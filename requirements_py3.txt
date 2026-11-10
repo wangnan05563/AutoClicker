@@ -1,0 +1,16 @@
+# Python 3.14 自动点击工具依赖项
+
+# ==================== 核心依赖 ====================
+pyautogui>=0.9.54
+keyboard>=0.13.5
+
+# ==================== Windows 特定依赖 ====================
+pywin32>=306; sys_platform == "win32"
+
+# ==================== Linux 特定依赖 ====================
+python-xlib>=0.33; sys_platform == "linux"
+pystray>=0.19.5; sys_platform == "linux"
+Pillow>=10.0.0; sys_platform == "linux"
+
+# ==================== 打包工具 ====================
+cx-Freeze>=6.15.0

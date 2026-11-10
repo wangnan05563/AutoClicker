@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.egg
+
+# PyInstaller 自动生成的 spec（构建时由 build_exe.py 重新生成）
+/AutoClicker.spec
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 构建产物（release 下保留 dist 供分发，其余全部忽略）
+release/
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+
+# 系统 / 工具
+.trae/
+.DS_Store
+Thumbs.db
+
+# 日志与缓存
+*.log
+.pytest_cache/
