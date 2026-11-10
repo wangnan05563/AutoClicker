@@ -291,15 +291,22 @@ class AutoClicker:
         self.root = root
         self.root.title(WINDOW_TITLE)
         
-        # 增大窗口尺寸，确保所有内容都能显示
-        self.root.geometry("650x700")
-        # 增大最小尺寸
-        self.root.minsize(600, 650)
+        # 窗口尺寸（修正 geometry 与 minsize 矛盾：F-10 / CX-05）
+        self.root.geometry("720x800")
+        self.root.minsize(700, 760)
         
         self.is_running = False
         self.click_thread = None
         self.config_file = os.path.expanduser("~/.auto_clicker_config_py3.json")
-        
+
+        # P0 安全/体验状态默认值（CX-01 / CX-02 / CX-04）
+        self.countdown_cancelled = False
+        self.startup_countdown = 3
+        self.click_limit = 0
+        self.duration_limit = 0
+        self.failsafe_enabled = False
+        self.start_time = time.time()
+
         self.setup_logging()
         self.load_config()
         self.setup_ui()
@@ -320,7 +327,13 @@ class AutoClicker:
             'prevent_sleep': True,
             'mouse_follow_enabled': True,  # 鼠标跟随功能
             'mouse_move_speed': 0.1,  # 鼠标移动速度 (0.0-1.0)
-            'mouse_move_only': False  # 只移动不点击
+            'mouse_move_only': False,  # 只移动不点击
+            # P0 安全与体验止血（CX-02 / CX-04 / CX-06）
+            'startup_countdown': 3,  # 启动倒计时（秒，0-5）
+            'click_limit': 0,  # 点击次数上限（0=无限）
+            'duration_limit': 0,  # 运行时长上限（分钟，0=无限）
+            'failsafe_enabled': False,  # 鼠标位移即停
+            'close_to_tray': True  # 关闭窗口最小化到托盘（否则直接退出）
         }
         
         try:
@@ -351,6 +364,13 @@ class AutoClicker:
             self.config['mouse_follow_enabled'] = self.mouse_follow_var.get()
             self.config['mouse_move_speed'] = float(self.mouse_speed_var.get())
             self.config['mouse_move_only'] = self.mouse_move_only_var.get()
+            # P0 安全与体验参数持久化（CX-02 / CX-04 / CX-06）
+            if hasattr(self, 'countdown_var'):
+                self.config['startup_countdown'] = int(self.countdown_var.get() or 0)
+                self.config['click_limit'] = int(self.click_limit_var.get() or 0)
+                self.config['duration_limit'] = int(self.duration_limit_var.get() or 0)
+                self.config['failsafe_enabled'] = self.failsafe_var.get()
+                self.config['close_to_tray'] = self.close_to_tray_var.get()
             self.save_config()
         except Exception as e:
             print("保存配置失败: " + str(e))
@@ -393,7 +413,16 @@ class AutoClicker:
                 self.log_message("已禁用只移动不点击模式")
         except Exception as e:
             print("保存配置失败: " + str(e))
-    
+
+    def on_close_behavior_changed(self):
+        """关闭行为选项改变时的回调（CX-06）"""
+        try:
+            self.config['close_to_tray'] = self.close_to_tray_var.get()
+            self.save_config()
+            self.log_message("关闭行为已设为：" + ("最小化到托盘" if self.close_to_tray_var.get() else "直接退出"))
+        except Exception as e:
+            print("保存关闭行为失败: " + str(e))
+
     def on_mouse_speed_changed(self, value):
         """鼠标移动速度改变时的回调"""
         try:
@@ -406,8 +435,8 @@ class AutoClicker:
                 
     def setup_ui(self):
         """设置现代化UI界面 - 采用卡片式布局和响应式设计"""
-        # 设置窗口最小尺寸
-        self.root.minsize(700, 800)
+        # 设置窗口最小尺寸（与 __init__ 保持一致，避免矛盾：CX-05）
+        self.root.minsize(700, 760)
         
         # 创建主容器 - 使用Canvas支持滚动
         main_container = ttk.Frame(self.root)
@@ -656,6 +685,48 @@ class AutoClicker:
                                           font=('微软雅黑', 9), width=5)
         self.mouse_speed_label.pack(side=tk.LEFT)
         
+        # ==================== 安全与终点控制（P0 止血） ====================
+        safety_card = ttk.LabelFrame(self.main_frame, text="🛡 安全与终点控制", padding="15")
+        safety_card.pack(fill=tk.X, pady=(0, 15))
+
+        # 启动倒计时（CX-04）
+        countdown_container = ttk.Frame(safety_card)
+        countdown_container.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(countdown_container, text="启动倒计时(秒, 0-5)",
+                 font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
+        self.countdown_var = tk.StringVar(value=str(self.config.get('startup_countdown', 3)))
+        ttk.Entry(countdown_container, textvariable=self.countdown_var,
+                 font=('微软雅黑', 11), width=8, justify='center').pack(side=tk.LEFT, padx=(5, 0))
+
+        # 点击次数上限（CX-02）
+        limit_container = ttk.Frame(safety_card)
+        limit_container.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(limit_container, text="点击次数上限(0=无限)",
+                 font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
+        self.click_limit_var = tk.StringVar(value=str(self.config.get('click_limit', 0)))
+        ttk.Entry(limit_container, textvariable=self.click_limit_var,
+                 font=('微软雅黑', 11), width=8, justify='center').pack(side=tk.LEFT, padx=(5, 0))
+
+        # 运行时长上限（CX-02）
+        duration_container = ttk.Frame(safety_card)
+        duration_container.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(duration_container, text="运行时长上限(分钟, 0=无限)",
+                 font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
+        self.duration_limit_var = tk.StringVar(value=str(self.config.get('duration_limit', 0)))
+        ttk.Entry(duration_container, textvariable=self.duration_limit_var,
+                 font=('微软雅黑', 11), width=8, justify='center').pack(side=tk.LEFT, padx=(5, 0))
+
+        # 鼠标位移 failsafe（CX-01）
+        self.failsafe_var = tk.BooleanVar(value=self.config.get('failsafe_enabled', False))
+        ttk.Checkbutton(safety_card, text="🖱 鼠标移动即停 (failsafe，移动>20px自动急停)",
+                       variable=self.failsafe_var).pack(anchor=tk.W)
+
+        # 关闭行为（CX-06）
+        self.close_to_tray_var = tk.BooleanVar(value=self.config.get('close_to_tray', True))
+        ttk.Checkbutton(safety_card, text="❌ 关闭窗口时最小化到托盘（否则直接退出）",
+                       variable=self.close_to_tray_var,
+                       command=self.on_close_behavior_changed).pack(anchor=tk.W, pady=(4, 0))
+
         # ==================== 日志区域 ====================
         log_card = ttk.LabelFrame(self.main_frame, text="📝 运行日志", padding="10")
         log_card.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
@@ -694,7 +765,7 @@ class AutoClicker:
         shortcut_frame = ttk.Frame(footer_frame)
         shortcut_frame.pack(fill=tk.X, pady=(0, 5))
         
-        shortcut_text = "⌨️ 快捷键: F6 - 快速启动/停止"
+        shortcut_text = "⌨️ 快捷键: F6 启动/停止 · F8/Esc 紧急停止"
         ttk.Label(shortcut_frame, text=shortcut_text, 
                  font=('微软雅黑', 9), foreground='#6c757d').pack(anchor=tk.CENTER)
         
@@ -723,6 +794,10 @@ class AutoClicker:
             try:
                 keyboard.add_hotkey('f6', self.toggle_clicking)
                 print("快捷键 F6 已注册")
+                # P0 独立急停热键（CX-01）：与启停键分离，统一走 stop_clicking(reason)
+                keyboard.add_hotkey('f8', self.emergency_stop, suppress=False)
+                keyboard.add_hotkey('esc', self.emergency_stop, suppress=False)
+                print("快捷键 F8/Esc 紧急停止已注册")
             except Exception as e:
                 print("注册快捷键失败: " + str(e))
                     
@@ -871,40 +946,91 @@ class AutoClicker:
         except Exception as e:
             print(f"恢复系统休眠设置失败: {e}")
                 
+    # ==================== 线程安全的 UI 更新辅助方法 ====================
+    def _ui(self, fn, *args):
+        try:
+            self.root.after(0, lambda: fn(*args))
+        except Exception:
+            pass
+
+    def _do_set_status(self, text, color):
+        try:
+            self.status_indicator.itemconfig(self.status_circle, fill=color)
+            self.status_label.config(text=text, foreground=color)
+        except Exception:
+            pass
+
+    def _set_status(self, text, color):
+        self._ui(self._do_set_status, text, color)
+
+    def _set_next(self, text):
+        self._ui(self.next_click_label.config, text=text)
+
+    def run_clicking(self):
+        """点击主流程（后台线程）：先启动倒计时，再进入点击循环（CX-04）"""
+        self.start_time = time.time()
+        countdown = self.startup_countdown
+        if countdown > 0:
+            for i in range(countdown, 0, -1):
+                if not self.is_running:
+                    return
+                self._set_status(f"{i} 秒后启动", 'orange')
+                self._set_next(f"启动倒计时 {i}s")
+                time.sleep(1)
+            if not self.is_running:
+                return
+        self._set_status("运行中", 'green')
+        self._set_next("--")
+        self.click_loop()
+
     def click_loop(self):
         while self.is_running:
             try:
                 interval = int(self.interval_var.get())
-                
+                if interval < 1:
+                    interval = 1
+
                 if self.prevent_sleep_var.get():
                     self.prevent_system_sleep()
-                
+
+                # 安全：鼠标位移 failsafe 基线（CX-01）
+                if self.failsafe_enabled:
+                    failsafe_base = get_cursor_pos()
+
                 for remaining in range(interval, 0, -1):
                     if not self.is_running:
                         break
-                    
-                    self.next_click_label.config(text=f"{remaining}秒")
+
+                    self._set_next(f"{remaining}秒")
                     time.sleep(1)
-                
+
+                    # 安全：运行中若开启 failsafe 且鼠标被移动 >20px，立即急停（CX-01）
+                    if self.failsafe_enabled and self.is_running:
+                        cur = get_cursor_pos()
+                        dx = cur[0] - failsafe_base[0]
+                        dy = cur[1] - failsafe_base[1]
+                        if (dx * dx + dy * dy) ** 0.5 > 20:
+                            self.stop_clicking(reason="鼠标位移触发安全停止 (failsafe)")
+                            return
+
                 if not self.is_running:
                     break
-                    
+
                 x, y = self.get_click_position()
-                
+
                 # 鼠标跟随移动
                 if self.mouse_follow_var.get():
                     try:
                         speed = float(self.mouse_speed_var.get())
                         # 根据速度调整移动时间，速度越快，时间越短
                         duration = max(0.1, 1.0 - speed)
-                        self.log_message(f"[DEBUG] 移动到 ({x}, {y}), 速度={speed:.2f}, 持续时间={duration:.2f}秒")
                         self.smooth_move_to(x, y, duration=duration)
                         self.log_message(f"鼠标已移动到位置 ({x}, {y})")
                         # 短暂延迟，确保鼠标移动完成
                         time.sleep(0.1)
                     except Exception as e:
                         self.log_message(f"鼠标跟随失败: {e}")
-                
+
                 # 只移动不点击模式下不执行点击
                 if not self.mouse_move_only_var.get():
                     # 使用跨平台点击函数
@@ -914,17 +1040,23 @@ class AutoClicker:
                         pyautogui.click(x, y)
                         self.log_message(f"使用pyautogui在位置 ({x}, {y}) 执行点击")
                     self.click_count += 1
-                    try:
-                        self.log_message(f"已在位置 ({x}, {y}) 执行点击，总点击次数: {self.click_count}")
-                    except Exception as e:
-                        print(f"日志写入失败: {e}")
                     self.click_count_label.config(text=str(self.click_count))
+                    self.log_message(f"已在位置 ({x}, {y}) 执行点击，总点击次数: {self.click_count}")
                 else:
-                    try:
-                        self.log_message(f"仅移动到位置 ({x}, {y})，未执行点击")
-                    except Exception as e:
-                        print(f"日志写入失败: {e}")
-                
+                    self.log_message(f"仅移动到位置 ({x}, {y})，未执行点击")
+
+                # 安全：点击次数上限（CX-02）
+                if self.click_limit and self.click_count >= self.click_limit:
+                    self.stop_clicking(reason=f"达到点击次数上限 ({self.click_limit} 次)")
+                    break
+
+                # 安全：运行时长上限（CX-02）
+                if self.duration_limit:
+                    elapsed_min = (time.time() - self.start_time) / 60.0
+                    if elapsed_min >= self.duration_limit:
+                        self.stop_clicking(reason=f"达到运行时长上限 ({self.duration_limit} 分钟)")
+                        break
+
             except Exception as e:
                 self.log_message(f"点击过程中发生错误: {e}")
                 time.sleep(5)
@@ -935,61 +1067,115 @@ class AutoClicker:
             if interval < 1 or interval > 3600:
                 messagebox.showerror("错误", "点击间隔必须在1-3600秒之间")
                 return
-                
+
+            # P0 安全/体验参数校验（CX-02 / CX-04）
+            try:
+                countdown = int(self.countdown_var.get())
+                if countdown < 0 or countdown > 5:
+                    messagebox.showerror("错误", "启动倒计时必须在 0-5 秒之间")
+                    return
+            except ValueError:
+                messagebox.showerror("错误", "启动倒计时必须为整数")
+                return
+
+            try:
+                click_limit = int(self.click_limit_var.get())
+                if click_limit < 0:
+                    messagebox.showerror("错误", "点击次数上限不能为负数")
+                    return
+            except ValueError:
+                messagebox.showerror("错误", "点击次数上限必须为整数")
+                return
+
+            try:
+                duration_limit = int(self.duration_limit_var.get())
+                if duration_limit < 0:
+                    messagebox.showerror("错误", "运行时长上限不能为负数")
+                    return
+            except ValueError:
+                messagebox.showerror("错误", "运行时长上限必须为整数")
+                return
+
             self.is_running = True
             self.click_count = 0
-            
+            self.countdown_cancelled = False
+            self.startup_countdown = countdown
+            self.click_limit = click_limit
+            self.duration_limit = duration_limit
+            self.failsafe_enabled = self.failsafe_var.get()
+            self.start_time = time.time()
+
             self.config['interval_seconds'] = interval
             self.config['click_mode'] = self.mode_var.get()
             self.config['prevent_sleep'] = self.prevent_sleep_var.get()
             self.config['mouse_follow_enabled'] = self.mouse_follow_var.get()
             self.config['mouse_move_speed'] = float(self.mouse_speed_var.get())
             self.config['mouse_move_only'] = self.mouse_move_only_var.get()
+            # P0 持久化安全/体验参数（CX-02 / CX-04 / CX-06）
+            self.config['startup_countdown'] = self.startup_countdown
+            self.config['click_limit'] = self.click_limit
+            self.config['duration_limit'] = self.duration_limit
+            self.config['failsafe_enabled'] = self.failsafe_enabled
+            self.config['close_to_tray'] = self.close_to_tray_var.get()
             self.save_config()
-            
-            self.log_message(f"启动配置: 模式={self.config['click_mode']}, 间隔={self.config['interval_seconds']}秒")
+
+            self.log_message(
+                "启动配置: 模式=" + str(self.config['click_mode']) + ", 间隔=" + str(self.config['interval_seconds']) + "秒"
+                + (", 倒计时=" + str(countdown) + "秒" if countdown else "")
+                + (", 次数上限=" + str(click_limit) if click_limit else "")
+                + (", 时长上限=" + str(duration_limit) + "分钟" if duration_limit else "")
+                + (", failsafe开" if self.failsafe_enabled else ""))
             if self.mouse_move_only_var.get():
-                self.log_message(f"只移动不点击模式: 启用")
-            
-            self.click_thread = threading.Thread(target=self.click_loop, daemon=True)
+                self.log_message("只移动不点击模式: 启用")
+
+            self.click_thread = threading.Thread(target=self.run_clicking, daemon=True)
             self.click_thread.start()
-            
+
             # 更新状态指示器
             self.status_indicator.itemconfig(self.status_circle, fill='green')
             self.status_label.config(text="运行中", foreground='green')
-            
-            # 更新按钮状态
+
+            # 更新按钮状态（倒计时期间停止按钮即作为取消键）
             self.start_btn.config(state=tk.DISABLED)
             self.stop_btn.config(state=tk.NORMAL)
             self.interval_entry.config(state=tk.DISABLED)
-            
+
             self.log_message("自动点击已启动")
-                
+
         except ValueError:
             messagebox.showerror("错误", "请输入有效的数字")
         except Exception as e:
             self.log_message(f"启动失败: {e}")
             messagebox.showerror("错误", f"启动失败: {e}")
             
-    def stop_clicking(self):
+    def stop_clicking(self, reason=""):
         self.is_running = False
-        
+        self.countdown_cancelled = False
+
         if self.click_thread:
             self.click_thread.join(timeout=2)
-            
+
         self.allow_system_sleep()
-        
+
         # 更新状态指示器
         self.status_indicator.itemconfig(self.status_circle, fill='red')
         self.status_label.config(text="已停止", foreground='red')
         self.next_click_label.config(text="--")
-        
+
         # 更新按钮状态
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
         self.interval_entry.config(state=tk.NORMAL)
-        
-        self.log_message("自动点击已停止")
+
+        if reason:
+            self.log_message("自动点击已停止（原因：" + str(reason) + "）")
+        else:
+            self.log_message("自动点击已停止")
+
+    def emergency_stop(self):
+        """P0 独立急停（CX-01）：仅作为停止入口，统一走 stop_clicking(reason)"""
+        if self.is_running:
+            self.stop_clicking(reason="用户按下紧急停止键 (F8/Esc)")
             
     def toggle_clicking(self):
         if self.is_running:
@@ -1000,14 +1186,21 @@ class AutoClicker:
     def test_click(self):
         try:
             x, y = self.get_click_position()
-            
-            result = messagebox.askyesno("测试点击", 
-                                         f"将在位置 ({x}, {y}) 执行测试点击\n是否继续？")
-            
+
+            result = messagebox.askyesno("测试点击",
+                                         f"将在位置 ({x}, {y}) 执行一次真实点击\n是否继续？")
+
             if result:
-                self.log_message(f"测试点击: 位置 ({x}, {y})")
-                messagebox.showinfo("测试成功", f"测试点击: 位置 ({x}, {y})")
-                    
+                # 修复 F-1：原先只弹窗不真实点击，现移动并执行一次真实点击（CX-03）
+                move_mouse(x, y)
+                time.sleep(0.05)
+                ok = click_mouse(x, y)
+                landed = get_cursor_pos()
+                self.log_message("测试点击已执行：目标=(" + str(x) + ", " + str(y) + ")，"
+                                "落点=" + str(landed) + "，结果=" + ("成功" if ok else "降级pyautogui"))
+                messagebox.showinfo("测试点击",
+                                   f"已在位置 ({x}, {y}) 执行一次真实点击\n实际落点：{landed}")
+
         except Exception as e:
             error_msg = f"测试点击失败: {e}"
             self.log_message(error_msg)
@@ -1310,10 +1503,13 @@ class AutoClicker:
             print(f"还原窗口失败: {e}")
     
     def on_closing(self):
-        """窗口关闭处理 - 最小化到系统托盘"""
-        # 隐藏窗口而不是关闭
-        self.root.withdraw()
-        self.log_message("程序已最小化到系统托盘")
+        """窗口关闭处理：根据配置选择最小化到托盘或直接退出（CX-06）"""
+        if self.config.get('close_to_tray', True):
+            # 隐藏窗口而不是关闭
+            self.root.withdraw()
+            self.log_message("程序已最小化到系统托盘")
+        else:
+            self.exit_application()
     
     def exit_application(self):
         """完全退出应用程序 - 从托盘菜单调用（跨平台）"""
