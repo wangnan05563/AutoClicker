@@ -8,11 +8,14 @@
 import sys
 import os
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog, simpledialog
+import subprocess
 import threading
 import time
 import random
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 
 # ==================== 平台检测 ====================
@@ -81,6 +84,10 @@ if IS_LINUX:
 MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
+MOUSEEVENTF_MIDDLEDOWN = 0x0020
+MOUSEEVENTF_MIDDLEUP = 0x0040
 MOUSEEVENTF_ABSOLUTE = 0x8000
 
 # ==================== 平台通用函数 ====================
@@ -95,20 +102,41 @@ def windows_move_mouse(x, y):
             return False
     return False
 
-def windows_click(x, y):
-    """使用 Windows API 执行鼠标点击"""
-    if HAS_WIN32API:
-        try:
-            ctypes.windll.user32.SetCursorPos(int(x), int(y))
-            time.sleep(0.01)
-            ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-            time.sleep(0.01)
-            ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+def windows_click(x, y, button='left', hold_ms=0):
+    """使用 Windows API 执行鼠标点击（支持左/右/中键、双击与按住时长）"""
+    if not HAS_WIN32API:
+        return False
+    try:
+        if button == 'double':
+            _windows_click_button(x, y, 'left', hold_ms)
+            time.sleep(0.03)
+            _windows_click_button(x, y, 'left', hold_ms)
             return True
-        except Exception as e:
-            print(f"点击失败：{e}")
-            return False
-    return False
+        return _windows_click_button(x, y, button, hold_ms)
+    except Exception as e:
+        print(f"点击失败：{e}")
+        return False
+
+
+def _windows_click_button(x, y, button, hold_ms):
+    """Windows 单键按下/抬起（含按住时长）"""
+    flags = {
+        'left': (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+        'right': (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+        'middle': (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+    }.get(button, (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP))
+    try:
+        ctypes.windll.user32.SetCursorPos(int(x), int(y))
+        time.sleep(0.005)
+        ctypes.windll.user32.mouse_event(flags[0], 0, 0, 0, 0)
+        if hold_ms > 0:
+            time.sleep(hold_ms / 1000.0)
+        time.sleep(0.005)
+        ctypes.windll.user32.mouse_event(flags[1], 0, 0, 0, 0)
+        return True
+    except Exception as e:
+        print(f"点击失败：{e}")
+        return False
 
 def linux_move_mouse(x, y):
     """使用 X11 API 移动鼠标（银河麒麟兼容）"""
@@ -135,34 +163,51 @@ def linux_move_mouse(x, y):
         except:
             return False
 
-def linux_click(x, y):
-    """使用 X11 API 执行鼠标点击（银河麒麟兼容）"""
-    if HAS_X11:
-        try:
-            d = display.Display()
-            linux_move_mouse(x, y)
-            time.sleep(0.01)
-            fake_input(d, X.ButtonPress, 1)
+def linux_click(x, y, button='left', hold_ms=0):
+    """使用 X11 API 执行鼠标点击（银河麒麟兼容，支持左/右/中键、双击与按住时长）"""
+    if not HAS_X11:
+        return _pyautogui_click(x, y, button)
+    try:
+        d = display.Display()
+        linux_move_mouse(x, y)
+        btn = {'left': 1, 'right': 3, 'middle': 2}.get(button, 1)
+
+        def press():
+            fake_input(d, X.ButtonPress, btn)
             d.sync()
-            time.sleep(0.01)
-            fake_input(d, X.ButtonRelease, 1)
+
+        def release():
+            fake_input(d, X.ButtonRelease, btn)
             d.sync()
-            d.close()
-            return True
-        except Exception as e:
-            print(f"Linux点击失败：{e}")
-            # 降级使用 pyautogui
-            try:
-                pyautogui.click(x, y)
-                return True
-            except:
-                return False
-    else:
-        try:
-            pyautogui.click(x, y)
-            return True
-        except:
-            return False
+
+        press()
+        if hold_ms > 0:
+            time.sleep(hold_ms / 1000.0)
+        if button == 'double':
+            release()
+            d.sync()
+            time.sleep(0.03)
+            press()
+            if hold_ms > 0:
+                time.sleep(hold_ms / 1000.0)
+        release()
+        d.sync()
+        d.close()
+        return True
+    except Exception as e:
+        print(f"Linux点击失败：{e}")
+        return _pyautogui_click(x, y, button)
+
+
+def _pyautogui_click(x, y, button):
+    """pyautogui 降级点击（无 X11 或异常时）"""
+    try:
+        pyautogui.click(x, y,
+                       button={'left': 'left', 'right': 'right', 'middle': 'middle'}.get(button, 'left'),
+                       clicks=2 if button == 'double' else 1)
+        return True
+    except Exception:
+        return False
 
 def linux_get_cursor_pos():
     """获取 Linux 鼠标位置"""
@@ -198,15 +243,14 @@ def move_mouse(x, y):
         pyautogui.moveTo(x, y)
         return True
 
-def click_mouse(x, y):
-    """跨平台点击鼠标"""
+def click_mouse(x, y, button='left', hold_ms=0):
+    """跨平台点击鼠标（支持按键类型与按住时长）"""
     if IS_WINDOWS:
-        return windows_click(x, y)
+        return windows_click(x, y, button, hold_ms)
     elif IS_LINUX:
-        return linux_click(x, y)
+        return linux_click(x, y, button, hold_ms)
     else:
-        pyautogui.click(x, y)
-        return True
+        return _pyautogui_click(x, y, button)
 
 # ERROR_ALREADY_EXISTS常量（在pywin32中可能未定义）
 ERROR_ALREADY_EXISTS = 183
@@ -307,6 +351,14 @@ class AutoClicker:
         self.failsafe_enabled = False
         self.start_time = time.time()
 
+        # P1 功能扩展状态默认值（FN-01 / FN-02 / CX-07 / FN-03）
+        self.click_button = 'left'
+        self.hold_ms = 10
+        self.interval_unit = 's'
+        self.jitter_pct = 0
+        self.use_multi_points = False
+        self.multi_points = []
+
         self.setup_logging()
         self.load_config()
         self.setup_ui()
@@ -317,8 +369,27 @@ class AutoClicker:
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
     def setup_logging(self):
-        print("自动点击工具启动 (Python 3.14)")
-            
+        """CX-10：初始化磁盘日志（RotatingFileHandler，单文件 5MB × 5 备份）"""
+        try:
+            self.log_dir = os.path.expanduser("~/.auto_clicker_logs")
+            os.makedirs(self.log_dir, exist_ok=True)
+            log_file = os.path.join(self.log_dir, "autoclicker.log")
+            self._file_logger = logging.getLogger("autoclicker")
+            self._file_logger.setLevel(logging.INFO)
+            # 避免重复添加 handler（多次调用时）
+            if not self._file_logger.handlers:
+                fh = RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024,
+                                         backupCount=5, encoding='utf-8')
+                fh.setFormatter(logging.Formatter(
+                    "%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"))
+                self._file_logger.addHandler(fh)
+            # 兼容旧控制台提示
+            self._file_logger.info("自动点击工具启动 (Python 3.14)")
+        except Exception as e:
+            # 日志初始化失败不应阻断程序启动
+            self._file_logger = None
+            print("初始化日志失败: " + str(e))
+
     def load_config(self):
         default_config = {
             'interval_seconds': 10,
@@ -333,7 +404,18 @@ class AutoClicker:
             'click_limit': 0,  # 点击次数上限（0=无限）
             'duration_limit': 0,  # 运行时长上限（分钟，0=无限）
             'failsafe_enabled': False,  # 鼠标位移即停
-            'close_to_tray': True  # 关闭窗口最小化到托盘（否则直接退出）
+            'close_to_tray': True,  # 关闭窗口最小化到托盘（否则直接退出）
+            # P1 功能扩展（FN-01 / FN-02 / CX-07 / CX-08 / CX-11 / FN-03）
+            'click_button': 'left',  # 鼠标按键：left/right/middle/double
+            'hold_ms': 10,  # 按住时长（毫秒）
+            'interval_unit': 's',  # 间隔单位：s=秒 / ms=毫秒
+            'jitter_pct': 0,  # 随机抖动百分比（0=关闭）
+            'hotkey_start': 'f6',  # 启动/停止热键（可自定义）
+            'hotkey_emergency': 'f8',  # 紧急停止热键（可自定义）
+            'autostart': False,  # 开机自启
+            'use_multi_points': False,  # 使用多点位序列
+            'multi_points': [],  # 多点位坐标列表 [{'x':, 'y':}, ...]
+            'config_version': 2  # 配置 schema 版本（CX-09 迁移用）
         }
         
         try:
@@ -348,6 +430,17 @@ class AutoClicker:
         except Exception as e:
             print("加载配置失败: " + str(e))
             self.config = default_config
+            
+        # 配置迁移（CX-09）：补齐 schema 版本与配置方案容器
+        try:
+            if 'config_version' not in self.config:
+                self.config['config_version'] = 2
+            if 'profiles' not in self.config or not isinstance(self.config['profiles'], dict):
+                self.config['profiles'] = {}
+            if 'current_profile' not in self.config:
+                self.config['current_profile'] = None
+        except Exception:
+            pass
             
     def save_config(self):
         try:
@@ -422,6 +515,255 @@ class AutoClicker:
             self.log_message("关闭行为已设为：" + ("最小化到托盘" if self.close_to_tray_var.get() else "直接退出"))
         except Exception as e:
             print("保存关闭行为失败: " + str(e))
+
+    # ==================== P1 辅助方法 ====================
+    def _refresh_multi_point_listbox(self):
+        try:
+            self.multi_point_listbox.delete(0, tk.END)
+            for p in self.config.get('multi_points', []):
+                self.multi_point_listbox.insert(tk.END, f"({p['x']}, {p['y']})")
+        except Exception:
+            pass
+
+    def _add_point(self, x, y):
+        try:
+            self.config.setdefault('multi_points', []).append({'x': int(x), 'y': int(y)})
+            self.save_config()
+            self._refresh_multi_point_listbox()
+            self.log_message(f"已添加多点位：({int(x)}, {int(y)})")
+        except Exception as e:
+            self.log_message("添加多点位失败: " + str(e))
+
+    def pick_coordinate(self):
+        """FN-04：3 秒后拾取当前光标坐标"""
+        try:
+            self.log_message("3 秒后拾取当前光标坐标…（请勿移动鼠标）")
+            def _pick():
+                time.sleep(3)
+                try:
+                    x, y = get_cursor_pos()
+                    self.root.after(0, lambda: self._add_point(x, y))
+                except Exception as e:
+                    self.root.after(0, lambda: self.log_message("拾取失败: " + str(e)))
+            threading.Thread(target=_pick, daemon=True).start()
+        except Exception as e:
+            self.log_message("拾取失败: " + str(e))
+
+    def add_manual_point(self):
+        try:
+            x = int(self.mp_x_var.get())
+            y = int(self.mp_y_var.get())
+            self._add_point(x, y)
+        except ValueError:
+            messagebox.showerror("错误", "请输入有效的整数坐标")
+
+    def remove_point(self):
+        try:
+            sel = self.multi_point_listbox.curselection()
+            if not sel:
+                return
+            idx = sel[0]
+            pts = self.config.get('multi_points', [])
+            if 0 <= idx < len(pts):
+                pts.pop(idx)
+                self.save_config()
+                self._refresh_multi_point_listbox()
+        except Exception as e:
+            self.log_message("删除多点位失败: " + str(e))
+
+    def clear_points(self):
+        self.config['multi_points'] = []
+        self.save_config()
+        self._refresh_multi_point_listbox()
+        self.log_message("已清空多点位列表")
+
+    def on_hotkey_apply(self):
+        """CX-08：校验冲突并重新注册热键"""
+        try:
+            start_k = self.hotkey_start_var.get().strip().lower()
+            emer_k = self.hotkey_emergency_var.get().strip().lower()
+            if not start_k or not emer_k:
+                messagebox.showerror("错误", "热键不能为空")
+                return
+            if start_k == emer_k:
+                messagebox.showerror("冲突", "启动键与紧急停止键不能相同")
+                return
+            if start_k == 'esc' or emer_k == 'esc':
+                messagebox.showerror("冲突", "Esc 为保留紧急停止键，不可用作启动/停止键")
+                return
+            self.config['hotkey_start'] = start_k
+            self.config['hotkey_emergency'] = emer_k
+            self.save_config()
+            self._register_hotkeys()
+            self.log_message(f"热键已应用：启动={start_k}，紧急停止={emer_k}（Esc 始终为紧急停止）")
+        except Exception as e:
+            messagebox.showerror("错误", "应用热键失败: " + str(e))
+
+    def on_autostart_changed(self):
+        """CX-11：开机自启开关"""
+        self.set_autostart(self.autostart_var.get())
+
+    def set_autostart(self, enable):
+        try:
+            if IS_WINDOWS:
+                import winreg
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                    r"Software\Microsoft\Windows\CurrentVersion\Run",
+                                    0, winreg.KEY_SET_VALUE)
+                exe = os.path.abspath(sys.argv[0]) if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
+                if enable:
+                    winreg.SetValueEx(key, "AutoClicker", 0, winreg.REG_SZ, '"' + exe + '"')
+                else:
+                    try:
+                        winreg.DeleteValue(key, "AutoClicker")
+                    except FileNotFoundError:
+                        pass
+                winreg.CloseKey(key)
+            elif IS_LINUX:
+                adir = os.path.expanduser("~/.config/autostart")
+                os.makedirs(adir, exist_ok=True)
+                desk = os.path.join(adir, "autoclicker.desktop")
+                if enable:
+                    exe = os.path.abspath(sys.argv[0]) if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
+                    with open(desk, 'w', encoding='utf-8') as f:
+                        f.write("[Desktop Entry]\nType=Application\nName=AutoClicker\n"
+                                "Exec=\"%s\"\nHidden=false\nX-GNOME-Autostart-enabled=true\n" % exe)
+                elif os.path.exists(desk):
+                    os.remove(desk)
+            else:
+                messagebox.showinfo("提示", "当前平台不支持开机自启")
+                return
+            self.config['autostart'] = enable
+            self.save_config()
+            self.log_message("开机自启已" + ("开启" if enable else "关闭"))
+        except Exception as e:
+            self.log_message("设置开机自启失败: " + str(e))
+            messagebox.showerror("错误", "设置开机自启失败: " + str(e))
+
+    def open_log_dir(self):
+        """CX-10：打开日志目录"""
+        try:
+            d = getattr(self, 'log_dir', os.path.expanduser("~/.auto_clicker_logs"))
+            if not os.path.isdir(d):
+                os.makedirs(d, exist_ok=True)
+            if IS_WINDOWS:
+                os.startfile(d)
+            elif IS_LINUX:
+                subprocess.Popen(['xdg-open', d])
+            else:
+                messagebox.showinfo("日志目录", d)
+        except Exception as e:
+            self.log_message("打开日志目录失败: " + str(e))
+
+    def _refresh_profile_combo(self):
+        try:
+            names = list(self.config.get('profiles', {}).keys())
+            self.profile_combo['values'] = names
+            cur = self.config.get('current_profile')
+            if cur and cur in names:
+                self.profile_var.set(cur)
+            elif names:
+                self.profile_var.set(names[0])
+            else:
+                self.profile_var.set('')
+        except Exception:
+            pass
+
+    def profile_save(self):
+        """CX-09：将当前参数保存为命名方案"""
+        name = simpledialog.askstring("保存方案", "请输入方案名称：")
+        if not name:
+            return
+        name = name.strip()
+        keys = ['interval_seconds', 'click_mode', 'prevent_sleep', 'mouse_follow_enabled',
+                'mouse_move_speed', 'mouse_move_only', 'startup_countdown', 'click_limit',
+                'duration_limit', 'failsafe_enabled', 'click_button', 'hold_ms',
+                'interval_unit', 'jitter_pct', 'use_multi_points', 'multi_points', 'click_area',
+                'hotkey_start', 'hotkey_emergency', 'autostart', 'close_to_tray']
+        snap = {k: self.config.get(k) for k in keys}
+        self.config.setdefault('profiles', {})[name] = snap
+        self.config['current_profile'] = name
+        self.save_config()
+        self._refresh_profile_combo()
+        self.log_message("已保存配置方案：" + name)
+
+    def profile_switch(self):
+        name = self.profile_var.get()
+        if not name or name not in self.config.get('profiles', {}):
+            messagebox.showerror("错误", "请先选择有效方案")
+            return
+        snap = self.config['profiles'][name]
+        for k, v in snap.items():
+            self.config[k] = v
+        self.config['current_profile'] = name
+        self.save_config()
+        self.apply_config_to_ui()
+        self.log_message("已切换到配置方案：" + name)
+
+    def profile_delete(self):
+        name = self.profile_var.get()
+        if not name or name not in self.config.get('profiles', {}):
+            return
+        del self.config['profiles'][name]
+        if self.config.get('current_profile') == name:
+            self.config['current_profile'] = None
+        self.save_config()
+        self._refresh_profile_combo()
+        self.log_message("已删除配置方案：" + name)
+
+    def profile_export(self):
+        try:
+            path = filedialog.asksaveasfilename(defaultextension=".json",
+                                               filetypes=[("JSON", "*.json")],
+                                               title="导出配置方案")
+            if not path:
+                return
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(self.config.get('profiles', {}), f, ensure_ascii=False, indent=2)
+            self.log_message("配置方案已导出：" + path)
+        except Exception as e:
+            messagebox.showerror("错误", "导出失败: " + str(e))
+
+    def profile_import(self):
+        try:
+            path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")], title="导入配置方案")
+            if not path:
+                return
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self.config.setdefault('profiles', {}).update(data)
+                self.save_config()
+                self._refresh_profile_combo()
+                self.log_message("配置方案已导入：" + str(len(data)) + " 个")
+        except Exception as e:
+            messagebox.showerror("错误", "导入失败: " + str(e))
+
+    def apply_config_to_ui(self):
+        """将 config 参数回填到所有 UI 控件（方案切换 / 迁移后调用）"""
+        try:
+            self.interval_var.set(str(self.config.get('interval_seconds', 10)))
+            self.mode_var.set(self.config.get('click_mode', 'random'))
+            self.prevent_sleep_var.set(self.config.get('prevent_sleep', True))
+            self.mouse_follow_var.set(self.config.get('mouse_follow_enabled', True))
+            self.mouse_speed_var.set(str(self.config.get('mouse_move_speed', 0.1)))
+            self.mouse_move_only_var.set(self.config.get('mouse_move_only', False))
+            self.countdown_var.set(str(self.config.get('startup_countdown', 3)))
+            self.click_limit_var.set(str(self.config.get('click_limit', 0)))
+            self.duration_limit_var.set(str(self.config.get('duration_limit', 0)))
+            self.failsafe_var.set(self.config.get('failsafe_enabled', False))
+            self.close_to_tray_var.set(self.config.get('close_to_tray', True))
+            self.click_button_var.set(self.config.get('click_button', 'left'))
+            self.hold_ms_var.set(str(self.config.get('hold_ms', 10)))
+            self.interval_unit_var.set(self.config.get('interval_unit', 's'))
+            self.jitter_var.set(str(self.config.get('jitter_pct', 0)))
+            self.use_multi_points_var.set(self.config.get('use_multi_points', False))
+            self.autostart_var.set(self.config.get('autostart', False))
+            self.hotkey_start_var.set(self.config.get('hotkey_start', 'f6'))
+            self.hotkey_emergency_var.set(self.config.get('hotkey_emergency', 'f8'))
+            self._refresh_multi_point_listbox()
+        except Exception as e:
+            print("回填 UI 失败: " + str(e))
 
     def on_mouse_speed_changed(self, value):
         """鼠标移动速度改变时的回调"""
@@ -727,6 +1069,87 @@ class AutoClicker:
                        variable=self.close_to_tray_var,
                        command=self.on_close_behavior_changed).pack(anchor=tk.W, pady=(4, 0))
 
+        # ==================== P1 功能扩展：点击 / 节奏 / 多点位 ====================
+        p1_card = ttk.LabelFrame(self.main_frame, text="🖱 点击 / 节奏 / 多点位 (P1)", padding="15")
+        p1_card.pack(fill=tk.X, pady=(0, 15))
+
+        row1 = ttk.Frame(p1_card)
+        row1.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(row1, text="鼠标按键", font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
+        self.click_button_var = tk.StringVar(value=self.config.get('click_button', 'left'))
+        ttk.Combobox(row1, textvariable=self.click_button_var, width=10,
+                     values=['left', 'right', 'middle', 'double'], state='readonly').pack(side=tk.LEFT, padx=(5, 15))
+        ttk.Label(row1, text="按住时长(ms)", font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
+        self.hold_ms_var = tk.StringVar(value=str(self.config.get('hold_ms', 10)))
+        ttk.Entry(row1, textvariable=self.hold_ms_var, width=8, justify='center').pack(side=tk.LEFT, padx=(5, 0))
+
+        row2 = ttk.Frame(p1_card)
+        row2.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(row2, text="间隔单位", font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
+        self.interval_unit_var = tk.StringVar(value=self.config.get('interval_unit', 's'))
+        ttk.Combobox(row2, textvariable=self.interval_unit_var, width=8,
+                     values=['s', 'ms'], state='readonly').pack(side=tk.LEFT, padx=(5, 15))
+        ttk.Label(row2, text="随机抖动(%)", font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
+        self.jitter_var = tk.StringVar(value=str(self.config.get('jitter_pct', 0)))
+        ttk.Entry(row2, textvariable=self.jitter_var, width=8, justify='center').pack(side=tk.LEFT, padx=(5, 0))
+
+        mp_frame = ttk.Frame(p1_card)
+        mp_frame.pack(fill=tk.X, pady=(4, 0))
+        self.use_multi_points_var = tk.BooleanVar(value=self.config.get('use_multi_points', False))
+        ttk.Checkbutton(mp_frame, text="🎯 使用多点位序列点击（按列表循环）",
+                        variable=self.use_multi_points_var).pack(anchor=tk.W)
+        self.multi_point_listbox = tk.Listbox(p1_card, height=4)
+        self.multi_point_listbox.pack(fill=tk.X, pady=(4, 4))
+        self._refresh_multi_point_listbox()
+        mp_btn = ttk.Frame(p1_card)
+        mp_btn.pack(fill=tk.X)
+        ttk.Button(mp_btn, text="拾取当前光标", command=self.pick_coordinate).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(mp_btn, text="添加(手动)", command=self.add_manual_point).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(mp_btn, text="删除选中", command=self.remove_point).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(mp_btn, text="清空", command=self.clear_points).pack(side=tk.LEFT)
+        mp_entry = ttk.Frame(p1_card)
+        mp_entry.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(mp_entry, text="X").pack(side=tk.LEFT)
+        self.mp_x_var = tk.StringVar()
+        ttk.Entry(mp_entry, textvariable=self.mp_x_var, width=8).pack(side=tk.LEFT, padx=(2, 8))
+        ttk.Label(mp_entry, text="Y").pack(side=tk.LEFT)
+        self.mp_y_var = tk.StringVar()
+        ttk.Entry(mp_entry, textvariable=self.mp_y_var, width=8).pack(side=tk.LEFT)
+
+        # ==================== P1 功能扩展：热键 / 配置方案 / 系统 ====================
+        p1b_card = ttk.LabelFrame(self.main_frame, text="⌨️ 热键 / 配置方案 / 系统 (P1)", padding="15")
+        p1b_card.pack(fill=tk.X, pady=(0, 15))
+
+        hk_row = ttk.Frame(p1b_card)
+        hk_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(hk_row, text="启动/停止键", font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
+        self.hotkey_start_var = tk.StringVar(value=self.config.get('hotkey_start', 'f6'))
+        ttk.Entry(hk_row, textvariable=self.hotkey_start_var, width=8).pack(side=tk.LEFT, padx=(5, 15))
+        ttk.Label(hk_row, text="紧急停止键", font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
+        self.hotkey_emergency_var = tk.StringVar(value=self.config.get('hotkey_emergency', 'f8'))
+        ttk.Entry(hk_row, textvariable=self.hotkey_emergency_var, width=8).pack(side=tk.LEFT, padx=(5, 10))
+        ttk.Button(hk_row, text="应用热键", command=self.on_hotkey_apply).pack(side=tk.LEFT)
+
+        prof_row = ttk.Frame(p1b_card)
+        prof_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(prof_row, text="配置方案", font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
+        self.profile_var = tk.StringVar()
+        self.profile_combo = ttk.Combobox(prof_row, textvariable=self.profile_var, width=14, state='readonly')
+        self.profile_combo.pack(side=tk.LEFT, padx=(5, 5))
+        self._refresh_profile_combo()
+        ttk.Button(prof_row, text="保存当前", command=self.profile_save).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(prof_row, text="切换", command=self.profile_switch).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(prof_row, text="删除", command=self.profile_delete).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(prof_row, text="导出", command=self.profile_export).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(prof_row, text="导入", command=self.profile_import).pack(side=tk.LEFT)
+
+        sys_row = ttk.Frame(p1b_card)
+        sys_row.pack(fill=tk.X, pady=(0, 6))
+        self.autostart_var = tk.BooleanVar(value=self.config.get('autostart', False))
+        ttk.Checkbutton(sys_row, text="🚀 开机自动启动", variable=self.autostart_var,
+                        command=self.on_autostart_changed).pack(side=tk.LEFT)
+        ttk.Button(sys_row, text="📂 打开日志目录", command=self.open_log_dir).pack(side=tk.LEFT, padx=(10, 0))
+
         # ==================== 日志区域 ====================
         log_card = ttk.LabelFrame(self.main_frame, text="📝 运行日志", padding="10")
         log_card.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
@@ -790,16 +1213,29 @@ class AutoClicker:
             print(f"模式切换错误: {e}")
     
     def setup_hotkeys(self):
-        if keyboard:
+        self._register_hotkeys()
+
+    def _register_hotkeys(self):
+        """CX-08：按配置注册热键，支持自定义与冲突规避（Esc 始终为紧急停止）"""
+        if not keyboard:
+            return
+        # 清除旧热键，避免重复注册
+        for k in list(getattr(self, '_hk_keys', [])):
             try:
-                keyboard.add_hotkey('f6', self.toggle_clicking)
-                print("快捷键 F6 已注册")
-                # P0 独立急停热键（CX-01）：与启停键分离，统一走 stop_clicking(reason)
-                keyboard.add_hotkey('f8', self.emergency_stop, suppress=False)
-                keyboard.add_hotkey('esc', self.emergency_stop, suppress=False)
-                print("快捷键 F8/Esc 紧急停止已注册")
-            except Exception as e:
-                print("注册快捷键失败: " + str(e))
+                keyboard.remove_hotkey(k)
+            except Exception:
+                pass
+        self._hk_keys = []
+        try:
+            start_k = self.config.get('hotkey_start', 'f6')
+            emer_k = self.config.get('hotkey_emergency', 'f8')
+            keyboard.add_hotkey(start_k, self.toggle_clicking)
+            keyboard.add_hotkey(emer_k, self.emergency_stop, suppress=False)
+            keyboard.add_hotkey('esc', self.emergency_stop, suppress=False)
+            self._hk_keys = [start_k, emer_k, 'esc']
+            print("快捷键已注册：启动=" + start_k + "，紧急停止=" + emer_k + "，Esc")
+        except Exception as e:
+            print("注册快捷键失败: " + str(e))
                     
     def set_click_area(self):
         try:
@@ -840,17 +1276,12 @@ class AutoClicker:
     def get_click_position(self):
         mode = self.mode_var.get()
         area = self.config['click_area']
-        
-        self.log_message(f"当前点击模式: {mode}")
-        
         if mode == 'center':
             x = area['x'] + area['width'] // 2
             y = area['y'] + area['height'] // 2
         else:
             x = random.randint(area['x'], area['x'] + area['width'])
             y = random.randint(area['y'], area['y'] + area['height'])
-            
-        self.log_message(f"生成的点击位置: ({x}, {y})")
         return x, y
     
     def smooth_move_to(self, x, y, duration=0.5):
@@ -983,13 +1414,48 @@ class AutoClicker:
         self._set_next("--")
         self.click_loop()
 
+    def _effective_interval_seconds(self):
+        """按间隔单位换算为秒（CX-07）：秒模式直接取，毫秒模式除以 1000"""
+        try:
+            val = float(self.interval_var.get())
+        except ValueError:
+            val = 1.0
+        if val < 0:
+            val = 0.0
+        if self.interval_unit == 'ms':
+            return val / 1000.0
+        return val
+
+    def _wait_interval(self, base_seconds):
+        """按 jitter 随机化后分段等待，期间可响应停止与 failsafe（CX-07）"""
+        if base_seconds <= 0:
+            return self.is_running
+        jp = self.jitter_pct
+        if jp and jp > 0:
+            factor = 1.0 + random.uniform(-jp / 100.0, jp / 100.0)
+            wait = max(0.0, base_seconds * factor)
+        else:
+            wait = base_seconds
+        show_countdown = base_seconds >= 1.0 and self.interval_unit == 's'
+        step = 0.05
+        remaining = wait
+        while remaining > 0 and self.is_running:
+            if show_countdown:
+                self._set_next(f"{max(0, int(remaining))}秒")
+            chunk = min(step, remaining)
+            time.sleep(chunk)
+            remaining -= chunk
+        if not show_countdown and self.is_running:
+            self._set_next("ms 模式")
+        return self.is_running
+
     def click_loop(self):
+        # 多点位序列模式（FN-03）
+        points = self.multi_points if self.use_multi_points else None
+        point_idx = 0
         while self.is_running:
             try:
-                interval = int(self.interval_var.get())
-                if interval < 1:
-                    interval = 1
-
+                base = self._effective_interval_seconds()
                 if self.prevent_sleep_var.get():
                     self.prevent_system_sleep()
 
@@ -997,51 +1463,50 @@ class AutoClicker:
                 if self.failsafe_enabled:
                     failsafe_base = get_cursor_pos()
 
-                for remaining in range(interval, 0, -1):
-                    if not self.is_running:
-                        break
-
-                    self._set_next(f"{remaining}秒")
-                    time.sleep(1)
-
-                    # 安全：运行中若开启 failsafe 且鼠标被移动 >20px，立即急停（CX-01）
-                    if self.failsafe_enabled and self.is_running:
-                        cur = get_cursor_pos()
-                        dx = cur[0] - failsafe_base[0]
-                        dy = cur[1] - failsafe_base[1]
-                        if (dx * dx + dy * dy) ** 0.5 > 20:
-                            self.stop_clicking(reason="鼠标位移触发安全停止 (failsafe)")
-                            return
-
-                if not self.is_running:
+                # 等待一个间隔（含随机抖动），期间可响应停止（CX-07）
+                if not self._wait_interval(base):
                     break
 
-                x, y = self.get_click_position()
+                # 安全：运行中若开启 failsafe 且鼠标被移动 >20px，立即急停（CX-01）
+                if self.failsafe_enabled and self.is_running:
+                    cur = get_cursor_pos()
+                    dx = cur[0] - failsafe_base[0]
+                    dy = cur[1] - failsafe_base[1]
+                    if (dx * dx + dy * dy) ** 0.5 > 20:
+                        self.stop_clicking(reason="鼠标位移触发安全停止 (failsafe)")
+                        return
+
+                # 计算本次点击坐标：多点位模式按序列循环，否则按模式取点
+                if points:
+                    if not points:
+                        break
+                    pt = points[point_idx % len(points)]
+                    x, y = int(pt['x']), int(pt['y'])
+                    point_idx += 1
+                else:
+                    x, y = self.get_click_position()
 
                 # 鼠标跟随移动
                 if self.mouse_follow_var.get():
                     try:
                         speed = float(self.mouse_speed_var.get())
-                        # 根据速度调整移动时间，速度越快，时间越短
                         duration = max(0.1, 1.0 - speed)
                         self.smooth_move_to(x, y, duration=duration)
-                        self.log_message(f"鼠标已移动到位置 ({x}, {y})")
-                        # 短暂延迟，确保鼠标移动完成
                         time.sleep(0.1)
                     except Exception as e:
                         self.log_message(f"鼠标跟随失败: {e}")
 
                 # 只移动不点击模式下不执行点击
                 if not self.mouse_move_only_var.get():
-                    # 使用跨平台点击函数
-                    if click_mouse(x, y):
-                        self.log_message(f"在位置 ({x}, {y}) 执行点击")
+                    # FN-01/FN-02：支持按键类型与按住时长
+                    ok = click_mouse(x, y, button=self.click_button, hold_ms=self.hold_ms)
+                    if ok:
+                        self.log_message(f"在位置 ({x}, {y}) 执行点击[按键={self.click_button}]")
                     else:
                         pyautogui.click(x, y)
                         self.log_message(f"使用pyautogui在位置 ({x}, {y}) 执行点击")
                     self.click_count += 1
                     self.click_count_label.config(text=str(self.click_count))
-                    self.log_message(f"已在位置 ({x}, {y}) 执行点击，总点击次数: {self.click_count}")
                 else:
                     self.log_message(f"仅移动到位置 ({x}, {y})，未执行点击")
 
@@ -1059,13 +1524,13 @@ class AutoClicker:
 
             except Exception as e:
                 self.log_message(f"点击过程中发生错误: {e}")
-                time.sleep(5)
+                time.sleep(1)
                 
     def start_clicking(self):
         try:
             interval = int(self.interval_var.get())
-            if interval < 1 or interval > 3600:
-                messagebox.showerror("错误", "点击间隔必须在1-3600秒之间")
+            if interval < 1:
+                messagebox.showerror("错误", "点击间隔必须 >= 1")
                 return
 
             # P0 安全/体验参数校验（CX-02 / CX-04）
@@ -1096,6 +1561,25 @@ class AutoClicker:
                 messagebox.showerror("错误", "运行时长上限必须为整数")
                 return
 
+            # P1 参数校验（CX-07 / FN-02）
+            try:
+                jitter = int(self.jitter_var.get())
+                if jitter < 0 or jitter > 100:
+                    messagebox.showerror("错误", "随机抖动必须在 0-100 之间")
+                    return
+            except ValueError:
+                messagebox.showerror("错误", "随机抖动必须为整数")
+                return
+
+            try:
+                hold_ms = int(self.hold_ms_var.get())
+                if hold_ms < 0:
+                    messagebox.showerror("错误", "按住时长不能为负数")
+                    return
+            except ValueError:
+                messagebox.showerror("错误", "按住时长必须为整数")
+                return
+
             self.is_running = True
             self.click_count = 0
             self.countdown_cancelled = False
@@ -1104,6 +1588,14 @@ class AutoClicker:
             self.duration_limit = duration_limit
             self.failsafe_enabled = self.failsafe_var.get()
             self.start_time = time.time()
+            # P1 状态（FN-01 / FN-02 / CX-07 / FN-03 / CX-11）
+            self.interval_unit = self.interval_unit_var.get()
+            self.jitter_pct = jitter
+            self.click_button = self.click_button_var.get()
+            self.hold_ms = hold_ms
+            self.use_multi_points = self.use_multi_points_var.get()
+            self.config['autostart'] = self.autostart_var.get()
+            self.multi_points = self.config.get('multi_points', [])
 
             self.config['interval_seconds'] = interval
             self.config['click_mode'] = self.mode_var.get()
@@ -1117,10 +1609,20 @@ class AutoClicker:
             self.config['duration_limit'] = self.duration_limit
             self.config['failsafe_enabled'] = self.failsafe_enabled
             self.config['close_to_tray'] = self.close_to_tray_var.get()
+            # P1 持久化（FN-01 / FN-02 / CX-07 / FN-03 / CX-11）
+            self.config['interval_unit'] = self.interval_unit
+            self.config['jitter_pct'] = self.jitter_pct
+            self.config['click_button'] = self.click_button
+            self.config['hold_ms'] = self.hold_ms
+            self.config['use_multi_points'] = self.use_multi_points
             self.save_config()
 
+            unit_text = "毫秒" if self.interval_unit == 'ms' else "秒"
             self.log_message(
-                "启动配置: 模式=" + str(self.config['click_mode']) + ", 间隔=" + str(self.config['interval_seconds']) + "秒"
+                "启动配置: 模式=" + str(self.config['click_mode']) + ", 间隔=" + str(interval) + unit_text
+                + ", 按键=" + str(self.click_button) + ", 按住=" + str(hold_ms) + "ms"
+                + (f", 抖动={jitter}%" if jitter else "")
+                + (", 多点位" if self.use_multi_points else "")
                 + (", 倒计时=" + str(countdown) + "秒" if countdown else "")
                 + (", 次数上限=" + str(click_limit) if click_limit else "")
                 + (", 时长上限=" + str(duration_limit) + "分钟" if duration_limit else "")
@@ -1142,12 +1644,41 @@ class AutoClicker:
 
             self.log_message("自动点击已启动")
 
+            # CX-12：托盘状态区分（运行中）
+            self._update_tray_status(True)
+
         except ValueError:
             messagebox.showerror("错误", "请输入有效的数字")
         except Exception as e:
             self.log_message(f"启动失败: {e}")
             messagebox.showerror("错误", f"启动失败: {e}")
             
+    def _update_tray_status(self, running):
+        """CX-12：托盘状态区分（运行/停止），同步托盘菜单与 Windows 提示气泡"""
+        try:
+            # Windows 托盘提示气泡（szTip）随运行状态变化
+            if IS_WINDOWS and getattr(self, 'tray_icon_created', False) and hasattr(self, 'tray_nid'):
+                try:
+                    tip = "AutoClicker - 运行中" if running else "AutoClicker - 已停止"
+                    new_nid = self.tray_nid[:5] + (tip,)
+                    win32gui.Shell_NotifyIcon(win32gui.NIM_MODIFY, new_nid)
+                except Exception:
+                    pass
+            # 托盘右键菜单顶部插入动态“停止/启动”项，区分当前状态
+            menu = getattr(self, 'tray_menu', None)
+            if menu is not None:
+                try:
+                    menu.delete(0)
+                except Exception:
+                    pass
+                if running:
+                    menu.insert_command(0, label="⏹ 停止点击", command=self.emergency_stop)
+                else:
+                    menu.insert_command(0, label="▶ 启动点击", command=self.start_clicking)
+                menu.insert_separator(1)
+        except Exception:
+            pass
+
     def stop_clicking(self, reason=""):
         self.is_running = False
         self.countdown_cancelled = False
@@ -1166,6 +1697,9 @@ class AutoClicker:
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
         self.interval_entry.config(state=tk.NORMAL)
+
+        # CX-12：托盘状态区分（已停止）
+        self._update_tray_status(False)
 
         if reason:
             self.log_message("自动点击已停止（原因：" + str(reason) + "）")
@@ -1222,6 +1756,12 @@ class AutoClicker:
             log_entry = f"[{timestamp}] {message}\n"
             # 输出到控制台
             print(log_entry)
+            # CX-10：同时写入磁盘日志
+            if getattr(self, '_file_logger', None) is not None:
+                try:
+                    self._file_logger.info(message)
+                except Exception:
+                    pass
             # 输出到UI文本框
             self.log_text.config(state=tk.NORMAL)
             self.log_text.insert(tk.END, log_entry)
