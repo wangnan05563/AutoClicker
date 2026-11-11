@@ -20,6 +20,7 @@
 - 开机自动启动（Windows 注册表 / Linux autostart）
 - 后台低资源运行（内存约 20-30MB）
 - 实时状态显示与运行日志（应用内 + 磁盘 `~/.auto_clicker_logs/autoclicker.log`，RotatingFileHandler 5MB×5）
+- 三档主题：浅色 / 深色 / 跟随系统，运行时切换并持久化（语义化配色集中管理，无散落色值）
 
 ## 系统要求
 

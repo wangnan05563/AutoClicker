@@ -91,6 +91,10 @@ def build_exe():
         "PIL.ImageTk",
         "tkinter",
         "tkinter.ttk",
+        # P2 主题系统（TH-01/TH-03）：ttkbootstrap 可选接入，单文件打包需显式隐藏导入
+        "ttkbootstrap",
+        "ttkbootstrap.style",
+        "ttkbootstrap.widgets",
     ]
 
     for imp in hidden_imports:

@@ -369,9 +369,13 @@ class AutoClicker:
 
         self.setup_logging()
         self.load_config()
+        self._init_theme()
         self.setup_ui()
+        self._apply_theme()
         self.setup_hotkeys()
         self.setup_tray_icon()
+        if self.theme_mode == 'system':
+            self._poll_system_theme()
         
         # 关闭按钮直接退出程序
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -423,6 +427,7 @@ class AutoClicker:
             'autostart': False,  # 开机自启
             'use_multi_points': False,  # 使用多点位序列
             'multi_points': [],  # 多点位坐标列表 [{'x':, 'y':}, ...]
+            'theme_mode': 'light',  # 主题：light / dark / system（TH-01/TH-03）
             'config_version': 2  # 配置 schema 版本（CX-09 迁移用）
         }
         
@@ -496,6 +501,132 @@ class AutoClicker:
             return ImageTk.PhotoImage(img)
         except Exception:
             return None
+
+    # ==================== P2 主题系统（TH-01 / TH-02 / TH-03） ====================
+    def _init_theme(self):
+        """初始化主题：语义化调色板 + 可选接入 ttkbootstrap + 读取持久化主题"""
+        # TH-02：主色/成功/危险/警告等语义化变量，集中定义，避免散落十六进制
+        self.THEMES = {
+            'light': {
+                'bg': '#ffffff', 'fg': '#212529', 'muted': '#6c757d',
+                'primary': '#007bff', 'success': '#28a745', 'danger': '#dc3545',
+                'warning': '#fd7e14', 'surface': '#f8f9fa', 'border': '#ced4da',
+            },
+            'dark': {
+                'bg': '#212529', 'fg': '#e9ecef', 'muted': '#adb5bd',
+                'primary': '#4a90d9', 'success': '#2ecc71', 'danger': '#e74c3c',
+                'warning': '#e67e22', 'surface': '#2b3035', 'border': '#495057',
+            },
+        }
+        self.theme_mode = self.config.get('theme_mode', 'light')
+        self._ttkb_style = None
+        # TH-01：可选接入 ttkbootstrap（缺失则降级为纯 ttk + 手动语义配色）
+        try:
+            import ttkbootstrap as ttkb  # noqa
+            self._ttkb_style = ttkb.Style(theme='cosmo')
+        except Exception:
+            self._ttkb_style = None
+        self._current_palette = self._resolve_palette()
+
+    def _color(self, key):
+        return self._current_palette.get(key, '#000000')
+
+    def _shade(self, hex_color, factor=0.85):
+        """按比例调暗十六进制色，用于 activebackground（TH-02）"""
+        try:
+            h = hex_color.lstrip('#')
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+            r = max(0, int(r * factor)); g = max(0, int(g * factor)); b = max(0, int(b * factor))
+            return '#%02x%02x%02x' % (r, g, b)
+        except Exception:
+            return hex_color
+
+    def _system_is_dark(self):
+        """检测系统是否深色模式（Windows 注册表；其他平台默认浅色）"""
+        try:
+            if IS_WINDOWS:
+                import winreg
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                    r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+                val = winreg.QueryValueEx(key, "AppsUseLightTheme")[0]
+                return val == 0
+        except Exception:
+            pass
+        return False
+
+    def _resolve_palette(self):
+        mode = self.theme_mode
+        if mode == 'system':
+            mode = 'dark' if self._system_is_dark() else 'light'
+        return self.THEMES.get(mode, self.THEMES['light'])
+
+    def _apply_theme(self):
+        """运行时应用主题：切换 ttkbootstrap 主题 + 重着色语义化控件（TH-01/TH-02）"""
+        try:
+            pal = self._resolve_palette()
+            self._current_palette = pal
+            # ttkbootstrap 主题切换（TH-01）
+            if self._ttkb_style is not None:
+                try:
+                    effective = self.theme_mode
+                    if effective == 'system':
+                        effective = 'dark' if self._system_is_dark() else 'light'
+                    tb_name = 'darkly' if effective == 'dark' else 'cosmo'
+                    self._ttkb_style.theme_use(tb_name)
+                except Exception:
+                    pass
+            # 语义化重着色已知 tk 控件（TH-02）
+            if getattr(self, 'start_btn', None):
+                self.start_btn.configure(bg=pal['success'], activebackground=self._shade(pal['success']),
+                                         fg='white', activeforeground='white')
+            if getattr(self, 'stop_btn', None):
+                self.stop_btn.configure(bg=pal['danger'], activebackground=self._shade(pal['danger']),
+                                        fg='white', activeforeground='white')
+            if getattr(self, 'test_btn', None):
+                self.test_btn.configure(bg=pal['primary'], activebackground=self._shade(pal['primary']),
+                                        fg='white', activeforeground='white')
+            if getattr(self, 'set_area_btn', None):
+                self.set_area_btn.configure(bg=pal['muted'], activebackground=self._shade(pal['muted']),
+                                            fg='white', activeforeground='white')
+            if getattr(self, 'log_text', None):
+                try:
+                    self.log_text.configure(bg=pal['surface'], fg=pal['fg'])
+                except Exception:
+                    pass
+            try:
+                self.root.configure(bg=pal['bg'])
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def on_theme_change(self, mode):
+        """切换主题并持久化（TH-03）"""
+        try:
+            if mode not in ('light', 'dark', 'system'):
+                return
+            self.theme_mode = mode
+            self.config['theme_mode'] = mode
+            self.save_config()
+            self._apply_theme()
+            # 跟随系统模式：启动轮询，随系统深浅色变化
+            if mode == 'system':
+                self._poll_system_theme()
+        except Exception:
+            pass
+
+    def on_theme_change_ui(self, event=None):
+        mapping = {'浅色': 'light', '深色': 'dark', '跟随系统': 'system'}
+        self.on_theme_change(mapping.get(self.theme_var.get(), 'light'))
+
+    def _poll_system_theme(self):
+        """system 模式下每 5s 检测系统深浅色变化并应用（TH-03）"""
+        try:
+            if self.theme_mode == 'system':
+                self._apply_theme()
+                self.root.after(5000, self._poll_system_theme)
+        except Exception:
+            pass
 
     def save_config(self):
         try:
@@ -886,8 +1017,19 @@ class AutoClicker:
         self.status_circle = self.status_indicator.create_oval(2, 2, 10, 10, fill='red', outline='')
         
         self.status_text_label = ttk.Label(title_container, text="已停止", 
-                                          font=('微软雅黑', 11, 'bold'), foreground='red')
+                                          font=('微软雅黑', 11, 'bold'), foreground=self._color('danger'))
         self.status_text_label.pack(side=tk.RIGHT, padx=5)
+        
+        # 主题选择器（TH-01 / TH-03）
+        theme_row = ttk.Frame(header_frame)
+        theme_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(theme_row, text="主题", font=('微软雅黑', 9)).pack(side=tk.LEFT)
+        self.theme_var = tk.StringVar(
+            value={'light': '浅色', 'dark': '深色', 'system': '跟随系统'}.get(self.theme_mode, '浅色'))
+        self.theme_combo = ttk.Combobox(theme_row, textvariable=self.theme_var,
+                                        values=['浅色', '深色', '跟随系统'], state='readonly', width=10)
+        self.theme_combo.pack(side=tk.LEFT, padx=(5, 0))
+        self.theme_combo.bind('<<ComboboxSelected>>', self.on_theme_change_ui)
         
         # 分隔线
         separator = ttk.Separator(self.main_frame, orient='horizontal')
@@ -900,7 +1042,7 @@ class AutoClicker:
         # 状态文字 + 倒计时进度条（同一行）
         sb_top = ttk.Frame(status_bar)
         sb_top.pack(fill=tk.X, pady=(0, 6))
-        self.sb_status_label = ttk.Label(sb_top, text="● 已停止", font=('微软雅黑', 11, 'bold'), foreground='#dc3545')
+        self.sb_status_label = ttk.Label(sb_top, text="● 已停止", font=('微软雅黑', 11, 'bold'), foreground=self._color('danger'))
         self.sb_status_label.pack(side=tk.LEFT)
         ttk.Label(sb_top, text="  启动倒计时", font=('微软雅黑', 9)).pack(side=tk.LEFT, padx=(10, 4))
         self.countdown_bar = ttk.Progressbar(sb_top, orient='horizontal', length=160, mode='determinate', maximum=100)
@@ -914,11 +1056,11 @@ class AutoClicker:
         sb_mid.pack(fill=tk.X)
         self.sb_count_label = ttk.Label(sb_mid, text="总点击: 0", font=('微软雅黑', 10))
         self.sb_count_label.pack(side=tk.LEFT, padx=(0, 16))
-        self.sb_success_label = ttk.Label(sb_mid, text="成功: 0", font=('微软雅黑', 10), foreground='#28a745')
+        self.sb_success_label = ttk.Label(sb_mid, text="成功: 0", font=('微软雅黑', 10), foreground=self._color('success'))
         self.sb_success_label.pack(side=tk.LEFT, padx=(0, 16))
-        self.sb_fail_label = ttk.Label(sb_mid, text="失败: 0", font=('微软雅黑', 10), foreground='#dc3545')
+        self.sb_fail_label = ttk.Label(sb_mid, text="失败: 0", font=('微软雅黑', 10), foreground=self._color('danger'))
         self.sb_fail_label.pack(side=tk.LEFT, padx=(0, 16))
-        self.sb_runtime_label = ttk.Label(sb_mid, text="运行时长: 00:00", font=('微软雅黑', 10), foreground='#007bff')
+        self.sb_runtime_label = ttk.Label(sb_mid, text="运行时长: 00:00", font=('微软雅黑', 10), foreground=self._color('primary'))
         self.sb_runtime_label.pack(side=tk.LEFT)
 
         # ==================== 核心控制区域 ====================
@@ -932,8 +1074,8 @@ class AutoClicker:
         self.start_btn = tk.Button(main_control_frame, text=" 启动自动点击",
                                   command=self.start_clicking,
                                   font=('微软雅黑', 12, 'bold'),
-                                  bg='#28a745', fg='white',
-                                  activebackground='#218838', activeforeground='white',
+                                  bg=self._color('success'), fg='white',
+                                  activebackground=self._shade(self._color('success')), activeforeground='white',
                                   width=20, height=2, cursor='hand2',
                                   relief=tk.FLAT, bd=0)
         self._icon_play = self.make_icon('play', 18, 'white')
@@ -944,8 +1086,8 @@ class AutoClicker:
         self.stop_btn = tk.Button(main_control_frame, text=" 停止",
                                  command=self.stop_clicking,
                                  font=('微软雅黑', 12, 'bold'),
-                                 bg='#dc3545', fg='white',
-                                 activebackground='#c82333', activeforeground='white',
+                                 bg=self._color('danger'), fg='white',
+                                 activebackground=self._shade(self._color('danger')), activeforeground='white',
                                  width=15, height=2, cursor='hand2',
                                  relief=tk.FLAT, bd=0, state=tk.DISABLED)
         self._icon_stop = self.make_icon('stop', 18, 'white')
@@ -957,8 +1099,8 @@ class AutoClicker:
         self.test_btn = tk.Button(control_card, text=" 测试点击位置",
                                  command=self.test_click,
                                  font=('微软雅黑', 10),
-                                 bg='#17a2b8', fg='white',
-                                 activebackground='#138496', activeforeground='white',
+                                 bg=self._color('primary'), fg='white',
+                                 activebackground=self._shade(self._color('primary')), activeforeground='white',
                                  height=1, cursor='hand2',
                                  relief=tk.FLAT, bd=0)
         self._icon_target = self.make_icon('target', 16, 'white')
@@ -1036,14 +1178,14 @@ class AutoClicker:
         
         self.area_label = ttk.Label(area_input_frame, 
                                    text=str(self.config['click_area']['width']) + "x" + str(self.config['click_area']['height']),
-                                   font=('微软雅黑', 10), foreground='#007bff')
+                                   font=('微软雅黑', 10), foreground=self._color('primary'))
         self.area_label.pack(side=tk.LEFT, padx=(0, 10))
         
         self.set_area_btn = tk.Button(area_input_frame, text="设置区域", 
                                      command=self.set_click_area,
                                      font=('微软雅黑', 9),
-                                     bg='#6c757d', fg='white',
-                                     activebackground='#5a6268',
+                                     bg=self._color('muted'), fg='white',
+                                     activebackground=self._shade(self._color('muted')),
                                      cursor='hand2', relief=tk.FLAT, bd=0)
         self.set_area_btn.pack(side=tk.LEFT)
         
@@ -1062,7 +1204,7 @@ class AutoClicker:
         ttk.Label(next_click_container, text="下次点击:", 
                  font=('微软雅黑', 9)).pack(side=tk.LEFT)
         self.next_click_label = ttk.Label(next_click_container, text="--", 
-                                         font=('微软雅黑', 10, 'bold'), foreground='#007bff')
+                                         font=('微软雅黑', 10, 'bold'), foreground=self._color('primary'))
         self.next_click_label.pack(side=tk.LEFT, padx=(5, 0))
         
         # 点击次数
@@ -1072,7 +1214,7 @@ class AutoClicker:
         ttk.Label(count_container, text="点击次数:", 
                  font=('微软雅黑', 9)).pack(side=tk.LEFT)
         self.click_count_label = ttk.Label(count_container, text="0", 
-                                          font=('微软雅黑', 14, 'bold'), foreground='#28a745')
+                                          font=('微软雅黑', 14, 'bold'), foreground=self._color('success'))
         self.click_count_label.pack(side=tk.LEFT, padx=(5, 0))
         
         self.click_count = 0
@@ -1266,15 +1408,15 @@ class AutoClicker:
         self.log_inner = ttk.Frame(log_card)
         self.log_inner.pack(fill=tk.BOTH, expand=True)
         self.log_text = tk.Text(self.log_inner, height=10, state=tk.DISABLED,
-                               font=('Consolas', 9), bg='#f8f9fa',
+                               font=('Consolas', 9), bg=self._color('surface'),
                                relief=tk.FLAT, padx=5, pady=5)
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar = ttk.Scrollbar(self.log_inner, orient=tk.VERTICAL, command=self.log_text.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_text['yscrollcommand'] = scrollbar.set
         # 日志分级着色标签（UI-04）
-        self.log_text.tag_config('lvl_err', foreground='#dc3545')
-        self.log_text.tag_config('lvl_warn', foreground='#fd7e14')
+        self.log_text.tag_config('lvl_err', foreground=self._color('danger'))
+        self.log_text.tag_config('lvl_warn', foreground=self._color('warning'))
         
         # ==================== 底部提示区域 ====================
         footer_frame = ttk.Frame(self.main_frame)
@@ -1286,11 +1428,11 @@ class AutoClicker:
         
         shortcut_text = "快捷键: F6 启动/停止 · F8/Esc 紧急停止"
         ttk.Label(shortcut_frame, text=shortcut_text, 
-                 font=('微软雅黑', 9), foreground='#6c757d').pack(anchor=tk.CENTER)
+                 font=('微软雅黑', 9), foreground=self._color('muted')).pack(anchor=tk.CENTER)
         
         # 版本信息
         version_label = ttk.Label(footer_frame, text="v2.0 (Python 3.14)", 
-                                 font=('微软雅黑', 8), foreground='#adb5bd')
+                                 font=('微软雅黑', 8), foreground=self._color('muted'))
         version_label.pack(anchor=tk.CENTER)
         
         # 更新状态标签引用
@@ -1838,7 +1980,7 @@ class AutoClicker:
 
         # 更新状态指示器
         self.status_indicator.itemconfig(self.status_circle, fill='red')
-        self.status_label.config(text="已停止", foreground='red')
+        self.status_label.config(text="已停止", foreground=self._color('danger'))
         self.next_click_label.config(text="--")
 
         # P2 状态条复位（UI-03）
@@ -2001,7 +2143,8 @@ class AutoClicker:
         """设置系统托盘图标和菜单（跨平台）"""
         try:
             # 创建原生托盘菜单（使用tkinter Menu）
-            self.tray_menu = tk.Menu(self.root, tearoff=0, bg='#f0f0f0', fg='black')
+            self.tray_menu = tk.Menu(self.root, tearoff=0,
+                                     bg=self._color('surface'), fg=self._color('fg'))
             self.tray_menu.add_command(label="显示窗口", command=self.show_from_tray)
             self.tray_menu.add_separator()
             self.tray_menu.add_command(label="退出程序", command=self.exit_from_tray)
