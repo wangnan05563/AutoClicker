@@ -359,6 +359,14 @@ class AutoClicker:
         self.use_multi_points = False
         self.multi_points = []
 
+        # P2 状态可视化默认值（UI-03）
+        self.success_count = 0
+        self.fail_count = 0
+        self._runtime_after_id = None
+        self._log_buffer = []  # [(text, level)] 全量日志缓冲（UI-04 过滤用）
+        self._log_filter = ''
+        self._log_collapsed = False
+
         self.setup_logging()
         self.load_config()
         self.setup_ui()
@@ -441,7 +449,54 @@ class AutoClicker:
                 self.config['current_profile'] = None
         except Exception:
             pass
-            
+
+    # ==================== P2 矢量图标工厂（UI-02，无 PIL 时降级为文本） ====================
+    def make_icon(self, name, size=16, color='#333333'):
+        """生成单色矢量图标的 tk.PhotoImage；无 PIL 时返回 None（调用方降级为文本）"""
+        try:
+            from PIL import Image, ImageDraw, ImageTk
+            img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            c = color
+            if name == 'play':
+                d.polygon([(size*0.30, size*0.20), (size*0.30, size*0.80), (size*0.80, size*0.50)], fill=c)
+            elif name == 'stop':
+                d.rectangle([size*0.28, size*0.28, size*0.72, size*0.72], fill=c)
+            elif name == 'target':
+                d.ellipse([size*0.18, size*0.18, size*0.82, size*0.82], outline=c, width=2)
+                d.line([(size*0.5, size*0.10), (size*0.5, size*0.90)], fill=c, width=2)
+                d.line([(size*0.10, size*0.5), (size*0.90, size*0.5)], fill=c, width=2)
+            elif name == 'gear':
+                d.ellipse([size*0.30, size*0.30, size*0.70, size*0.70], outline=c, width=2)
+                for a in range(0, 360, 45):
+                    import math
+                    r = math.radians(a)
+                    d.line([(size*0.5 + 0.30*size*math.cos(r), size*0.5 + 0.30*size*math.sin(r)),
+                            (size*0.5 + 0.42*size*math.cos(r), size*0.5 + 0.42*size*math.sin(r))], fill=c, width=2)
+            elif name == 'clipboard':
+                d.rectangle([size*0.30, size*0.22, size*0.70, size*0.80], outline=c, width=2)
+                d.rectangle([size*0.40, size*0.14, size*0.60, size*0.26], outline=c, width=2)
+            elif name == 'broom':
+                d.line([(size*0.25, size*0.65), (size*0.70, size*0.25)], fill=c, width=3)
+                d.line([(size*0.30, size*0.78), (size*0.72, size*0.40)], fill=c, width=3)
+            elif name == 'funnel':
+                d.line([(size*0.20, size*0.25), (size*0.80, size*0.25), (size*0.55, size*0.55), (size*0.55, size*0.80), (size*0.45, size*0.80), (size*0.45, size*0.55)], fill=c, width=2, closed=True)
+            elif name == 'folder':
+                d.rectangle([size*0.20, size*0.35, size*0.80, size*0.75], outline=c, width=2)
+                d.line([(size*0.20, size*0.35), (size*0.35, size*0.25), (size*0.55, size*0.25), (size*0.55, size*0.35)], fill=c, width=2)
+            elif name == 'shield':
+                d.polygon([(size*0.5, size*0.15), (size*0.82, size*0.28), (size*0.82, size*0.55),
+                           (size*0.5, size*0.85), (size*0.18, size*0.55), (size*0.18, size*0.28)], outline=c, width=2)
+            elif name == 'clock':
+                d.ellipse([size*0.18, size*0.18, size*0.82, size*0.82], outline=c, width=2)
+                d.line([(size*0.5, size*0.5), (size*0.5, size*0.30)], fill=c, width=2)
+                d.line([(size*0.5, size*0.5), (size*0.68, size*0.5)], fill=c, width=2)
+            else:
+                return None
+            return ImageTk.PhotoImage(img)
+        except Exception:
+            return None
+
     def save_config(self):
         try:
             with open(self.config_file, 'w', encoding='utf-8') as f:
@@ -820,7 +875,7 @@ class AutoClicker:
         title_container.pack(fill=tk.X)
         
         # 主标题
-        title_label = ttk.Label(title_container, text="🖱️ 桌面自动点击工具", 
+        title_label = ttk.Label(title_container, text="桌面自动点击工具", 
                                font=('微软雅黑', 18, 'bold'))
         title_label.pack(side=tk.LEFT)
         
@@ -837,41 +892,78 @@ class AutoClicker:
         # 分隔线
         separator = ttk.Separator(self.main_frame, orient='horizontal')
         separator.pack(fill=tk.X, pady=(0, 15))
-        
+
+        # ==================== 顶部运行状态条（UI-01 / UI-03） ====================
+        status_bar = ttk.LabelFrame(self.main_frame, text="运行状态", padding="10")
+        status_bar.pack(fill=tk.X, pady=(0, 15))
+
+        # 状态文字 + 倒计时进度条（同一行）
+        sb_top = ttk.Frame(status_bar)
+        sb_top.pack(fill=tk.X, pady=(0, 6))
+        self.sb_status_label = ttk.Label(sb_top, text="● 已停止", font=('微软雅黑', 11, 'bold'), foreground='#dc3545')
+        self.sb_status_label.pack(side=tk.LEFT)
+        ttk.Label(sb_top, text="  启动倒计时", font=('微软雅黑', 9)).pack(side=tk.LEFT, padx=(10, 4))
+        self.countdown_bar = ttk.Progressbar(sb_top, orient='horizontal', length=160, mode='determinate', maximum=100)
+        self.countdown_bar.pack(side=tk.LEFT, padx=(0, 6))
+        self.countdown_bar['value'] = 0
+        self.sb_countdown_label = ttk.Label(sb_top, text="--", font=('微软雅黑', 9), foreground='gray')
+        self.sb_countdown_label.pack(side=tk.LEFT)
+
+        # 计数 / 运行时长（同一行）
+        sb_mid = ttk.Frame(status_bar)
+        sb_mid.pack(fill=tk.X)
+        self.sb_count_label = ttk.Label(sb_mid, text="总点击: 0", font=('微软雅黑', 10))
+        self.sb_count_label.pack(side=tk.LEFT, padx=(0, 16))
+        self.sb_success_label = ttk.Label(sb_mid, text="成功: 0", font=('微软雅黑', 10), foreground='#28a745')
+        self.sb_success_label.pack(side=tk.LEFT, padx=(0, 16))
+        self.sb_fail_label = ttk.Label(sb_mid, text="失败: 0", font=('微软雅黑', 10), foreground='#dc3545')
+        self.sb_fail_label.pack(side=tk.LEFT, padx=(0, 16))
+        self.sb_runtime_label = ttk.Label(sb_mid, text="运行时长: 00:00", font=('微软雅黑', 10), foreground='#007bff')
+        self.sb_runtime_label.pack(side=tk.LEFT)
+
         # ==================== 核心控制区域 ====================
-        control_card = ttk.LabelFrame(self.main_frame, text="⚡ 核心控制", padding="15")
+        control_card = ttk.LabelFrame(self.main_frame, text="核心控制", padding="15")
         control_card.pack(fill=tk.X, pady=(0, 15))
         
         # 主控制按钮 - 大按钮设计
         main_control_frame = ttk.Frame(control_card)
         main_control_frame.pack(fill=tk.X, pady=(0, 10))
         
-        self.start_btn = tk.Button(main_control_frame, text="▶ 启动自动点击", 
+        self.start_btn = tk.Button(main_control_frame, text=" 启动自动点击",
                                   command=self.start_clicking,
                                   font=('微软雅黑', 12, 'bold'),
                                   bg='#28a745', fg='white',
                                   activebackground='#218838', activeforeground='white',
                                   width=20, height=2, cursor='hand2',
                                   relief=tk.FLAT, bd=0)
+        self._icon_play = self.make_icon('play', 18, 'white')
+        if self._icon_play:
+            self.start_btn.configure(image=self._icon_play, compound=tk.LEFT)
         self.start_btn.pack(side=tk.LEFT, padx=(0, 10), fill=tk.X, expand=True)
         
-        self.stop_btn = tk.Button(main_control_frame, text="⏹ 停止", 
+        self.stop_btn = tk.Button(main_control_frame, text=" 停止",
                                  command=self.stop_clicking,
                                  font=('微软雅黑', 12, 'bold'),
                                  bg='#dc3545', fg='white',
                                  activebackground='#c82333', activeforeground='white',
                                  width=15, height=2, cursor='hand2',
                                  relief=tk.FLAT, bd=0, state=tk.DISABLED)
+        self._icon_stop = self.make_icon('stop', 18, 'white')
+        if self._icon_stop:
+            self.stop_btn.configure(image=self._icon_stop, compound=tk.LEFT)
         self.stop_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
         
         # 测试按钮
-        self.test_btn = tk.Button(control_card, text="🎯 测试点击位置", 
+        self.test_btn = tk.Button(control_card, text=" 测试点击位置",
                                  command=self.test_click,
                                  font=('微软雅黑', 10),
                                  bg='#17a2b8', fg='white',
                                  activebackground='#138496', activeforeground='white',
                                  height=1, cursor='hand2',
                                  relief=tk.FLAT, bd=0)
+        self._icon_target = self.make_icon('target', 16, 'white')
+        if self._icon_target:
+            self.test_btn.configure(image=self._icon_target, compound=tk.LEFT)
         self.test_btn.pack(fill=tk.X, pady=(5, 0))
         
         # ==================== 配置区域 - 两列布局 ====================
@@ -879,14 +971,14 @@ class AutoClicker:
         config_container.pack(fill=tk.X, pady=(0, 15))
         
         # 左列 - 基本配置
-        left_card = ttk.LabelFrame(config_container, text="⚙️ 基本配置", padding="15")
+        left_card = ttk.LabelFrame(config_container, text="目标", padding="15")
         left_card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
         
         # 点击间隔配置
         interval_container = ttk.Frame(left_card)
         interval_container.pack(fill=tk.X, pady=(0, 12))
         
-        ttk.Label(interval_container, text="⏱️ 点击间隔", 
+        ttk.Label(interval_container, text="点击间隔", 
                  font=('微软雅黑', 10, 'bold')).pack(anchor=tk.W)
         
         interval_input_frame = ttk.Frame(interval_container)
@@ -907,7 +999,7 @@ class AutoClicker:
         mode_container = ttk.Frame(left_card)
         mode_container.pack(fill=tk.X, pady=(0, 12))
         
-        ttk.Label(mode_container, text="🎯 点击模式", 
+        ttk.Label(mode_container, text="点击模式", 
                  font=('微软雅黑', 10, 'bold')).pack(anchor=tk.W)
         
         # 模式映射
@@ -936,7 +1028,7 @@ class AutoClicker:
         area_container = ttk.Frame(left_card)
         area_container.pack(fill=tk.X)
         
-        ttk.Label(area_container, text="📐 点击区域", 
+        ttk.Label(area_container, text="点击区域", 
                  font=('微软雅黑', 10, 'bold')).pack(anchor=tk.W)
         
         area_input_frame = ttk.Frame(area_container)
@@ -956,7 +1048,7 @@ class AutoClicker:
         self.set_area_btn.pack(side=tk.LEFT)
         
         # 右列 - 高级选项和状态
-        right_card = ttk.LabelFrame(config_container, text="📊 状态监控", padding="15")
+        right_card = ttk.LabelFrame(config_container, text="状态监控", padding="15")
         right_card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
         # 状态信息
@@ -967,7 +1059,7 @@ class AutoClicker:
         next_click_container = ttk.Frame(status_info_frame)
         next_click_container.pack(fill=tk.X, pady=(0, 8))
         
-        ttk.Label(next_click_container, text="⏰ 下次点击:", 
+        ttk.Label(next_click_container, text="下次点击:", 
                  font=('微软雅黑', 9)).pack(side=tk.LEFT)
         self.next_click_label = ttk.Label(next_click_container, text="--", 
                                          font=('微软雅黑', 10, 'bold'), foreground='#007bff')
@@ -977,7 +1069,7 @@ class AutoClicker:
         count_container = ttk.Frame(status_info_frame)
         count_container.pack(fill=tk.X)
         
-        ttk.Label(count_container, text="📈 点击次数:", 
+        ttk.Label(count_container, text="点击次数:", 
                  font=('微软雅黑', 9)).pack(side=tk.LEFT)
         self.click_count_label = ttk.Label(count_container, text="0", 
                                           font=('微软雅黑', 14, 'bold'), foreground='#28a745')
@@ -986,24 +1078,24 @@ class AutoClicker:
         self.click_count = 0
         
         # 高级选项
-        options_frame = ttk.LabelFrame(right_card, text="🔧 高级选项", padding="10")
+        options_frame = ttk.LabelFrame(right_card, text="高级选项", padding="10")
         options_frame.pack(fill=tk.X, pady=(10, 0))
         
         self.prevent_sleep_var = tk.BooleanVar(value=self.config['prevent_sleep'])
-        prevent_sleep_check = ttk.Checkbutton(options_frame, text="☕ 防止系统锁屏",
+        prevent_sleep_check = ttk.Checkbutton(options_frame, text="防止系统锁屏",
                                              variable=self.prevent_sleep_var,
                                              command=self.on_prevent_sleep_changed)
         prevent_sleep_check.pack(anchor=tk.W, pady=3)
 
         # 鼠标跟随设置
         self.mouse_follow_var = tk.BooleanVar(value=self.config['mouse_follow_enabled'])
-        mouse_follow_check = ttk.Checkbutton(options_frame, text="🖱️ 鼠标跟随移动",
+        mouse_follow_check = ttk.Checkbutton(options_frame, text="鼠标跟随移动",
                                              variable=self.mouse_follow_var,
                                              command=self.on_mouse_follow_changed)
         mouse_follow_check.pack(anchor=tk.W, pady=3)
         
         self.mouse_move_only_var = tk.BooleanVar(value=self.config['mouse_move_only'])
-        mouse_move_only_check = ttk.Checkbutton(options_frame, text="   📍 只移动不点击",
+        mouse_move_only_check = ttk.Checkbutton(options_frame, text="   只移动不点击",
                                                 variable=self.mouse_move_only_var,
                                                 command=self.on_mouse_move_only_changed)
         mouse_move_only_check.pack(anchor=tk.W, pady=3)
@@ -1012,7 +1104,7 @@ class AutoClicker:
         speed_container = ttk.Frame(options_frame)
         speed_container.pack(fill=tk.X, pady=(5, 0))
         
-        ttk.Label(speed_container, text="⚡ 移动速度:", 
+        ttk.Label(speed_container, text="移动速度:", 
                  font=('微软雅黑', 9)).pack(side=tk.LEFT, padx=(0, 10))
         
         self.mouse_speed_var = tk.StringVar(value=str(self.config['mouse_move_speed']))
@@ -1028,7 +1120,7 @@ class AutoClicker:
         self.mouse_speed_label.pack(side=tk.LEFT)
         
         # ==================== 安全与终点控制（P0 止血） ====================
-        safety_card = ttk.LabelFrame(self.main_frame, text="🛡 安全与终点控制", padding="15")
+        safety_card = ttk.LabelFrame(self.main_frame, text="安全", padding="15")
         safety_card.pack(fill=tk.X, pady=(0, 15))
 
         # 启动倒计时（CX-04）
@@ -1060,17 +1152,17 @@ class AutoClicker:
 
         # 鼠标位移 failsafe（CX-01）
         self.failsafe_var = tk.BooleanVar(value=self.config.get('failsafe_enabled', False))
-        ttk.Checkbutton(safety_card, text="🖱 鼠标移动即停 (failsafe，移动>20px自动急停)",
+        ttk.Checkbutton(safety_card, text="鼠标移动即停 (failsafe，移动>20px自动急停)",
                        variable=self.failsafe_var).pack(anchor=tk.W)
 
         # 关闭行为（CX-06）
         self.close_to_tray_var = tk.BooleanVar(value=self.config.get('close_to_tray', True))
-        ttk.Checkbutton(safety_card, text="❌ 关闭窗口时最小化到托盘（否则直接退出）",
+        ttk.Checkbutton(safety_card, text="关闭窗口时最小化到托盘（否则直接退出）",
                        variable=self.close_to_tray_var,
                        command=self.on_close_behavior_changed).pack(anchor=tk.W, pady=(4, 0))
 
         # ==================== P1 功能扩展：点击 / 节奏 / 多点位 ====================
-        p1_card = ttk.LabelFrame(self.main_frame, text="🖱 点击 / 节奏 / 多点位 (P1)", padding="15")
+        p1_card = ttk.LabelFrame(self.main_frame, text="节奏与点击 (P1)", padding="15")
         p1_card.pack(fill=tk.X, pady=(0, 15))
 
         row1 = ttk.Frame(p1_card)
@@ -1096,7 +1188,7 @@ class AutoClicker:
         mp_frame = ttk.Frame(p1_card)
         mp_frame.pack(fill=tk.X, pady=(4, 0))
         self.use_multi_points_var = tk.BooleanVar(value=self.config.get('use_multi_points', False))
-        ttk.Checkbutton(mp_frame, text="🎯 使用多点位序列点击（按列表循环）",
+        ttk.Checkbutton(mp_frame, text="使用多点位序列点击（按列表循环）",
                         variable=self.use_multi_points_var).pack(anchor=tk.W)
         self.multi_point_listbox = tk.Listbox(p1_card, height=4)
         self.multi_point_listbox.pack(fill=tk.X, pady=(4, 4))
@@ -1117,7 +1209,7 @@ class AutoClicker:
         ttk.Entry(mp_entry, textvariable=self.mp_y_var, width=8).pack(side=tk.LEFT)
 
         # ==================== P1 功能扩展：热键 / 配置方案 / 系统 ====================
-        p1b_card = ttk.LabelFrame(self.main_frame, text="⌨️ 热键 / 配置方案 / 系统 (P1)", padding="15")
+        p1b_card = ttk.LabelFrame(self.main_frame, text="高级 (P1)", padding="15")
         p1b_card.pack(fill=tk.X, pady=(0, 15))
 
         hk_row = ttk.Frame(p1b_card)
@@ -1146,39 +1238,43 @@ class AutoClicker:
         sys_row = ttk.Frame(p1b_card)
         sys_row.pack(fill=tk.X, pady=(0, 6))
         self.autostart_var = tk.BooleanVar(value=self.config.get('autostart', False))
-        ttk.Checkbutton(sys_row, text="🚀 开机自动启动", variable=self.autostart_var,
+        ttk.Checkbutton(sys_row, text="开机自动启动", variable=self.autostart_var,
                         command=self.on_autostart_changed).pack(side=tk.LEFT)
-        ttk.Button(sys_row, text="📂 打开日志目录", command=self.open_log_dir).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Button(sys_row, text="打开日志目录", command=self.open_log_dir).pack(side=tk.LEFT, padx=(10, 0))
 
         # ==================== 日志区域 ====================
-        log_card = ttk.LabelFrame(self.main_frame, text="📝 运行日志", padding="10")
+        log_card = ttk.LabelFrame(self.main_frame, text="运行日志", padding="10")
         log_card.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-        
-        # 日志工具栏
+
+        # 日志工具栏（UI-04：过滤 / 复制 / 清空；UI-01：可折叠）
         log_toolbar = ttk.Frame(log_card)
         log_toolbar.pack(fill=tk.X, pady=(0, 5))
-        
-        ttk.Label(log_toolbar, text="实时日志", font=('微软雅黑', 9), 
-                 foreground='gray').pack(side=tk.LEFT)
-        
-        # 清空日志按钮
-        clear_btn = tk.Button(log_toolbar, text="清空", 
-                             command=self.clear_log,
-                             font=('微软雅黑', 8),
-                             bg='#dc3545', fg='white',
-                             activebackground='#c82333',
-                             cursor='hand2', relief=tk.FLAT, bd=0, width=6)
-        clear_btn.pack(side=tk.RIGHT)
-        
-        # 日志文本框
-        self.log_text = tk.Text(log_card, height=10, state=tk.DISABLED,
+
+        ttk.Label(log_toolbar, text="过滤:", font=('微软雅黑', 9)).pack(side=tk.LEFT)
+        self.log_filter_var = tk.StringVar()
+        self.log_filter_entry = ttk.Entry(log_toolbar, textvariable=self.log_filter_var,
+                                         width=16, font=('微软雅黑', 9))
+        self.log_filter_entry.pack(side=tk.LEFT, padx=(2, 4))
+        self.log_filter_entry.bind('<Return>', lambda e: self.filter_log())
+        ttk.Button(log_toolbar, text="过滤", command=self.filter_log, width=6).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(log_toolbar, text="复制", command=self.copy_log, width=6).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(log_toolbar, text="清空", command=self.clear_log, width=6).pack(side=tk.LEFT)
+        self.log_toggle_btn = ttk.Button(log_toolbar, text="收起", command=self.toggle_log_collapse, width=6)
+        self.log_toggle_btn.pack(side=tk.RIGHT)
+
+        # 可折叠日志内容（UI-01）
+        self.log_inner = ttk.Frame(log_card)
+        self.log_inner.pack(fill=tk.BOTH, expand=True)
+        self.log_text = tk.Text(self.log_inner, height=10, state=tk.DISABLED,
                                font=('Consolas', 9), bg='#f8f9fa',
                                relief=tk.FLAT, padx=5, pady=5)
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        scrollbar = ttk.Scrollbar(log_card, orient=tk.VERTICAL, command=self.log_text.yview)
+        scrollbar = ttk.Scrollbar(self.log_inner, orient=tk.VERTICAL, command=self.log_text.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_text['yscrollcommand'] = scrollbar.set
+        # 日志分级着色标签（UI-04）
+        self.log_text.tag_config('lvl_err', foreground='#dc3545')
+        self.log_text.tag_config('lvl_warn', foreground='#fd7e14')
         
         # ==================== 底部提示区域 ====================
         footer_frame = ttk.Frame(self.main_frame)
@@ -1188,7 +1284,7 @@ class AutoClicker:
         shortcut_frame = ttk.Frame(footer_frame)
         shortcut_frame.pack(fill=tk.X, pady=(0, 5))
         
-        shortcut_text = "⌨️ 快捷键: F6 启动/停止 · F8/Esc 紧急停止"
+        shortcut_text = "快捷键: F6 启动/停止 · F8/Esc 紧急停止"
         ttk.Label(shortcut_frame, text=shortcut_text, 
                  font=('微软雅黑', 9), foreground='#6c757d').pack(anchor=tk.CENTER)
         
@@ -1388,6 +1484,43 @@ class AutoClicker:
         try:
             self.status_indicator.itemconfig(self.status_circle, fill=color)
             self.status_label.config(text=text, foreground=color)
+            if getattr(self, 'sb_status_label', None) is not None:
+                self.sb_status_label.config(text="● " + text, foreground=color)
+        except Exception:
+            pass
+
+    # ==================== P2 状态条辅助（UI-03） ====================
+    def _set_sb_counts(self):
+        try:
+            self.sb_count_label.config(text="总点击: " + str(self.click_count))
+            self.sb_success_label.config(text="成功: " + str(self.success_count))
+            self.sb_fail_label.config(text="失败: " + str(self.fail_count))
+        except Exception:
+            pass
+
+    def _start_runtime_tick(self):
+        try:
+            self._stop_runtime_tick()
+            def _tick():
+                if not self.is_running:
+                    return
+                try:
+                    elapsed = int(time.time() - self.start_time)
+                    mm = elapsed // 60
+                    ss = elapsed % 60
+                    self.sb_runtime_label.config(text="运行时长: %02d:%02d" % (mm, ss))
+                except Exception:
+                    pass
+                self._runtime_after_id = self.root.after(1000, _tick)
+            self._runtime_after_id = self.root.after(1000, _tick)
+        except Exception:
+            pass
+
+    def _stop_runtime_tick(self):
+        try:
+            if self._runtime_after_id is not None:
+                self.root.after_cancel(self._runtime_after_id)
+                self._runtime_after_id = None
         except Exception:
             pass
 
@@ -1400,19 +1533,30 @@ class AutoClicker:
     def run_clicking(self):
         """点击主流程（后台线程）：先启动倒计时，再进入点击循环（CX-04）"""
         self.start_time = time.time()
+        self.success_count = 0
+        self.fail_count = 0
+        self._ui(self._set_sb_counts)
         countdown = self.startup_countdown
         if countdown > 0:
+            self._ui(self.countdown_bar.config, value=0)
+            self._ui(self.sb_countdown_label.config, text=f"{countdown}s")
             for i in range(countdown, 0, -1):
                 if not self.is_running:
                     return
                 self._set_status(f"{i} 秒后启动", 'orange')
                 self._set_next(f"启动倒计时 {i}s")
+                self._ui(self.countdown_bar.config, value=int((countdown - i) / countdown * 100))
+                self._ui(self.sb_countdown_label.config, text=f"{i}s")
                 time.sleep(1)
             if not self.is_running:
                 return
+        self._ui(self.countdown_bar.config, value=100)
         self._set_status("运行中", 'green')
         self._set_next("--")
+        self._start_runtime_tick()
         self.click_loop()
+        self._stop_runtime_tick()
+        self._ui(self.countdown_bar.config, value=0)
 
     def _effective_interval_seconds(self):
         """按间隔单位换算为秒（CX-07）：秒模式直接取，毫秒模式除以 1000"""
@@ -1506,7 +1650,9 @@ class AutoClicker:
                         pyautogui.click(x, y)
                         self.log_message(f"使用pyautogui在位置 ({x}, {y}) 执行点击")
                     self.click_count += 1
+                    self.success_count = self.click_count
                     self.click_count_label.config(text=str(self.click_count))
+                    self._ui(self._set_sb_counts)
                 else:
                     self.log_message(f"仅移动到位置 ({x}, {y})，未执行点击")
 
@@ -1524,6 +1670,8 @@ class AutoClicker:
 
             except Exception as e:
                 self.log_message(f"点击过程中发生错误: {e}")
+                self.fail_count += 1
+                self._ui(self._set_sb_counts)
                 time.sleep(1)
                 
     def start_clicking(self):
@@ -1672,9 +1820,9 @@ class AutoClicker:
                 except Exception:
                     pass
                 if running:
-                    menu.insert_command(0, label="⏹ 停止点击", command=self.emergency_stop)
+                    menu.insert_command(0, label="停止点击", command=self.emergency_stop)
                 else:
-                    menu.insert_command(0, label="▶ 启动点击", command=self.start_clicking)
+                    menu.insert_command(0, label="启动点击", command=self.start_clicking)
                 menu.insert_separator(1)
         except Exception:
             pass
@@ -1692,6 +1840,16 @@ class AutoClicker:
         self.status_indicator.itemconfig(self.status_circle, fill='red')
         self.status_label.config(text="已停止", foreground='red')
         self.next_click_label.config(text="--")
+
+        # P2 状态条复位（UI-03）
+        self._stop_runtime_tick()
+        try:
+            self.countdown_bar['value'] = 0
+            self.sb_countdown_label.config(text="--")
+            self.sb_runtime_label.config(text="运行时长: 00:00")
+            self._set_sb_counts()
+        except Exception:
+            pass
 
         # 更新按钮状态
         self.start_btn.config(state=tk.NORMAL)
@@ -1741,15 +1899,73 @@ class AutoClicker:
             messagebox.showerror("错误", error_msg)
     
     def clear_log(self):
-        """清空日志"""
+        """清空日志（UI-04）：清空缓冲区与文本框"""
         try:
-            self.log_text.config(state=tk.NORMAL)
-            self.log_text.delete(1.0, tk.END)
-            self.log_text.config(state=tk.DISABLED)
-            self.log_message("日志已清空")
+            self._log_buffer = []
+            self._render_log()
+            print("日志已清空")
         except Exception as e:
             print(f"清空日志失败: {e}")
-            
+
+    # ==================== P2 日志：分级着色 / 过滤 / 复制（UI-04） ====================
+    def _log_level(self, msg):
+        m = msg.lower()
+        if any(k in msg for k in ('失败', '错误', '异常', 'error', 'exception', 'traceback')) or 'fail' in m:
+            return 'err'
+        if any(k in msg for k in ('警告', '警示')) or 'warn' in m:
+            return 'warn'
+        return ''
+
+    def _render_log(self):
+        """按当前过滤条件重绘日志文本框（UI-04）"""
+        try:
+            flt = (self._log_filter or '').lower()
+            self.log_text.config(state=tk.NORMAL)
+            self.log_text.delete(1.0, tk.END)
+            for entry, level in self._log_buffer:
+                if flt and flt not in entry.lower():
+                    continue
+                tag = 'lvl_err' if level == 'err' else ('lvl_warn' if level == 'warn' else '')
+                self.log_text.insert(tk.END, entry, tag)
+            self.log_text.see(tk.END)
+            self.log_text.config(state=tk.DISABLED)
+        except Exception:
+            pass
+
+    def filter_log(self):
+        """应用关键字过滤（UI-04）"""
+        try:
+            self._log_filter = (self.log_filter_var.get() or '').strip()
+            self._render_log()
+        except Exception:
+            pass
+
+    def copy_log(self):
+        """复制当前（过滤后）日志内容到剪贴板（UI-04）"""
+        try:
+            flt = (self._log_filter or '').lower()
+            lines = [e for e, _ in self._log_buffer if not flt or flt in e.lower()]
+            text = ''.join(lines)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.log_message("已复制日志内容到剪贴板")
+        except Exception as e:
+            print(f"复制日志失败: {e}")
+
+    def toggle_log_collapse(self):
+        """折叠/展开日志内容区（UI-01）"""
+        try:
+            if getattr(self, '_log_collapsed', False):
+                self.log_inner.pack(fill=tk.BOTH, expand=True)
+                self.log_toggle_btn.config(text="收起")
+                self._log_collapsed = False
+            else:
+                self.log_inner.pack_forget()
+                self.log_toggle_btn.config(text="展开")
+                self._log_collapsed = True
+        except Exception:
+            pass
+
     def log_message(self, message):
         try:
             timestamp = datetime.now().strftime("%H:%M:%S")
@@ -1762,11 +1978,22 @@ class AutoClicker:
                     self._file_logger.info(message)
                 except Exception:
                     pass
-            # 输出到UI文本框
-            self.log_text.config(state=tk.NORMAL)
-            self.log_text.insert(tk.END, log_entry)
-            self.log_text.see(tk.END)
-            self.log_text.config(state=tk.DISABLED)
+            # UI-04：写入缓冲区并按过滤条件渲染
+            level = self._log_level(message)
+            self._log_buffer.append((log_entry, level))
+            if len(self._log_buffer) > 2000:
+                self._log_buffer = self._log_buffer[-2000:]
+            if self._log_filter:
+                self._render_log()
+            else:
+                try:
+                    self.log_text.config(state=tk.NORMAL)
+                    tag = 'lvl_err' if level == 'err' else ('lvl_warn' if level == 'warn' else '')
+                    self.log_text.insert(tk.END, log_entry, tag)
+                    self.log_text.see(tk.END)
+                    self.log_text.config(state=tk.DISABLED)
+                except Exception:
+                    pass
         except Exception as e:
             print(f"日志写入失败: {e}")
     
@@ -1775,9 +2002,9 @@ class AutoClicker:
         try:
             # 创建原生托盘菜单（使用tkinter Menu）
             self.tray_menu = tk.Menu(self.root, tearoff=0, bg='#f0f0f0', fg='black')
-            self.tray_menu.add_command(label="📱 显示窗口", command=self.show_from_tray)
+            self.tray_menu.add_command(label="显示窗口", command=self.show_from_tray)
             self.tray_menu.add_separator()
-            self.tray_menu.add_command(label="❌ 退出程序", command=self.exit_from_tray)
+            self.tray_menu.add_command(label="退出程序", command=self.exit_from_tray)
             
             self.tray_enabled = True
             self.tray_icon = None
