@@ -338,10 +338,13 @@ class AutoClicker:
         # 窗口尺寸（修正 geometry 与 minsize 矛盾：F-10 / CX-05）
         self.root.geometry("720x800")
         self.root.minsize(700, 760)
+        self._init_dpi_awareness()
         
         self.is_running = False
         self.click_thread = None
         self.config_file = os.path.expanduser("~/.auto_clicker_config_py3.json")
+        # 首启检测（6.9.1 引导与预设配置）：配置不存在即视为首次运行
+        self.first_run = not os.path.exists(self.config_file)
 
         # P0 安全/体验状态默认值（CX-01 / CX-02 / CX-04）
         self.countdown_cancelled = False
@@ -366,16 +369,29 @@ class AutoClicker:
         self._log_buffer = []  # [(text, level)] 全量日志缓冲（UI-04 过滤用）
         self._log_filter = ''
         self._log_collapsed = False
+        # REQ-004 运行统计：最近一次会话快照（供导出）
+        self.last_run_stats = {
+            'timestamp': '', 'click_count': 0, 'success_count': 0,
+            'fail_count': 0, 'runtime_seconds': 0.0,
+            'interval_seconds': 0.0, 'mode': '', 'button': '',
+        }
 
         self.setup_logging()
         self.load_config()
         self._init_theme()
         self.setup_ui()
+        # 补记 DPI 诊断（此时日志/UI 设施已就绪）
+        self.log_message("DPI 适配：系统缩放 %.2f，已据缩放调整渲染" % getattr(self, '_dpi_scale', 1.0))
         self._apply_theme()
         self.setup_hotkeys()
         self.setup_tray_icon()
         if self.theme_mode == 'system':
             self._poll_system_theme()
+        
+        # 6.9.1 引导与预设配置：首次运行写入推荐安全预设并弹出引导
+        if self.first_run:
+            self._apply_first_run_preset()
+            self.root.after(800, self._show_first_run_guidance)
         
         # 关闭按钮直接退出程序
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -454,6 +470,30 @@ class AutoClicker:
                 self.config['current_profile'] = None
         except Exception:
             pass
+
+    # ==================== 6.11.2 DPI 适配 ====================
+    def _init_dpi_awareness(self):
+        """进程级 DPI 感知已在 main() 中、创建 Tk 根窗口之前设置（保证点击坐标与
+        物理像素一致）。此处依据系统缩放设置 tk 渲染比例，避免高分屏下 UI 过小。"""
+        try:
+            scale = 1.0
+            try:
+                scale = float(self.root.tk.call('tk', 'scaling'))
+            except Exception:
+                scale = 1.0
+            self._dpi_scale = scale
+            # 缩放较高时放大全局默认字体（仅作用于未显式指定 font 的控件，如按钮/下拉框）
+            if scale and scale > 1.25:
+                try:
+                    size = int(round(10 * min(scale, 1.6)))
+                    self.root.option_add('*Font', '微软雅黑 %d' % size)
+                except Exception:
+                    pass
+            # 此处日志设施尚未初始化（setup_logging/setup_ui 在后），仅控制台留痕；
+            # UI/磁盘日志在 __init__ 中 setup_ui() 之后补记
+            print("[DPI] 系统缩放 %.2f" % scale)
+        except Exception:
+            self._dpi_scale = 1.0
 
     # ==================== P2 矢量图标工厂（UI-02，无 PIL 时降级为文本） ====================
     def make_icon(self, name, size=16, color='#333333'):
@@ -840,6 +880,66 @@ class AutoClicker:
                 messagebox.showinfo("日志目录", d)
         except Exception as e:
             self.log_message("打开日志目录失败: " + str(e))
+
+    # ==================== 6.9.1 引导与预设配置 ====================
+    def _apply_first_run_preset(self):
+        """首次运行：落盘推荐安全预设，并预置一个「推荐安全」配置方案用于引导。"""
+        try:
+            # 以当前默认配置（已含安全止血参数）作为基线落盘
+            self.save_config()
+            safe = {
+                'interval_seconds': 10, 'click_mode': 'random', 'prevent_sleep': True,
+                'startup_countdown': 3, 'click_limit': 0, 'duration_limit': 0,
+                'failsafe_enabled': True, 'click_button': 'left', 'hold_ms': 10,
+                'interval_unit': 's', 'jitter_pct': 0, 'use_multi_points': False,
+                'multi_points': [], 'hotkey_start': 'f6', 'hotkey_emergency': 'f8',
+                'autostart': False, 'close_to_tray': True,
+            }
+            self.config.setdefault('profiles', {})['推荐安全'] = safe
+            self.save_config()
+            self.log_message("首次运行：已写入推荐安全预设与「推荐安全」配置方案")
+        except Exception:
+            pass
+
+    def _show_first_run_guidance(self):
+        try:
+            messagebox.showinfo("欢迎使用 AutoClicker",
+                "首次运行已为你写入推荐安全预设：\n"
+                "• 启动前 3 秒倒计时，避免误触\n"
+                "• F8 / Esc 紧急停止；鼠标移开 20px 自动停（安全停止）\n"
+                "• 可在「安全设置」中开启点击上限 / 时长上限\n\n"
+                "建议在自动点击前，先用「测试点击」确认目标位置。")
+        except Exception:
+            pass
+
+    # ==================== REQ-004 运行统计与导出 ====================
+    def export_run_stats(self):
+        """将最近一次运行统计导出为 JSON / CSV（REQ-004）"""
+        try:
+            stats = getattr(self, 'last_run_stats', None)
+            if not stats or stats.get('click_count', 0) == 0:
+                messagebox.showinfo("提示", "暂无可导出的运行统计（请先完成至少一次点击）")
+                return
+            path = filedialog.asksaveasfilename(
+                defaultextension=".json",
+                filetypes=[("JSON", "*.json"), ("CSV", "*.csv")],
+                title="导出运行统计")
+            if not path:
+                return
+            if path.lower().endswith('.csv'):
+                import csv
+                with open(path, 'w', encoding='utf-8-sig', newline='') as f:
+                    w = csv.writer(f)
+                    w.writerow(["项目", "数值"])
+                    for k, v in stats.items():
+                        w.writerow([k, v])
+            else:
+                with open(path, 'w', encoding='utf-8') as f:
+                    json.dump(stats, f, ensure_ascii=False, indent=2)
+            self.log_message("运行统计已导出：" + path)
+            messagebox.showinfo("导出成功", "运行统计已导出：\n" + path)
+        except Exception as e:
+            messagebox.showerror("错误", "导出失败: " + str(e))
 
     def _refresh_profile_combo(self):
         try:
@@ -1383,6 +1483,7 @@ class AutoClicker:
         ttk.Checkbutton(sys_row, text="开机自动启动", variable=self.autostart_var,
                         command=self.on_autostart_changed).pack(side=tk.LEFT)
         ttk.Button(sys_row, text="打开日志目录", command=self.open_log_dir).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Button(sys_row, text="导出运行统计", command=self.export_run_stats).pack(side=tk.LEFT, padx=(10, 0))
 
         # ==================== 日志区域 ====================
         log_card = ttk.LabelFrame(self.main_frame, text="运行日志", padding="10")
@@ -1973,6 +2074,22 @@ class AutoClicker:
         self.is_running = False
         self.countdown_cancelled = False
 
+        # REQ-004：记录最近一次运行统计快照（供导出）
+        try:
+            runtime = max(0.0, time.time() - getattr(self, 'start_time', time.time()))
+            self.last_run_stats = {
+                'timestamp': datetime.now().isoformat(timespec='seconds'),
+                'click_count': getattr(self, 'click_count', 0),
+                'success_count': getattr(self, 'success_count', 0),
+                'fail_count': getattr(self, 'fail_count', 0),
+                'runtime_seconds': round(runtime, 1),
+                'interval_seconds': self._effective_interval_seconds(),
+                'mode': self.config.get('click_mode', ''),
+                'button': getattr(self, 'click_button', ''),
+            }
+        except Exception:
+            pass
+
         if self.click_thread:
             self.click_thread.join(timeout=2)
 
@@ -2503,11 +2620,19 @@ def show_single_instance_warning():
 
 
 def setup_dpi_awareness():
-    """设置DPI感知"""
+    """6.11.2 DPI 适配：开启进程级 DPI 感知，使点击坐标与物理像素一致。
+    必须在创建 Tk 根窗口之前调用（否则对已创建的窗口不生效）。"""
     if sys.platform == 'win32':
         try:
             from ctypes import windll
-            windll.shcore.SetProcessDpiAwareness(1)
+            # 优先 per-monitor v2，回退 v1，再回退 SetProcessDPIAware
+            try:
+                windll.shcore.SetProcessDpiAwareness(2)
+            except Exception:
+                try:
+                    windll.shcore.SetProcessDpiAwareness(1)
+                except Exception:
+                    windll.user32.SetProcessDPIAware()
         except Exception:
             pass
 
@@ -2518,8 +2643,8 @@ def main():
         show_single_instance_warning()
         return
     
+    setup_dpi_awareness()  # 必须在 tk.Tk() 之前，保证 DPI 感知对根窗口生效
     root = tk.Tk()
-    setup_dpi_awareness()
 
     app = AutoClicker(root)
 
