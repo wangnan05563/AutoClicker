@@ -15,20 +15,33 @@ AutoClicker 的模拟输入在 Linux 上目前依赖 **pyautogui → X11（Xlib 
 
 ## 2. 已实现的「明确降级」
 
-当前代码遵循 PRD「**不静默失败**」原则：
+当前代码遵循 PRD「**不静默失败**」原则，启动时由 `detect_input_backend()` 完成会话探测：
 
-- 点击过程中的异常会被 `click_loop` 捕获并写入运行日志（带 `失败` 计数），不会让主流程静默卡死；
-- 测试点击失败时弹出原因与修复指引（FR-C04）；
-- 开机自启 / 托盘等平台能力在不可用时给出提示而非静默跳过（FR-G03、FR-A05）。
+| 环节 | 行为 |
+| --- | --- |
+| 会话判定 | 读取 `XDG_SESSION_TYPE` / `WAYLAND_DISPLAY` / `DISPLAY`；仅当明确为 Wayland 且无 X11 可用时拦截。**XWayland 与「未设 XDG 但有 DISPLAY」不会被误判**，避免误伤国产桌面 |
+| 顶部横幅 | 显示「注意：Wayland 会话不支持模拟输入，启动已禁用」，可点「×」关闭；「详情」按钮给出完整诊断与修复指引 |
+| 启动禁用 | 禁用「启动」按钮；`start_clicking()` **首句守卫**同时拦住 F6 热键通道（`toggle_clicking` 也经过此处），`test_click()` 同样拦截；`stop_clicking()` 不会把按钮误恢复为可用 |
+| 分级提示 | 未装 `ydotool` → 提示切换 X11 或安装 `ydotool` + 启动 `ydotoold` + 加入 `input` 组；已装 `ydotool` → 明确告知本版本**尚未接入 ydotool 后端**，仍需切换 X11 |
+| 运行期兜底 | 点击过程中的异常由 `click_loop` 捕获并写入日志（带 `失败` 计数），不静默卡死；开机自启 / 托盘不可用时给出提示而非静默跳过 |
 
-> 说明：PRD 要求的「启动前自动检测 `XDG_SESSION_TYPE` 并在 Wayland 不可用时禁用启动按钮 + 横幅提示」目前**尚未在代码中落地**，属于需要真机 Wayland 环境联调的待办项（见第 4 节）。
+判定矩阵（已用模拟环境变量实测 7 个分支全部通过）：
+
+| 环境变量 | 判定 | 结果 |
+| --- | --- | --- |
+| Windows / macOS | 原生 | 可用 |
+| `XDG_SESSION_TYPE=x11` | x11 | 可用 |
+| `XDG_SESSION_TYPE=x11` + `WAYLAND_DISPLAY` | XWayland | 可用（不误伤） |
+| 仅 `DISPLAY=:0` | x11 | 可用 |
+| `XDG_SESSION_TYPE=wayland` | wayland | 拦截 |
+| 仅 `WAYLAND_DISPLAY`（无 `DISPLAY`） | wayland | 拦截 |
 
 ## 3. 用户侧推荐做法（降级路径）
 
 | 场景 | 推荐操作 |
 | --- | --- |
 | 银河麒麟 / 其他 Linux 桌面 | **优先使用 X11 会话登录**（在登录界面选择「X11 / 经典」会话），可获完整点击、热键、托盘能力 |
-| 只能用 Wayland | 安装并配置 `ydotool` + `ydotoold`，将当前用户加入 `input` 组；或在测试点击报错后按指引切换 X11 |
+| 只能用 Wayland | 程序会自动禁用启动并给出指引；**最可靠的做法是注销后切换 X11 会话**。安装 `ydotool` 仅是为后续版本集成预留，当前版本即使检测到也不会自动启用 |
 | 临时规避 | 在 X11 会话下运行本程序，避免 Wayland 下的模拟输入限制 |
 
 ### 安装 ydotool（Wayland 兼容输入，未来集成路径）
@@ -46,11 +59,12 @@ sudo usermod -aG input $USER
 
 ## 4. 待办（真机联调项，本环境无法验证）
 
-- [ ] 启动时读取 `XDG_SESSION_TYPE`，Wayland 且 `ydotool` 不可用时：禁用「启动」按钮 + 顶部横幅「Wayland 会话不支持模拟输入，启动已禁用」（PRD 操作级提示）。
-- [ ] 集成 `ydotool` 作为 Wayland 下的点击 / 移动后端，替换 pyautogui 在 Wayland 分支的调用。
+- [x] 启动时读取 `XDG_SESSION_TYPE`，Wayland 且无可用输入后端时：禁用「启动」按钮 + 顶部横幅 + 首句守卫拦截热键 / 测试点击（PRD 操作级提示）——**已实现，逻辑分支已实测，待真机 Wayland 目视确认横幅与按钮态**。
+- [ ] 集成 `ydotool` 作为 Wayland 下的点击 / 移动后端，替换 pyautogui 在 Wayland 分支的调用（需要 `ydotoold` + `input` 组真机环境联调）。
 - [ ] 真机矩阵验证：Kylin V10 SP1 X11（x86_64 / arm64）、Kylin V10 SP1 Wayland（降级路径）（NFR-07）。
+- [ ] GUI 实测：本 Agent 环境无图形显示、无法运行 tkinter 主循环，横幅渲染、按钮禁用态与详情弹窗尚未做目视验证。
 
-> 这些项需要真实 Wayland/arm64 设备与长时 soak 验证，已按「收尾 + 少量补做」决策保留为 `todo`，不在本阶段自动执行。
+> 剩余项需要真实 Wayland/arm64 设备与 GUI 环境，已按「收尾 + 少量补做」决策保留为 `todo`（对应 mtask `T05249`），不在本阶段自动执行。
 
 ## 5. 兼容性小结
 
@@ -58,4 +72,4 @@ sudo usermod -aG input $USER
 | --- | --- | --- | --- | --- | --- |
 | Windows 10/11 | — | ✅ | ✅ | ✅ | 完整 |
 | Kylin V10 SP1 | X11 | ✅ | ✅ | ✅ | 完整 |
-| Kylin V10 SP1 | Wayland | ⚠️ 需 ydotool（手动） | ⚠️ | ⚠️ | 降级 + 指引 |
+| Kylin V10 SP1 | Wayland | 启动已禁用 | 停止通道保留 | 视合成器 | 自动检测 + 横幅提示 + 启动禁用（不静默失败） |

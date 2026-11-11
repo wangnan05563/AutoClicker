@@ -15,6 +15,7 @@ import time
 import random
 import json
 import logging
+import shutil
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 
@@ -23,6 +24,38 @@ PLATFORM = sys.platform
 IS_WINDOWS = PLATFORM == 'win32'
 IS_LINUX = PLATFORM.startswith('linux')
 IS_MACOS = PLATFORM == 'darwin'
+
+
+def detect_input_backend():
+    """FR-L01 / 6.12.1：启动时探测当前会话是否支持模拟输入。
+
+    返回 (ok, session, reason)。ok=False 时必须明确提示并禁用启动，不静默失败。
+    判据保持保守：只有明确是 Wayland 且没有 X11 可用时才拦截，避免误伤
+    XWayland / X11 会话（银河麒麟等国产桌面常同时设置多个环境变量）。
+    """
+    if not IS_LINUX:
+        return True, ('windows' if IS_WINDOWS else PLATFORM), ''
+
+    session = (os.environ.get('XDG_SESSION_TYPE') or '').strip().lower()
+    has_wayland = bool(os.environ.get('WAYLAND_DISPLAY'))
+    has_x11 = bool(os.environ.get('DISPLAY'))
+    is_wayland = (session == 'wayland') or (not session and has_wayland and not has_x11)
+    if not is_wayland:
+        return True, (session or ('x11' if has_x11 else 'unknown')), ''
+
+    doc = "\n\n详见 docs/Wayland降级说明.md"
+    if not shutil.which('ydotool'):
+        return False, 'wayland', (
+            "当前为 Wayland 会话，且未检测到 ydotool，无法模拟鼠标输入。\n"
+            "请在登录界面切换到 X11 会话；或安装 ydotool 并启动 ydotoold（当前用户需加入 input 组）。"
+            + doc)
+    # 有 ydotool 二进制也不代表可用：本版本尚未把 ydotool 接入点击后端
+    return False, 'wayland', (
+        "当前为 Wayland 会话。虽已检测到 ydotool，但本版本尚未接入 ydotool 输入后端，"
+        "pyautogui 仍依赖 X11，点击可能落空。\n"
+        "请切换到 X11 会话后使用。"
+        + doc)
+
 
 # ==================== 核心依赖 ====================
 try:
@@ -345,6 +378,8 @@ class AutoClicker:
         self.config_file = os.path.expanduser("~/.auto_clicker_config_py3.json")
         # 首启检测（6.9.1 引导与预设配置）：配置不存在即视为首次运行
         self.first_run = not os.path.exists(self.config_file)
+        # FR-L01：会话输入能力探测（Wayland 降级，须早于 setup_ui 建按钮）
+        self.input_ok, self.input_session, self.input_reason = detect_input_backend()
 
         # P0 安全/体验状态默认值（CX-01 / CX-02 / CX-04）
         self.countdown_cancelled = False
@@ -383,6 +418,13 @@ class AutoClicker:
         # 补记 DPI 诊断（此时日志/UI 设施已就绪）
         self.log_message("DPI 适配：系统缩放 %.2f，已据缩放调整渲染" % getattr(self, '_dpi_scale', 1.0))
         self._apply_theme()
+        # FR-L01：无可用输入后端时禁用启动（按钮 + 热键通道由 start_clicking 统一守卫兜底）
+        if not self.input_ok:
+            try:
+                self.start_btn.config(state=tk.DISABLED)
+            except Exception:
+                pass
+            self.log_message("Wayland 降级：启动已禁用（会话=%s）" % self.input_session)
         self.setup_hotkeys()
         self.setup_tray_icon()
         if self.theme_mode == 'system':
@@ -941,6 +983,19 @@ class AutoClicker:
         except Exception as e:
             messagebox.showerror("错误", "导出失败: " + str(e))
 
+    # ==================== FR-L01 Wayland 降级指引 ====================
+    def show_input_diag(self):
+        """展示会话输入能力诊断与可执行的修复指引（不静默失败）"""
+        try:
+            self.log_message("会话输入能力诊断：%s / 可用=%s"
+                             % (self.input_session, self.input_ok))
+        except Exception:
+            pass
+        messagebox.showwarning(
+            "当前会话不支持模拟输入",
+            "会话类型：%s\n\n%s\n\n启动按钮、启动热键与测试点击均已禁用。"
+            % (self.input_session, self.input_reason))
+
     def _refresh_profile_combo(self):
         try:
             names = list(self.config.get('profiles', {}).keys())
@@ -1130,7 +1185,29 @@ class AutoClicker:
                                         values=['浅色', '深色', '跟随系统'], state='readonly', width=10)
         self.theme_combo.pack(side=tk.LEFT, padx=(5, 0))
         self.theme_combo.bind('<<ComboboxSelected>>', self.on_theme_change_ui)
-        
+
+        # FR-L01 / 6.12.1：Wayland 降级横幅（可关闭；纯文本，保持 UI-02 零 emoji）
+        if not self.input_ok:
+            warn_bar = tk.Frame(self.main_frame, bg=self._color('warning'))
+            warn_bar.pack(fill=tk.X, pady=(0, 10))
+            tk.Label(warn_bar,
+                     text="注意：Wayland 会话不支持模拟输入，启动已禁用",
+                     bg=self._color('warning'), fg='white',
+                     font=('微软雅黑', 10, 'bold'), wraplength=500,
+                     justify=tk.LEFT, anchor=tk.W).pack(
+                         side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 6), pady=7)
+            tk.Button(warn_bar, text="详情", command=self.show_input_diag,
+                      relief=tk.FLAT, bd=0, bg=self._color('warning'), fg='white',
+                      activebackground=self._shade(self._color('warning')),
+                      font=('微软雅黑', 9, 'underline'), cursor='hand2').pack(
+                          side=tk.RIGHT, padx=(0, 6))
+            tk.Button(warn_bar, text="×", command=warn_bar.destroy,
+                      relief=tk.FLAT, bd=0, bg=self._color('warning'), fg='white',
+                      activebackground=self._shade(self._color('warning')),
+                      font=('微软雅黑', 11, 'bold'), cursor='hand2').pack(
+                          side=tk.RIGHT, padx=(0, 4))
+            self._input_banner = warn_bar
+
         # 分隔线
         separator = ttk.Separator(self.main_frame, orient='horizontal')
         separator.pack(fill=tk.X, pady=(0, 15))
@@ -1918,6 +1995,10 @@ class AutoClicker:
                 time.sleep(1)
                 
     def start_clicking(self):
+        # FR-L01：统一守卫，按钮与 F6 热键（toggle_clicking）都经过此处，避免绕过 UI 禁用
+        if not self.input_ok:
+            messagebox.showerror("启动已禁用", self.input_reason)
+            return
         try:
             interval = int(self.interval_var.get())
             if interval < 1:
@@ -2111,7 +2192,8 @@ class AutoClicker:
             pass
 
         # 更新按钮状态
-        self.start_btn.config(state=tk.NORMAL)
+        # FR-L01：Wayland 降级下停止后不得把启动按钮误恢复为可用
+        self.start_btn.config(state=tk.NORMAL if self.input_ok else tk.DISABLED)
         self.stop_btn.config(state=tk.DISABLED)
         self.interval_entry.config(state=tk.NORMAL)
 
@@ -2135,6 +2217,10 @@ class AutoClicker:
             self.start_clicking()
             
     def test_click(self):
+        # FR-L01：测试点击同样是真实模拟输入，Wayland 下先给出原因，避免"点了没反应"
+        if not self.input_ok:
+            messagebox.showerror("测试点击已禁用", self.input_reason)
+            return
         try:
             x, y = self.get_click_position()
 
