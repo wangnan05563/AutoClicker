@@ -10,6 +10,15 @@ import sys
 import subprocess
 import shutil
 
+# 强制 stdout/stderr 为 UTF-8，避免中文 Windows 默认 GBK 控制台下打印 ✓/✅/📦 等
+# Unicode 字符时触发 UnicodeEncodeError 而中断打包。
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 
 # 脚本位于 scripts/ 下，项目根目录为其父目录，所有路径都以此为基准
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -91,11 +100,16 @@ def build_exe():
         "PIL.ImageTk",
         "tkinter",
         "tkinter.ttk",
-        # P2 主题系统（TH-01/TH-03）：ttkbootstrap 可选接入，单文件打包需显式隐藏导入
-        "ttkbootstrap",
-        "ttkbootstrap.style",
-        "ttkbootstrap.widgets",
     ]
+    # 可选主题依赖（P2 主题系统 TH-01/TH-03）：ttkbootstrap 尚未纳入依赖且功能未实现，
+    # 仅当模块可导入时才作为隐藏导入，避免 PyInstaller 报 "Hidden import not found" 误导。
+    import importlib.util
+    for opt in ["ttkbootstrap", "ttkbootstrap.style", "ttkbootstrap.widgets"]:
+        try:
+            if importlib.util.find_spec(opt) is not None:
+                hidden_imports.append(opt)
+        except (ImportError, ValueError):
+            pass
 
     for imp in hidden_imports:
         cmd.extend(["--hidden-import", imp])
