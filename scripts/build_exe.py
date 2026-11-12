@@ -22,6 +22,7 @@ except Exception:
 
 # 脚本位于 scripts/ 下，项目根目录为其父目录，所有路径都以此为基准
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RELEASE_DIR = os.path.join(ROOT_DIR, 'release')
 
 
@@ -80,7 +81,7 @@ def build_exe():
         "--clean",  # 清理临时文件
         "--distpath", os.path.join(RELEASE_DIR, "dist"),  # 产物统一输出到 release/
         "--workpath", os.path.join(RELEASE_DIR, "build"),
-        "--specpath", ROOT_DIR,
+        "--specpath", SCRIPT_DIR,  # 自动生成的 spec 落到 scripts/，与手工 spec 同处存放
     ]
 
     # 添加图标

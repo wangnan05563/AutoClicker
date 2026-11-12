@@ -2,10 +2,10 @@
 
 
 a = Analysis(
-    ['auto_clicker_py3.py'],
+    ['../auto_clicker_py3.py'],
     pathex=[],
     binaries=[],
-    datas=[('icons', 'icons')],
+    datas=[('../icons', 'icons')],
     hiddenimports=['pyautogui', 'keyboard', 'PIL', 'PIL.Image', 'PIL.ImageTk', 'tkinter', 'tkinter.ttk'],
     hookspath=[],
     hooksconfig={},
@@ -35,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['icons\\autoclicker.ico'],
+    icon=['../icons/autoclicker.ico'],
 )

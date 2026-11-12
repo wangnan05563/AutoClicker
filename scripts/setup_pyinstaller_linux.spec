@@ -10,19 +10,19 @@ import sys
 # 获取当前目录
 block_cipher = None
 
-# 图标路径（Linux 使用 PNG 格式）
+# 图标路径（Linux 使用 PNG 格式，相对本 spec 所在 scripts/ 目录指向上级 icons/）
 icon_path = None
-if os.path.exists('icons/tray.png'):
-    icon_path = 'icons/tray.png'
-elif os.path.exists('icons/autoclicker.png'):
-    icon_path = 'icons/autoclicker.png'
+if os.path.exists('../icons/tray.png'):
+    icon_path = '../icons/tray.png'
+elif os.path.exists('../icons/autoclicker.png'):
+    icon_path = '../icons/autoclicker.png'
 
 a = Analysis(
-    ['auto_clicker_py3.py'],
+    ['../auto_clicker_py3.py'],
     pathex=[],
     binaries=[],
     datas=[
-        ('icons', 'icons'),
+        ('../icons', 'icons'),
     ],
     hiddenimports=[
         'PIL._tkinter_finder',

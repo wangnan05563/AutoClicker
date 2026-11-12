@@ -33,5 +33,15 @@
       "enabled": true,
       "timeout_seconds": 10
     }
+  },
+  "release": {
+    "version": "2.0",
+    "arch": "win64",
+    "package_name": "AutoClicker-{version}-{arch}",
+    "output_dir": "release/publish",
+    "include": [
+      "README.md",
+      "LICENSE"
+    ]
   }
 }

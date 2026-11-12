@@ -61,12 +61,13 @@ function Stop-RunningInstance($ImageName) {
 }
 
 try {
-    $PROJECT_ROOT = $PSScriptRoot
+    # 本脚本位于 scripts/ 下，项目根目录为其父目录；config 与本脚本同目录
+    $PROJECT_ROOT = Split-Path $PSScriptRoot -Parent
     Write-Banner "AutoClicker 构建与打包"
     Write-Host "项目根目录: $PROJECT_ROOT"
 
     # 读取配置
-    $configPath = Join-Path $PROJECT_ROOT "config.build.json"
+    $configPath = Join-Path $PSScriptRoot "config.build.json"
     if (-not (Test-Path $configPath)) { throw "未找到配置文件: $configPath" }
     $config = Get-Content $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
 

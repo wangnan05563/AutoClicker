@@ -6,7 +6,7 @@ __pycache__/
 *.egg
 
 # PyInstaller 自动生成的 spec（构建时由 build_exe.py 重新生成）
-/AutoClicker.spec
+/scripts/AutoClicker.spec
 
 # 虚拟环境
 .venv/
