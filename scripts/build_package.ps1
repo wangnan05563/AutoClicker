@@ -122,19 +122,18 @@ try {
         Write-Host "==> 启动冒烟测试（超时 $($config.verification.launch_smoke_test.timeout_seconds)s）..." -ForegroundColor Cyan
         try {
             $proc = Start-Process -FilePath $exePath -PassThru -WindowStyle Hidden -ErrorAction Stop
-            $started = $false
-            for ($i = 0; $i -lt $config.verification.launch_smoke_test.timeout_seconds; $i++) {
-                if (-not $proc.HasExited) { $started = $true; break }
-                Start-Sleep -Seconds 1
-            }
-            if ($started -and -not $proc.HasExited) {
-                Write-Host "[OK] 可执行文件已启动并运行中（PID $($proc.Id)）。执行成功已确认。" -ForegroundColor Green
+            # 先等稳定期（超时一半，至少 3 秒）再判定：onefile 解包阶段进程必然存活，
+            # 立即判断会把"解包存活、随后崩溃"误判为成功（历史教训：pyautogui 缺失即如此）
+            $stableSec = [Math]::Max(3, [int]($config.verification.launch_smoke_test.timeout_seconds / 2))
+            Start-Sleep -Seconds $stableSec
+            if (-not $proc.HasExited) {
+                Write-Host "[OK] 可执行文件稳定运行 $($stableSec)s（PID $($proc.Id)）。执行成功已确认。" -ForegroundColor Green
                 try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
             } else {
-                Write-Warning "可执行文件立即退出（退出码 $($proc.ExitCode)）。产物可能损坏，请检查运行依赖。"
+                throw "可执行文件启动后立即退出（退出码 $($proc.ExitCode)）。产物可能缺依赖，请用 --console 诊断版查看报错。"
             }
         } catch {
-            Write-Warning "无法启动（可能是无界面/无显示环境）。产物已通过文件检查： $_"
+            Write-Warning "启动冒烟测试未通过： $_"
         }
     }
 
