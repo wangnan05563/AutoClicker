@@ -63,8 +63,9 @@ def build_exe():
         print("✗ PyInstaller 未安装，正在安装...")
         subprocess.check_call([sys.executable, "-m", "pip", "install", "pyinstaller"])
 
-    # 图标路径
-    icon_path = os.path.join("icons", "autoclicker.ico")
+    # 图标路径（绝对路径：spec 落在 scripts/ 后，spec 内相对路径按 spec 目录解析，必须用绝对路径）
+    icons_dir = os.path.join(ROOT_DIR, "icons")
+    icon_path = os.path.join(icons_dir, "autoclicker.ico")
     if not os.path.exists(icon_path):
         icon_path = None
         print("⚠ 未找到图标文件，将使用默认图标")
@@ -88,9 +89,9 @@ def build_exe():
     if icon_path:
         cmd.extend(["--icon", icon_path])
 
-    # 添加数据文件（图标目录）
-    if os.path.exists("icons"):
-        cmd.extend(["--add-data", f"icons{os.pathsep}icons"])
+    # 添加数据文件（图标目录：源侧绝对路径；目标侧 'icons' 保持相对，指 exe 内部路径）
+    if os.path.isdir(icons_dir):
+        cmd.extend(["--add-data", f"{icons_dir}{os.pathsep}icons"])
 
     # 隐藏导入（解决某些模块找不到的问题）
     hidden_imports = [
