@@ -6,6 +6,8 @@
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $ErrorActionPreference = 'Stop'
+# 强制启用 TLS 1.2（PowerShell 5.1 默认可能协商到被 GitHub 拒绝的旧协议）
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
 
 . (Join-Path $PSScriptRoot "build-config.ps1")
 
@@ -254,7 +256,7 @@ try {
                 & git -C $gitDir push origin ":refs/tags/$relTag" 2>$null
                 & git -C $gitDir tag -d $relTag 2>$null
             }
-        } catch { /* 404 = 不存在，忽略 */ }
+        } catch { # 404 = 不存在，忽略（Release 尚不存在，可安全跳过） }
         try {
             $body = @{ tag_name = $relTag; name = $relName; body = $relNotes; draft = $false; prerelease = $false } | ConvertTo-Json -Compress
             $rel = Invoke-RestMethod -Uri $apiBase -Method Post -Headers $headers -Body $body -ContentType "application/json"
