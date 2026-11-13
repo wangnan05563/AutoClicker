@@ -1,165 +1,165 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-AutoClicker 打包脚本
-使用 PyInstaller 打包为独立可执行文件
+"""PyInstaller 打包脚本（完全配置驱动）。
+
+所有业务参数来自 scripts/config.build.json；机器相关覆盖来自
+scripts/config.build.local.json（gitignore）。本文件不含硬编码业务参数。
 """
 
 import os
 import sys
 import json
+import importlib.util
 import subprocess
 import shutil
 
-# 强制 stdout/stderr 为 UTF-8，避免中文 Windows 默认 GBK 控制台下打印 ✓/✅/📦 等
-# Unicode 字符时触发 UnicodeEncodeError 而中断打包。
-try:
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-except Exception:
-    pass
-
-
-# 脚本位于 scripts/ 下，项目根目录为其父目录，所有路径都以此为基准
+# 脚本位于 scripts/ 下，项目根目录为其父目录，所有相对路径都以此为基准
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-RELEASE_DIR = os.path.join(ROOT_DIR, 'release')
+MAIN_CONFIG = os.path.join(SCRIPT_DIR, 'config.build.json')
+LOCAL_CONFIG = os.path.join(SCRIPT_DIR, 'config.build.local.json')
+
+
+def _bootstrap_encoding():
+    """按配置设置 Python 流编码；配置不可读时用 UTF-8 作为结构性兜底。"""
+    enc = 'utf-8'
+    try:
+        with open(MAIN_CONFIG, 'r', encoding='utf-8') as f:
+            enc = (json.load(f).get('runtime') or {}).get('python_io_encoding') or enc
+    except (OSError, ValueError):
+        pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if hasattr(stream, 'reconfigure'):
+                stream.reconfigure(encoding=enc)
+        except Exception:
+            pass
+
+
+def _merge_section(base, override):
+    """顶层分段按键合并；两侧同为 dict 时递归，数组/标量以覆盖为准。"""
+    out = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _merge_section(out[key], value)
+        else:
+            out[key] = value
+    return out
 
 
 def load_build_config():
-    """读取与本脚本同目录的 config.build.json（配置驱动，读不到则回退空配置）。"""
-    cfg_path = os.path.join(SCRIPT_DIR, 'config.build.json')
-    try:
-        with open(cfg_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except (OSError, ValueError) as e:
-        print(f"⚠ 无法读取构建配置 {cfg_path}: {e}，使用默认参数")
-        return {}
+    with open(MAIN_CONFIG, 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+    if os.path.exists(LOCAL_CONFIG):
+        with open(LOCAL_CONFIG, 'r', encoding='utf-8') as f:
+            cfg = _merge_section(cfg, json.load(f))
+        print(f"✓ 已加载本地配置覆盖: {LOCAL_CONFIG}")
+    return cfg
 
 
-def clean_build():
-    """清理之前的构建文件"""
-    dirs_to_remove = [
-        os.path.join(RELEASE_DIR, 'build'),
-        os.path.join(RELEASE_DIR, 'dist'),
-        os.path.join(ROOT_DIR, '__pycache__'),
-        os.path.join(ROOT_DIR, '.pytest_cache'),
-    ]
+def abs_from_root(rel):
+    """配置中的相对路径统一解析为项目根下的绝对路径。"""
+    return os.path.normpath(os.path.join(ROOT_DIR, rel))
 
-    for dir_name in dirs_to_remove:
-        if os.path.exists(dir_name):
-            print(f"删除目录: {dir_name}")
-            shutil.rmtree(dir_name, ignore_errors=True)
+
+def clean_build(cfg):
+    """按配置清理上一次构建文件。"""
+    for rel in (cfg['build'].get('clean_paths') or []):
+        path = abs_from_root(rel)
+        if os.path.exists(path):
+            print(f"删除目录: {path}")
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def build_exe():
-    """使用 PyInstaller 打包"""
+    cfg = load_build_config()
+    project = cfg['project']
+    build = cfg['build']
+    pyi = build['pyinstaller']
 
-    # 确保在项目根目录执行，PyInstaller 才能找到主脚本和 icons
+    # 确保在项目根目录执行，PyInstaller 才能解析主脚本与资源路径
     os.chdir(ROOT_DIR)
-    os.makedirs(RELEASE_DIR, exist_ok=True)
+    os.makedirs(abs_from_root(build['release_dir']), exist_ok=True)
 
     print("=" * 60)
-    print("开始打包 AutoClicker...")
+    print(f"开始打包 {project['name']}...")
     print("=" * 60)
 
-    # 清理旧文件
-    clean_build()
+    clean_build(cfg)
 
-    # 检查 PyInstaller
+    # PyInstaller 可用性自检（缺失时按配置安装）
     try:
-        import PyInstaller
-        print("✓ PyInstaller 已安装")
-    except ImportError:
-        print("✗ PyInstaller 未安装，正在安装...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "pyinstaller"])
+        importlib.util.find_spec(pyi['module'])
+        __import__(pyi['module'])
+        print(f"✓ {pyi['module']} 已安装")
+    except (ImportError, ValueError):
+        pkg = pyi['pip_package']
+        print(f"✗ {pyi['module']} 未安装，正在安装 {pkg} ...")
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', pkg])
 
-    # 图标路径（绝对路径：spec 落在 scripts/ 后，spec 内相对路径按 spec 目录解析，必须用绝对路径）
-    icons_dir = os.path.join(ROOT_DIR, "icons")
-    icon_path = os.path.join(icons_dir, "autoclicker.ico")
-    if not os.path.exists(icon_path):
+    # 图标（绝对路径：spec 落在 scripts/ 时，spec 内相对路径按 spec 目录二次解析）
+    icon_path = abs_from_root(pyi['icon']) if pyi.get('icon') else None
+    if icon_path and not os.path.isfile(icon_path):
+        print(f"⚠ 未找到图标文件，将使用默认图标: {icon_path}")
         icon_path = None
-        print("⚠ 未找到图标文件，将使用默认图标")
-    else:
+    elif icon_path:
         print(f"✓ 使用图标: {icon_path}")
 
-    # 构建命令
+    exe_name = build['exe_name']
+    app_name = os.path.splitext(exe_name)[0]
+
     cmd = [
-        sys.executable, "-m", "PyInstaller",
-        "--name=AutoClicker",
-        "--onefile",  # 打包为单个文件
-        "--windowed",  # Windows GUI 程序（不显示控制台）
-        "--noconfirm",  # 不询问确认
-        "--clean",  # 清理临时文件
-        "--distpath", os.path.join(RELEASE_DIR, "dist"),  # 产物统一输出到 release/
-        "--workpath", os.path.join(RELEASE_DIR, "build"),
-        "--specpath", SCRIPT_DIR,  # 自动生成的 spec 落到 scripts/，与手工 spec 同处存放
+        sys.executable, '-m', pyi['module'],
+        f"--name={app_name}",
+        *pyi.get('flags', []),
+        '--distpath', abs_from_root(build['dist_dir']),
+        '--workpath', abs_from_root(build['build_dir']),
+        '--specpath', abs_from_root(build['spec_dir']),
     ]
 
-    # 添加图标
     if icon_path:
-        cmd.extend(["--icon", icon_path])
+        cmd.extend(['--icon', icon_path])
 
-    # 添加数据文件（图标目录：源侧绝对路径；目标侧 'icons' 保持相对，指 exe 内部路径）
-    if os.path.isdir(icons_dir):
-        cmd.extend(["--add-data", f"{icons_dir}{os.pathsep}icons"])
+    for item in pyi.get('add_data', []):
+        source = abs_from_root(item['source'])
+        if os.path.exists(source):
+            cmd.extend(['--add-data', f"{source}{os.pathsep}{item['target']}"])
+        else:
+            print(f"⚠ 数据路径不存在，跳过: {source}")
 
-    # 隐藏导入（解决某些模块找不到的问题）
-    hidden_imports = [
-        "pyautogui",
-        "keyboard",
-        "PIL",
-        "PIL.Image",
-        "PIL.ImageTk",
-        "tkinter",
-        "tkinter.ttk",
-    ]
-    # 可选主题依赖（P2 主题系统 TH-01/TH-03）：ttkbootstrap 尚未纳入依赖且功能未实现，
-    # 仅当模块可导入时才作为隐藏导入，避免 PyInstaller 报 "Hidden import not found" 误导。
-    import importlib.util
-    for opt in ["ttkbootstrap", "ttkbootstrap.style", "ttkbootstrap.widgets"]:
+    hidden = list(pyi.get('hidden_imports', []))
+    for opt in pyi.get('optional_hidden_imports', []):
         try:
             if importlib.util.find_spec(opt) is not None:
-                hidden_imports.append(opt)
+                hidden.append(opt)
         except (ImportError, ValueError):
             pass
+    for imp in hidden:
+        cmd.extend(['--hidden-import', imp])
 
-    for imp in hidden_imports:
-        cmd.extend(["--hidden-import", imp])
-
-    # 排除模块（配置驱动，来自 config.build.json 的 build.exclude_modules）
-    # cv2：pyscreeze 的 OpenCV 后端会把 opencv DLL 全部打进包（约 +42MB）。
-    # 本项目不使用截图/图像定位，排除后 pyscreeze 回退 Pillow 实现（_useOpenCV=False）。
-    exclude_modules = (load_build_config().get("build") or {}).get("exclude_modules") or []
-    for mod in exclude_modules:
-        cmd.extend(["--exclude-module", mod])
+    for mod in pyi.get('exclude_modules', []):
+        cmd.extend(['--exclude-module', mod])
         print(f"✓ 排除模块: {mod}")
 
-    # 主脚本
-    cmd.append("auto_clicker_py3.py")
+    cmd.append(project['main_script'])
 
     print("\n执行命令:")
     print(" ".join(cmd))
     print("\n" + "=" * 60)
 
-    # 执行打包
     try:
         subprocess.check_call(cmd)
         print("\n" + "=" * 60)
         print("✅ 打包成功!")
         print("=" * 60)
 
-        # 显示输出路径
-        exe_path = os.path.join(RELEASE_DIR, "dist", "AutoClicker.exe")
+        exe_path = os.path.join(abs_from_root(build['dist_dir']), exe_name)
         if os.path.exists(exe_path):
-            file_size = os.path.getsize(exe_path) / (1024 * 1024)  # MB
+            size_mb = os.path.getsize(exe_path) / (1024 * 1024)
             print(f"\n📦 可执行文件: {exe_path}")
-            print(f"📊 文件大小: {file_size:.2f} MB")
+            print(f"📊 文件大小: {size_mb:.2f} MB")
             print("\n💡 提示: 可以直接运行此文件，无需其他依赖")
-
         return True
-
     except subprocess.CalledProcessError as e:
         print("\n" + "=" * 60)
         print("❌ 打包失败!")
@@ -168,6 +168,6 @@ def build_exe():
         return False
 
 
-if __name__ == "__main__":
-    success = build_exe()
-    sys.exit(0 if success else 1)
+if __name__ == '__main__':
+    _bootstrap_encoding()
+    sys.exit(0 if build_exe() else 1)

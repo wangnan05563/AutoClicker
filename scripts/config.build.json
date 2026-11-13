@@ -1,46 +1,102 @@
 {
+  "schema_version": 2,
   "project": {
     "name": "AutoClicker",
-    "main_script": "auto_clicker_py3.py",
-    "root": "."
+    "main_script": "auto_clicker_py3.py"
   },
   "build": {
+    "release_dir": "release",
     "dist_dir": "release/dist",
     "build_dir": "release/build",
+    "spec_dir": "scripts",
     "exe_name": "AutoClicker.exe",
     "build_script": "scripts/build_exe.py",
-    "exclude_modules": [
-      "cv2"
+    "build_ps1": "scripts/build_package.ps1",
+    "pyinstaller": {
+      "module": "PyInstaller",
+      "pip_package": "pyinstaller",
+      "flags": [
+        "--onefile",
+        "--windowed",
+        "--noconfirm",
+        "--clean"
+      ],
+      "icon": "icons/autoclicker.ico",
+      "add_data": [
+        {
+          "source": "icons",
+          "target": "icons"
+        }
+      ],
+      "hidden_imports": [
+        "pyautogui",
+        "keyboard",
+        "PIL",
+        "PIL.Image",
+        "PIL.ImageTk",
+        "tkinter",
+        "tkinter.ttk"
+      ],
+      "optional_hidden_imports": [
+        "ttkbootstrap",
+        "ttkbootstrap.style",
+        "ttkbootstrap.widgets"
+      ],
+      "exclude_modules": [
+        "cv2"
+      ]
+    },
+    "clean_paths": [
+      "release/build",
+      "release/dist",
+      "__pycache__",
+      ".pytest_cache"
     ]
   },
   "runtime": {
     "python_min_version": [3, 10],
+    "python_io_encoding": "utf-8",
+    "required_imports": [
+      "tkinter"
+    ],
     "python_candidates": [
+      "%LOCALAPPDATA%\\Programs\\Python\\Python314\\python.exe",
       "%LOCALAPPDATA%\\Programs\\Python\\Python313\\python.exe",
       "%LOCALAPPDATA%\\Programs\\Python\\Python312\\python.exe",
       "%LOCALAPPDATA%\\Programs\\Python\\Python311\\python.exe",
-      "F:\\Program Files\\Python3.14\\python.exe",
-      "%USERPROFILE%\\.workbuddy\\binaries\\python\\versions\\3.13.12\\python.exe",
-      "%USERPROFILE%\\.workbuddy\\binaries\\python\\versions\\3.14\\python.exe"
+      "%LOCALAPPDATA%\\Programs\\Python\\Python310\\python.exe"
     ]
   },
   "build_safeguards": {
     "stop_before_build": {
       "enabled": true,
-      "image_name": "AutoClicker.exe"
+      "image_name": "AutoClicker.exe",
+      "wait_seconds": 1
     }
   },
   "verification": {
     "min_exe_size_mb": 5,
     "launch_smoke_test": {
       "enabled": true,
-      "timeout_seconds": 10
+      "timeout_seconds": 10,
+      "stable_seconds": 5
+    },
+    "freshness_check": {
+      "enabled": true,
+      "source_dir": ".",
+      "source_extensions": [
+        ".py",
+        ".spec"
+      ]
     }
   },
   "release": {
     "version": "2.0",
     "arch": "win64",
     "package_name": "AutoClicker-{version}-{arch}",
+    "archive_extension": ".zip",
+    "overwrite_existing": true,
+    "unique_suffix_format": "yyyyMMdd-HHmmss",
     "output_dir": "release/publish",
     "include": [
       "README.md",

@@ -1,13 +1,12 @@
 ﻿# -*- coding: utf-8 -*-
-# AutoClicker 一键发布脚本（Windows）
+# 项目一键发布脚本（Windows，完全配置驱动）
 # 由 一键发布.bat 委派执行。所有中文输出在此（UTF-8 BOM）。
-# 逻辑：确保构建产物存在（缺失/过期则先构建）-> 打版本化发布包(zip) -> 校验包内容。
+# 逻辑：确保构建产物存在（缺失/过期则先构建）-> 打版本化发布包 -> 校验包内容。
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $ErrorActionPreference = 'Stop'
 
-# 强制子进程 Python 使用 UTF-8 I/O，避免 build_exe.py 打印 Unicode 字符时因 GBK 控制台崩溃
-$env:PYTHONIOENCODING = "utf-8"
+. (Join-Path $PSScriptRoot "build-config.ps1")
 
 function Write-Banner($msg) {
     Write-Host ""
@@ -19,13 +18,11 @@ function Write-Banner($msg) {
 try {
     # 本脚本位于 scripts/ 下，项目根目录为其父目录
     $PROJECT_ROOT = Split-Path $PSScriptRoot -Parent
-    Write-Banner "AutoClicker 一键发布"
-    Write-Host "项目根目录: $PROJECT_ROOT"
+    $config = Get-BuildConfig $PSScriptRoot
+    $env:PYTHONIOENCODING = $config.runtime.python_io_encoding
 
-    # 读取配置（config.build.json 与本脚本同目录）
-    $configPath = Join-Path $PSScriptRoot "config.build.json"
-    if (-not (Test-Path $configPath)) { throw "未找到配置文件: $configPath" }
-    $config = Get-Content $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    Write-Banner "$($config.project.name) 一键发布"
+    Write-Host "项目根目录: $PROJECT_ROOT"
 
     $distDir = $config.build.dist_dir
     $exeName = $config.build.exe_name
@@ -33,17 +30,18 @@ try {
 
     # 步骤 1：确保构建产物
     Write-Banner "步骤 1/4: 确保构建产物"
+    $fresh = $config.verification.freshness_check
     $needBuild = $false
     if (-not (Test-Path $exePath)) {
         Write-Host "未找到产物 $exePath，需要先构建。" -ForegroundColor Yellow
         $needBuild = $true
-    } else {
-        # 源码（根目录 .py / .spec）比产物新则视为过期，需重建
-        # 注意：Get-ChildItem 的 -Include 不带 -Recurse 时会被忽略（PS 陷阱），改用扩展名过滤
+    } elseif ($fresh.enabled) {
+        # 源码比产物新则视为过期，需重建（用扩展名过滤，避开 -Include 无 -Recurse 的 PS 陷阱）
+        $srcDir = [System.IO.Path]::Combine($PROJECT_ROOT, $fresh.source_dir)
         $exeTime = (Get-Item $exePath).LastWriteTime
         $stale = $false
-        Get-ChildItem -Path $PROJECT_ROOT -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Extension -in ".py", ".spec" } |
+        Get-ChildItem -Path $srcDir -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in $fresh.source_extensions } |
             ForEach-Object { if ($_.LastWriteTime -gt $exeTime) { $stale = $true } }
         if ($stale) {
             Write-Host "源码已更新，产物过期，需要先重新构建。" -ForegroundColor Yellow
@@ -51,10 +49,12 @@ try {
         } else {
             Write-Host "产物已存在且为最新，跳过构建: $exePath" -ForegroundColor Gray
         }
+    } else {
+        Write-Host "新鲜度检查已禁用，直接使用现有产物: $exePath" -ForegroundColor Gray
     }
 
     if ($needBuild) {
-        $buildPs1 = Join-Path $PSScriptRoot "build_package.ps1"
+        $buildPs1 = Join-Path $PROJECT_ROOT $config.build.build_ps1
         if (-not (Test-Path $buildPs1)) { throw "未找到构建脚本: $buildPs1" }
         Write-Host "==> 调用构建脚本..." -ForegroundColor Cyan
         & $buildPs1
@@ -78,16 +78,19 @@ try {
     if ($filesToPack.Count -eq 0) { throw "没有可打包的文件。" }
 
     # 步骤 3：生成版本化发布包
-    Write-Banner "步骤 3/4: 生成发布包 (zip)"
-    $ver = $config.release.version
-    $arch = $config.release.arch
-    $pkgName = $config.release.package_name -replace "\{version\}", $ver -replace "\{arch\}", $arch
+    $ext = $config.release.archive_extension
+    Write-Banner "步骤 3/4: 生成发布包 ($ext)"
+    $pkgName = $config.release.package_name -replace "\{version\}", $config.release.version -replace "\{arch\}", $config.release.arch
     $outDir = Join-Path $PROJECT_ROOT $config.release.output_dir
     New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-    $zipPath = Join-Path $outDir ($pkgName + ".zip")
+    $zipPath = Join-Path $outDir ($pkgName + $ext)
 
-    # 先删除旧包，避免 Compress-Archive 的"已存在"报错
-    if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+    # 重复发布处理：默认用 -Force 覆盖（不删除文件，避免 safe-delete 钩子拦截）；
+    # 配置为不覆盖时，改用唯一后缀写入新文件，同样不做删除/覆盖式重命名。
+    if ((Test-Path $zipPath) -and (-not [bool]$config.release.overwrite_existing)) {
+        $suffix = Get-Date -Format $config.release.unique_suffix_format
+        $zipPath = Join-Path $outDir ($pkgName + '-' + $suffix + $ext)
+    }
     Compress-Archive -Path $filesToPack -DestinationPath $zipPath -Force
     Write-Host "[OK] 发布包: $zipPath" -ForegroundColor Green
 
