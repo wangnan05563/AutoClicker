@@ -181,20 +181,33 @@ try {
     $branch = (& git -C $gitDir rev-parse --abbrev-ref HEAD 2>$null).Trim()
     $upstream = (& git -C $gitDir rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>$null).Trim()
     $pushArgs = if (-not $upstream) { @('-u', 'origin', $branch) } else { @() }
-    $pushed = $false
-    for ($attempt = 1; $attempt -le 5; $attempt++) {
-        Write-Host "==> 推送至 origin/$branch（第 $attempt 次）..." -ForegroundColor Cyan
-        try {
-            & git -C $gitDir push @pushArgs 2>$null
-        } catch {
-            # git 在 Stop 偏好下会把 stderr 提升为错误，这里吞掉，交由 LASTEXITCODE 判断重试
+    # 本地已与远程同步（无新提交）时跳过推送，避免无谓联网（弱网下推送连接可能直接崩溃）
+    $skipPush = $false
+    if ($upstream) {
+        $aheadRaw = & git -C $gitDir rev-list --count "$($upstream)..HEAD" 2>$null
+        $aheadCount = 0
+        if ($LASTEXITCODE -eq 0 -and [int]::TryParse($aheadRaw, [ref]$aheadCount) -and $aheadCount -le 0) {
+            $skipPush = $true
         }
-        if ($LASTEXITCODE -eq 0) { $pushed = $true; break }
-        Write-Warning "推送失败（退出码 $LASTEXITCODE），3 秒后重试..."
-        Start-Sleep -Seconds 3
     }
-    if (-not $pushed) { throw "git push 失败（已重试 5 次）。请检查网络/鉴权，或手动执行 git push。" }
-    Write-Host "[OK] 源码已推送至 GitHub ($branch)。" -ForegroundColor Green
+    if ($skipPush) {
+        Write-Host "[OK] 本地已与远程同步，跳过推送（无新提交需推送）。" -ForegroundColor Gray
+    } else {
+        $pushed = $false
+        for ($attempt = 1; $attempt -le 5; $attempt++) {
+            Write-Host "==> 推送至 origin/$branch（第 $attempt 次）..." -ForegroundColor Cyan
+            try {
+                & git -C $gitDir push @pushArgs 2>$null
+            } catch {
+                # git 在 Stop 偏好下会把 stderr 提升为错误，这里吞掉，交由 LASTEXITCODE 判断重试
+            }
+            if ($LASTEXITCODE -eq 0) { $pushed = $true; break }
+            Write-Warning "推送失败（退出码 $LASTEXITCODE），3 秒后重试..."
+            Start-Sleep -Seconds 3
+        }
+        if (-not $pushed) { throw "git push 失败（已重试 5 次）。请检查网络/鉴权，或手动执行 git push。" }
+        Write-Host "[OK] 源码已推送至 GitHub ($branch)。" -ForegroundColor Green
+    }
 
     # 5.3.5 载入 GitHub Token（优先级：环境变量 > 项目根 .env；绝不回显 token 值）
     if (-not $env:GITHUB_TOKEN) {
