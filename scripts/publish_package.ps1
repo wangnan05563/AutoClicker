@@ -256,7 +256,9 @@ try {
                 & git -C $gitDir push origin ":refs/tags/$relTag" 2>$null
                 & git -C $gitDir tag -d $relTag 2>$null
             }
-        } catch { # 404 = 不存在，忽略（Release 尚不存在，可安全跳过） }
+        } catch {
+            # 404 = 不存在，忽略（Release 尚不存在，可安全跳过）
+        }
         try {
             $body = @{ tag_name = $relTag; name = $relName; body = $relNotes; draft = $false; prerelease = $false } | ConvertTo-Json -Compress
             $rel = Invoke-RestMethod -Uri $apiBase -Method Post -Headers $headers -Body $body -ContentType "application/json"
