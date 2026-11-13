@@ -177,17 +177,19 @@ try {
         Write-Host "工作区无源码变更，跳过提交。" -ForegroundColor Gray
     }
 
-    # 5.3 推送（必要时设置上游）
+    # 5.3 推送（必要时设置上游；网络抖动自动重试）
     $branch = (& git -C $gitDir rev-parse --abbrev-ref HEAD).Trim()
     $upstream = (& git -C $gitDir rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>$null).Trim()
-    if (-not $upstream) {
-        Write-Host "==> 分支 $branch 无上游，设置并推送 origin/$branch ..." -ForegroundColor Cyan
-        & git -C $gitDir push -u origin $branch
-    } else {
-        Write-Host "==> 推送至 $upstream ..." -ForegroundColor Cyan
-        & git -C $gitDir push
+    $pushArgs = if (-not $upstream) { @('-u', 'origin', $branch) } else { @() }
+    $pushed = $false
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        Write-Host "==> 推送至 origin/$branch（第 $attempt 次）..." -ForegroundColor Cyan
+        & git -C $gitDir push @pushArgs
+        if ($LASTEXITCODE -eq 0) { $pushed = $true; break }
+        Write-Warning "推送失败（退出码 $LASTEXITCODE），2 秒后重试..."
+        Start-Sleep -Seconds 2
     }
-    if ($LASTEXITCODE -ne 0) { throw "git push 失败（退出码 $LASTEXITCODE）。请检查网络/鉴权，或手动执行 git push。" }
+    if (-not $pushed) { throw "git push 失败（已重试 3 次）。请检查网络/鉴权，或手动执行 git push。" }
     Write-Host "[OK] 源码已推送至 GitHub ($branch)。" -ForegroundColor Green
 
     # 5.3.5 载入 GitHub Token（优先级：环境变量 > 项目根 .env；绝不回显 token 值）
