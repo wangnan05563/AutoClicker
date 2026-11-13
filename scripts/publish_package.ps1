@@ -236,9 +236,12 @@ try {
     # 5.4 创建 GitHub Release 并上传 zip（自动 Tag=v{version}，重跑可重发）
     $relTag = "v$($config.release.version)"
     $relName = "$($config.project.name) $($config.release.version)"
-    $relNotes = "AutoClicker $($config.release.version) 自动发布包（Windows $($config.release.arch)）。`n`n" +
-                "由 scripts/publish_package.ps1 自动生成并发布，包含 AutoClicker.exe + 文档。`n" +
-                "本地源码已同步至仓库 main 分支。"
+    $relNotes = "AutoClicker $($config.release.version) 发布包（Windows $($config.release.arch)）`n`n" +
+                "本次为 $($config.release.version) 版本，主要变更：`n`n" +
+                "- UI 修复：修正主题下拉框与选项字号过大、按钮被 DPI 二次放大导致文字被撑爆的问题（统一 9pt 字体基准，适配高 DPI 屏幕）。`n" +
+                "- 构建修复：一键发布改用零删除的原子替换，兼容安全删除钩子，修复重复发布失败。`n" +
+                "- 发布修复：GitHub Release 说明强制 UTF-8 编码，修正中文乱码。`n`n" +
+                "由 scripts/publish_package.ps1 自动构建并发布，包含 AutoClicker.exe + 文档。"
     $remoteUrl = (& git -C $gitDir remote get-url origin).Trim()
     $repoOk = $remoteUrl -match 'github\.com[:/]([^/]+)/(.+?)(?:\.git)?$'
 
@@ -260,8 +263,12 @@ try {
             # 404 = 不存在，忽略（Release 尚不存在，可安全跳过）
         }
         try {
-            $body = @{ tag_name = $relTag; name = $relName; body = $relNotes; draft = $false; prerelease = $false } | ConvertTo-Json -Compress
-            $rel = Invoke-RestMethod -Uri $apiBase -Method Post -Headers $headers -Body $body -ContentType "application/json"
+            # 关键：PowerShell 5.1 对字符串 -Body 会按系统默认编码（中文 Windows=GBK/936）
+            # 发送，GitHub 按 UTF-8 解析 GBK 字节 -> 非法序列变 U+FFFD（即你看到的乱码 ?）。
+            # 这里显式转 UTF-8 字节并以 charset=utf-8 发送，彻底解决中文乱码。
+            $bodyJson = @{ tag_name = $relTag; name = $relName; body = $relNotes; draft = $false; prerelease = $false } | ConvertTo-Json -Compress
+            $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($bodyJson)
+            $rel = Invoke-RestMethod -Uri $apiBase -Method Post -Headers $headers -Body $bodyBytes -ContentType "application/json; charset=utf-8"
             $uploadUrl = $rel.upload_url -replace '\{.*\}$', "?name=$(Split-Path $zipPath -Leaf)"
             $assetBytes = [System.IO.File]::ReadAllBytes($zipPath)
             Invoke-RestMethod -Uri $uploadUrl -Method Post -Headers $headers -Body $assetBytes -ContentType "application/zip" | Out-Null

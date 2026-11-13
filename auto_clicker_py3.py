@@ -291,7 +291,7 @@ ERROR_ALREADY_EXISTS = 183
 # 单实例检查 - 使用互斥锁
 SINGLE_INSTANCE_MUTEX_NAME = "AutoClicker_SingleInstance_Mutex"
 SINGLE_INSTANCE_LOCK_FILE = os.path.expanduser("~/.autoclicker.lock")
-WINDOW_TITLE = "桌面自动点击工具 v2.0 (Python 3.14)"
+WINDOW_TITLE = "桌面自动点击工具 v2.0.1 (Python 3.14)"
 IS_SINGLE_INSTANCE = True
 EXISTING_WINDOW_HWND = None
 SINGLE_INSTANCE_LOCK_FD = None
@@ -1660,7 +1660,7 @@ class AutoClicker:
                  font=('微软雅黑', 9), foreground=self._color('muted')).pack(anchor=tk.CENTER)
         
         # 版本信息
-        version_label = ttk.Label(footer_frame, text="v2.0 (Python 3.14)", 
+        version_label = ttk.Label(footer_frame, text="v2.0.1 (Python 3.14)", 
                                  font=('微软雅黑', 8), foreground=self._color('muted'))
         version_label.pack(anchor=tk.CENTER)
         

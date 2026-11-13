@@ -91,7 +91,7 @@
     }
   },
   "release": {
-    "version": "2.0",
+    "version": "2.0.1",
     "arch": "win64",
     "package_name": "AutoClicker-{version}-{arch}",
     "archive_extension": ".zip",
