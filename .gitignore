@@ -32,3 +32,7 @@ Thumbs.db
 # 日志与缓存
 *.log
 .pytest_cache/
+
+# 代理/助手工作目录（含个人数据，绝不入库）
+.workbuddy-ai/
+.workbuddy/

@@ -13,7 +13,7 @@ set "RC=%ERRORLEVEL%"
 
 if "%RC%"=="0" (
     echo.
-    echo [PUBLISH OK] Release package created successfully.
+    echo [PUBLISH OK] 已发布到 GitHub（源码已推送；本地包见 release/publish/）
 ) else (
     echo.
     echo [PUBLISH FAILED] Exit code %RC%.
