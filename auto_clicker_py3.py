@@ -414,9 +414,11 @@ class AutoClicker:
         self.setup_logging()
         self.load_config()
         self._init_theme()
+        self._init_ui_fonts()
         self.setup_ui()
         # 补记 DPI 诊断（此时日志/UI 设施已就绪）
-        self.log_message("DPI 适配：系统缩放 %.2f，已据缩放调整渲染" % getattr(self, '_dpi_scale', 1.0))
+        self.log_message("DPI 适配：系统缩放 %.2f，UI 字体基准 %dpt（不做二次放大）" % (
+            getattr(self, '_dpi_scale', 1.0), getattr(self, 'ui_font_size', 9)))
         self._apply_theme()
         # FR-L01：无可用输入后端时禁用启动（按钮 + 热键通道由 start_clicking 统一守卫兜底）
         if not self.input_ok:
@@ -513,29 +515,74 @@ class AutoClicker:
         except Exception:
             pass
 
-    # ==================== 6.11.2 DPI 适配 ====================
+    # ==================== 6.11.2 DPI 适配 / UI 字体基准 ====================
     def _init_dpi_awareness(self):
         """进程级 DPI 感知已在 main() 中、创建 Tk 根窗口之前设置（保证点击坐标与
-        物理像素一致）。此处依据系统缩放设置 tk 渲染比例，避免高分屏下 UI 过小。"""
+        物理像素一致）。此处只记录 tk 渲染比例供诊断/日志使用，不再据此放大字体。
+
+        注意：Windows 上 `tk scaling` 是「每点像素数」（96dpi 默认 1.333、200% 缩放为 2.0），
+        Tk 的 point-size 字体本就会随它渲染。若再按 scale 手工放大字号，等于二次放大。
+        """
         try:
-            scale = 1.0
             try:
                 scale = float(self.root.tk.call('tk', 'scaling'))
             except Exception:
                 scale = 1.0
             self._dpi_scale = scale
-            # 缩放较高时放大全局默认字体（仅作用于未显式指定 font 的控件，如按钮/下拉框）
-            if scale and scale > 1.25:
-                try:
-                    size = int(round(10 * min(scale, 1.6)))
-                    self.root.option_add('*Font', '微软雅黑 %d' % size)
-                except Exception:
-                    pass
             # 此处日志设施尚未初始化（setup_logging/setup_ui 在后），仅控制台留痕；
             # UI/磁盘日志在 __init__ 中 setup_ui() 之后补记
-            print("[DPI] 系统缩放 %.2f" % scale)
+            print("[DPI] 系统缩放 %.2f（字体基准由 _init_ui_fonts 统一设置）" % scale)
         except Exception:
             self._dpi_scale = 1.0
+
+    def _init_ui_fonts(self):
+        """统一 tk/ttk 控件与 Combobox 弹层的字体基准；须在 _init_theme() 之后调用。
+
+        旧实现用 `option_add('*Font', '微软雅黑 %d' % (10 * scale))` 把全局默认字体
+        放大到 16pt，而该 option 只命中「未显式指定 font」的控件（ttk 按钮、Combobox
+        输入区与下拉 Listbox、Entry），源码里显式 9~11pt 的 Label 不受影响，于是出现
+        「标签小、下拉/按钮巨大」的字号割裂，并撑爆按钮导致文字裁切。
+        """
+        from tkinter import font as tkfont
+        family, size = '微软雅黑', 9
+        self.ui_font_size = size
+        self.ui_font = (family, size)
+        font_str = '%s %d' % (family, size)
+        try:
+            # 1) named fonts：ttk 默认样式、菜单、Combobox 弹层 Listbox 均引用它们
+            for name in ('TkDefaultFont', 'TkTextFont', 'TkMenuFont', 'TkHeadingFont'):
+                try:
+                    tkfont.nametofont(name).configure(family=family, size=size)
+                except Exception:
+                    pass
+            # 2) option database：未显式指定 font 的 tk 控件 + 下拉弹层
+            self.root.option_add('*Font', font_str)
+            self.root.option_add('*Listbox.font', font_str)
+            self.root.option_add('*TCombobox*Listbox.font', font_str)
+            self.root.option_add('*Menu.font', font_str)
+        except Exception:
+            pass
+        self._apply_ttk_fonts()
+
+    def _apply_ttk_fonts(self):
+        """按统一基准覆盖 ttk 样式字体；主题切换后须重调（theme_use 会重置样式）。"""
+        from tkinter import ttk
+        family, size = getattr(self, 'ui_font', None) or ('微软雅黑', 9)
+        try:
+            style = ttk.Style()
+            for name in ('TButton', 'TCombobox', 'TEntry', 'TLabel', 'TCheckbutton',
+                         'TRadiobutton', 'TNotebook.Tab', 'TLabelframe.Label',
+                         'Treeview', 'TSpinbox'):
+                try:
+                    style.configure(name, font=(family, size))
+                except Exception:
+                    pass
+            try:
+                style.configure('Treeview.Heading', font=(family, size, 'bold'))
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     # ==================== P2 矢量图标工厂（UI-02，无 PIL 时降级为文本） ====================
     def make_icon(self, name, size=16, color='#333333'):
@@ -657,6 +704,8 @@ class AutoClicker:
                     self._ttkb_style.theme_use(tb_name)
                 except Exception:
                     pass
+            # theme_use 会重置 ttk 样式字体，切换后需按统一基准重新覆盖
+            self._apply_ttk_fonts()
             # 语义化重着色已知 tk 控件（TH-02）
             if getattr(self, 'start_btn', None):
                 self.start_btn.configure(bg=pal['success'], activebackground=self._shade(pal['success']),
@@ -1245,6 +1294,8 @@ class AutoClicker:
         control_card.pack(fill=tk.X, pady=(0, 15))
         
         # 主控制按钮 - 大按钮设计
+        # 注意：tk.Button 带 image 时 width/height 的单位是「像素」而非字符/行，
+        # 旧代码 height=2 会把按钮压成 2px 色条（文字不可见）；改用 padx/pady 控制留白。
         main_control_frame = ttk.Frame(control_card)
         main_control_frame.pack(fill=tk.X, pady=(0, 10))
         
@@ -1253,7 +1304,7 @@ class AutoClicker:
                                   font=('微软雅黑', 12, 'bold'),
                                   bg=self._color('success'), fg='white',
                                   activebackground=self._shade(self._color('success')), activeforeground='white',
-                                  width=20, height=2, cursor='hand2',
+                                  padx=12, pady=8, cursor='hand2',
                                   relief=tk.FLAT, bd=0)
         self._icon_play = self.make_icon('play', 18, 'white')
         if self._icon_play:
@@ -1265,7 +1316,7 @@ class AutoClicker:
                                  font=('微软雅黑', 12, 'bold'),
                                  bg=self._color('danger'), fg='white',
                                  activebackground=self._shade(self._color('danger')), activeforeground='white',
-                                 width=15, height=2, cursor='hand2',
+                                 padx=12, pady=8, cursor='hand2',
                                  relief=tk.FLAT, bd=0, state=tk.DISABLED)
         self._icon_stop = self.make_icon('stop', 18, 'white')
         if self._icon_stop:
@@ -1278,7 +1329,7 @@ class AutoClicker:
                                  font=('微软雅黑', 10),
                                  bg=self._color('primary'), fg='white',
                                  activebackground=self._shade(self._color('primary')), activeforeground='white',
-                                 height=1, cursor='hand2',
+                                 pady=6, cursor='hand2',
                                  relief=tk.FLAT, bd=0)
         self._icon_target = self.make_icon('target', 16, 'white')
         if self._icon_target:
