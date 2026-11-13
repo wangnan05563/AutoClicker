@@ -8,7 +8,10 @@
     "dist_dir": "release/dist",
     "build_dir": "release/build",
     "exe_name": "AutoClicker.exe",
-    "build_script": "scripts/build_exe.py"
+    "build_script": "scripts/build_exe.py",
+    "exclude_modules": [
+      "cv2"
+    ]
   },
   "runtime": {
     "python_min_version": [3, 10],

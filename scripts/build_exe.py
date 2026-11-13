@@ -7,6 +7,7 @@ AutoClicker 打包脚本
 
 import os
 import sys
+import json
 import subprocess
 import shutil
 
@@ -24,6 +25,17 @@ except Exception:
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RELEASE_DIR = os.path.join(ROOT_DIR, 'release')
+
+
+def load_build_config():
+    """读取与本脚本同目录的 config.build.json（配置驱动，读不到则回退空配置）。"""
+    cfg_path = os.path.join(SCRIPT_DIR, 'config.build.json')
+    try:
+        with open(cfg_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"⚠ 无法读取构建配置 {cfg_path}: {e}，使用默认参数")
+        return {}
 
 
 def clean_build():
@@ -115,6 +127,14 @@ def build_exe():
 
     for imp in hidden_imports:
         cmd.extend(["--hidden-import", imp])
+
+    # 排除模块（配置驱动，来自 config.build.json 的 build.exclude_modules）
+    # cv2：pyscreeze 的 OpenCV 后端会把 opencv DLL 全部打进包（约 +42MB）。
+    # 本项目不使用截图/图像定位，排除后 pyscreeze 回退 Pillow 实现（_useOpenCV=False）。
+    exclude_modules = (load_build_config().get("build") or {}).get("exclude_modules") or []
+    for mod in exclude_modules:
+        cmd.extend(["--exclude-module", mod])
+        print(f"✓ 排除模块: {mod}")
 
     # 主脚本
     cmd.append("auto_clicker_py3.py")
