@@ -131,9 +131,9 @@ try {
 
     # ===================================================================
     # 步骤 5/5：发布到 GitHub（真正的“发布”——把源码推送到远程仓库）
-    # 说明：release/publish 下的 zip 是本地构建产物（已被 .gitignore 忽略），
-    #       此处推送的是源码；若本机装有 gh 或设置了 $env:GITHUB_TOKEN，还会
-    #       创建带 zip 的 GitHub Release（最佳努力，失败不阻断发布）。
+# 说明：release/publish 下的 zip 是本地构建产物（已被 .gitignore 忽略），
+#       此处推送的是源码；并通过 .env 的 GH_TOKEN（或环境变量 / gh）创建带
+#       zip 的 GitHub Release（自动 Tag=v{version}，重跑可重发）。
     # ===================================================================
     Write-Banner "步骤 5/5: 发布到 GitHub"
     $gitDir = $PROJECT_ROOT
@@ -190,37 +190,73 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "git push 失败（退出码 $LASTEXITCODE）。请检查网络/鉴权，或手动执行 git push。" }
     Write-Host "[OK] 源码已推送至 GitHub ($branch)。" -ForegroundColor Green
 
-    # 5.4 创建 GitHub Release（最佳努力：gh 优先，其次 REST API + GITHUB_TOKEN）
+    # 5.3.5 载入 GitHub Token（优先级：环境变量 > 项目根 .env；绝不回显 token 值）
+    if (-not $env:GITHUB_TOKEN) {
+        $envFilePath = Join-Path $gitDir ".env"
+        if (Test-Path $envFilePath) {
+            foreach ($raw in (Get-Content $envFilePath -Encoding UTF8)) {
+                $line = $raw.Trim()
+                if ($line -eq '' -or $line.StartsWith('#')) { continue }
+                if ($line -match '^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$') {
+                    $k = $Matches[1]; $v = $Matches[2].Trim()
+                    if ($v -match '^"(.*)"$') { $v = $Matches[1] }
+                    elseif ($v -match "^'(.*)'$") { $v = $Matches[1] }
+                    $v = $v -replace '\s+#.*$', ''
+                    if (($k -eq 'GH_TOKEN' -or $k -eq 'GITHUB_TOKEN') -and $v -ne '') {
+                        $env:GITHUB_TOKEN = $v
+                        Write-Host "[OK] 已从 .env 载入 GitHub Token（用于创建 Release）。" -ForegroundColor Gray
+                        break
+                    }
+                }
+            }
+        }
+    }
+
+    # 5.4 创建 GitHub Release 并上传 zip（自动 Tag=v{version}，重跑可重发）
     $relTag = "v$($config.release.version)"
     $relName = "$($config.project.name) $($config.release.version)"
-    $gh = Get-Command gh -ErrorAction SilentlyContinue
-    if ($gh) {
-        Write-Host "==> 通过 gh 创建 Release $relTag 并上传发布包..." -ForegroundColor Cyan
-        $notes = "AutoClicker $($config.release.version) 自动发布包（Windows $($config.release.arch)）。`n由 scripts/publish_package.ps1 生成。"
-        & gh -C $gitDir release create $relTag $zipPath --title $relName --notes $notes --latest
+    $relNotes = "AutoClicker $($config.release.version) 自动发布包（Windows $($config.release.arch)）。`n`n" +
+                "由 scripts/publish_package.ps1 自动生成并发布，包含 AutoClicker.exe + 文档。`n" +
+                "本地源码已同步至仓库 main 分支。"
+    $remoteUrl = (& git -C $gitDir remote get-url origin).Trim()
+    $repoOk = $remoteUrl -match 'github\.com[:/]([^/]+)/(.+?)(?:\.git)?$'
+
+    if ($env:GITHUB_TOKEN -and $repoOk) {
+        Write-Host "==> 通过 GitHub API 创建/更新 Release $relTag 并上传发布包..." -ForegroundColor Cyan
+        $owner = $Matches[1]; $repo = $Matches[2]
+        $apiBase = "https://api.github.com/repos/$owner/$repo/releases"
+        $headers = @{ Authorization = "token $($env:GITHUB_TOKEN)"; Accept = "application/vnd.github+json" }
+        # 重跑场景：若 Release/Tag 已存在，先删除再重建（保证可直接重发）
+        try {
+            $existing = Invoke-RestMethod -Uri "$apiBase/tags/$relTag" -Headers $headers -ErrorAction Stop
+            if ($existing -and $existing.id) {
+                Write-Host "    检测到已存在 Release($relTag)，先删除再重建..." -ForegroundColor Yellow
+                Invoke-RestMethod -Uri "$apiBase/$($existing.id)" -Method Delete -Headers $headers -ErrorAction Stop | Out-Null
+                & git -C $gitDir push origin ":refs/tags/$relTag" 2>$null
+                & git -C $gitDir tag -d $relTag 2>$null
+            }
+        } catch { /* 404 = 不存在，忽略 */ }
+        try {
+            $body = @{ tag_name = $relTag; name = $relName; body = $relNotes; draft = $false; prerelease = $false } | ConvertTo-Json -Compress
+            $rel = Invoke-RestMethod -Uri $apiBase -Method Post -Headers $headers -Body $body -ContentType "application/json"
+            $uploadUrl = $rel.upload_url -replace '\{.*\}$', "?name=$(Split-Path $zipPath -Leaf)"
+            Invoke-RestMethod -Uri $uploadUrl -Method Post -Headers $headers -InFile $zipPath -ContentType "application/zip" | Out-Null
+            Write-Host "[OK] Release 已创建并上传资产: $relTag -> $($rel.html_url)" -ForegroundColor Green
+        } catch {
+            Write-Warning "GitHub API 创建 Release 失败：$_ 源码已推送，可稍后手动发布 Release。"
+        }
+    } elseif (($gh = Get-Command gh -ErrorAction SilentlyContinue) -and $repoOk) {
+        Write-Host "==> 通过 gh 创建/更新 Release $relTag 并上传发布包..." -ForegroundColor Cyan
+        & gh -C $gitDir release delete $relTag --yes 2>$null
+        & git -C $gitDir push origin ":refs/tags/$relTag" 2>$null
+        & git -C $gitDir tag -d $relTag 2>$null
+        & gh -C $gitDir release create $relTag $zipPath --title $relName --notes $relNotes --latest
         if ($LASTEXITCODE -eq 0) { Write-Host "[OK] Release 已创建: $relTag" -ForegroundColor Green }
         else { Write-Warning "gh release create 失败（退出码 $LASTEXITCODE）；源码已推送，可稍后手动发布 Release。" }
-    } elseif ($env:GITHUB_TOKEN) {
-        Write-Host "==> 通过 GitHub API 创建 Release $relTag ..." -ForegroundColor Cyan
-        $remoteUrl = (& git -C $gitDir remote get-url origin).Trim()
-        if ($remoteUrl -match 'github\.com[:/]([^/]+)/(.+?)(?:\.git)?$') {
-            $owner = $Matches[1]; $repo = $Matches[2]
-            $apiBase = "https://api.github.com/repos/$owner/$repo/releases"
-            $body = @{ tag_name = $relTag; name = $relName; body = "AutoClicker $($config.release.version) 自动发布包（Windows $($config.release.arch)）。"; draft = $false; prerelease = $false } | ConvertTo-Json -Compress
-            try {
-                $rel = Invoke-RestMethod -Uri $apiBase -Method Post -Headers @{ Authorization = "token $($env:GITHUB_TOKEN)"; Accept = "application/vnd.github+json" } -Body $body -ContentType "application/json"
-                $uploadUrl = $rel.upload_url -replace '\{.*\}$', "?name=$(Split-Path $zipPath -Leaf)"
-                Invoke-RestMethod -Uri $uploadUrl -Method Post -Headers @{ Authorization = "token $($env:GITHUB_TOKEN)"; Accept = "application/vnd.github+json" } -InFile $zipPath -ContentType "application/zip" | Out-Null
-                Write-Host "[OK] Release 已创建并上传资产: $relTag" -ForegroundColor Green
-            } catch {
-                Write-Warning "GitHub API 创建 Release 失败：$_ 源码已推送，可稍后手动发布 Release。"
-            }
-        } else { Write-Warning "无法解析 GitHub 远程地址，跳过 Release 创建。" }
     } else {
-        Write-Host "[提示] 未检测到 gh 且未设置 GITHUB_TOKEN，跳过 GitHub Release 创建（源码已推送）。" -ForegroundColor Yellow
+        Write-Host "[提示] 未配置 GH_TOKEN（.env 或环境变量）且未安装 gh，跳过 GitHub Release 创建（源码已推送）。" -ForegroundColor Yellow
         Write-Host "       本地发布包: $zipPath" -ForegroundColor Gray
-        Write-Host "       如需把 zip 作为 Release 资产发布，可手动执行：" -ForegroundColor Gray
-        Write-Host "         gh release create $relTag `"$zipPath`" --title `"$relName`"" -ForegroundColor Gray
+        Write-Host "       配置 .env 的 GH_TOKEN 或安装 gh 后重跑即可自动发布 Release。" -ForegroundColor Gray
     }
 
     Write-Banner "发布成功完成（源码已推送 GitHub）"
