@@ -182,14 +182,18 @@ try {
     $upstream = (& git -C $gitDir rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>$null).Trim()
     $pushArgs = if (-not $upstream) { @('-u', 'origin', $branch) } else { @() }
     $pushed = $false
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
         Write-Host "==> 推送至 origin/$branch（第 $attempt 次）..." -ForegroundColor Cyan
-        & git -C $gitDir push @pushArgs 2>$null
+        try {
+            & git -C $gitDir push @pushArgs 2>$null
+        } catch {
+            # git 在 Stop 偏好下会把 stderr 提升为错误，这里吞掉，交由 LASTEXITCODE 判断重试
+        }
         if ($LASTEXITCODE -eq 0) { $pushed = $true; break }
-        Write-Warning "推送失败（退出码 $LASTEXITCODE），2 秒后重试..."
-        Start-Sleep -Seconds 2
+        Write-Warning "推送失败（退出码 $LASTEXITCODE），3 秒后重试..."
+        Start-Sleep -Seconds 3
     }
-    if (-not $pushed) { throw "git push 失败（已重试 3 次）。请检查网络/鉴权，或手动执行 git push。" }
+    if (-not $pushed) { throw "git push 失败（已重试 5 次）。请检查网络/鉴权，或手动执行 git push。" }
     Write-Host "[OK] 源码已推送至 GitHub ($branch)。" -ForegroundColor Green
 
     # 5.3.5 载入 GitHub Token（优先级：环境变量 > 项目根 .env；绝不回显 token 值）
