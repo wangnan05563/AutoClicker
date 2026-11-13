@@ -159,7 +159,7 @@ try {
     if ($toAdd.Count -eq 0) { throw "没有可发布的源码文件，已中止以免空提交。" }
 
     Write-Host "==> 暂存源码（白名单）..." -ForegroundColor Cyan
-    & git -C $gitDir add -- $toAdd
+    & git -C $gitDir add -- $toAdd 2>$null
     if ($LASTEXITCODE -ne 0) { throw "git add 失败（退出码 $LASTEXITCODE）。" }
     # 安全兜底：任何情况下都确保代理目录不会被提交
     & git -C $gitDir reset -q -- .workbuddy-ai .workbuddy 2>$null
@@ -170,7 +170,7 @@ try {
         $commitMsg = "chore(release): AutoClicker $($config.release.version) 源码同步（一键发布）`n" +
                      "`n由 scripts/publish_package.ps1 自动提交并推送至 GitHub。`n" +
                      "构建产物已本地打包于 release/publish/，未纳入版本库（见 .gitignore）。"
-        & git -C $gitDir commit -m $commitMsg
+        & git -C $gitDir commit -m $commitMsg 2>$null
         if ($LASTEXITCODE -ne 0) { throw "git commit 失败（退出码 $LASTEXITCODE）。" }
         Write-Host "[OK] 已提交 $($pending.Count) 个文件。" -ForegroundColor Green
     } else {
@@ -178,13 +178,13 @@ try {
     }
 
     # 5.3 推送（必要时设置上游；网络抖动自动重试）
-    $branch = (& git -C $gitDir rev-parse --abbrev-ref HEAD).Trim()
+    $branch = (& git -C $gitDir rev-parse --abbrev-ref HEAD 2>$null).Trim()
     $upstream = (& git -C $gitDir rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>$null).Trim()
     $pushArgs = if (-not $upstream) { @('-u', 'origin', $branch) } else { @() }
     $pushed = $false
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         Write-Host "==> 推送至 origin/$branch（第 $attempt 次）..." -ForegroundColor Cyan
-        & git -C $gitDir push @pushArgs
+        & git -C $gitDir push @pushArgs 2>$null
         if ($LASTEXITCODE -eq 0) { $pushed = $true; break }
         Write-Warning "推送失败（退出码 $LASTEXITCODE），2 秒后重试..."
         Start-Sleep -Seconds 2
@@ -227,7 +227,7 @@ try {
         Write-Host "==> 通过 GitHub API 创建/更新 Release $relTag 并上传发布包..." -ForegroundColor Cyan
         $owner = $Matches[1]; $repo = $Matches[2]
         $apiBase = "https://api.github.com/repos/$owner/$repo/releases"
-        $headers = @{ Authorization = "token $($env:GITHUB_TOKEN)"; Accept = "application/vnd.github+json" }
+        $headers = @{ Authorization = "Bearer $($env:GITHUB_TOKEN)"; Accept = "application/vnd.github+json" }
         # 重跑场景：若 Release/Tag 已存在，先删除再重建（保证可直接重发）
         try {
             $existing = Invoke-RestMethod -Uri "$apiBase/tags/$relTag" -Headers $headers -ErrorAction Stop
@@ -242,7 +242,8 @@ try {
             $body = @{ tag_name = $relTag; name = $relName; body = $relNotes; draft = $false; prerelease = $false } | ConvertTo-Json -Compress
             $rel = Invoke-RestMethod -Uri $apiBase -Method Post -Headers $headers -Body $body -ContentType "application/json"
             $uploadUrl = $rel.upload_url -replace '\{.*\}$', "?name=$(Split-Path $zipPath -Leaf)"
-            Invoke-RestMethod -Uri $uploadUrl -Method Post -Headers $headers -InFile $zipPath -ContentType "application/zip" | Out-Null
+            $assetBytes = [System.IO.File]::ReadAllBytes($zipPath)
+            Invoke-RestMethod -Uri $uploadUrl -Method Post -Headers $headers -Body $assetBytes -ContentType "application/zip" | Out-Null
             Write-Host "[OK] Release 已创建并上传资产: $relTag -> $($rel.html_url)" -ForegroundColor Green
         } catch {
             Write-Warning "GitHub API 创建 Release 失败：$_ 源码已推送，可稍后手动发布 Release。"
@@ -252,7 +253,7 @@ try {
         & gh -C $gitDir release delete $relTag --yes 2>$null
         & git -C $gitDir push origin ":refs/tags/$relTag" 2>$null
         & git -C $gitDir tag -d $relTag 2>$null
-        & gh -C $gitDir release create $relTag $zipPath --title $relName --notes $relNotes --latest
+        & gh -C $gitDir release create $relTag $zipPath --title $relName --notes $relNotes --latest 2>$null
         if ($LASTEXITCODE -eq 0) { Write-Host "[OK] Release 已创建: $relTag" -ForegroundColor Green }
         else { Write-Warning "gh release create 失败（退出码 $LASTEXITCODE）；源码已推送，可稍后手动发布 Release。" }
     } else {
