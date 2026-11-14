@@ -128,6 +128,10 @@ MOUSEEVENTF_ABSOLUTE = 0x8000
 # 远小于常见 1~5 分钟的系统空闲锁屏/屏保阈值，从而独立于“点击运行”持续保活。
 KEEPALIVE_INTERVAL = 30
 
+# 复用文案与文件类型（S1192：避免同一字面量重复定义）
+MSG_SAVE_CONFIG_FAILED = "保存配置失败: "
+JSON_FILE_PATTERN = "*.json"
+
 # ==================== 平台通用函数 ====================
 def windows_move_mouse(x, y):
     """使用 Windows API 移动鼠标（ctypes 直连，不依赖 pywin32 是否可用）"""
@@ -193,13 +197,13 @@ def linux_move_mouse(x, y):
             try:
                 pyautogui.moveTo(x, y)
                 return True
-            except:
+            except Exception:
                 return False
     else:
         try:
             pyautogui.moveTo(x, y)
             return True
-        except:
+        except Exception:
             return False
 
 def linux_click(x, y, button='left', hold_ms=0):
@@ -259,7 +263,7 @@ def linux_get_cursor_pos():
             y = data["root_y"]
             d.close()
             return x, y
-        except:
+        except Exception:
             pass
     return pyautogui.position()
 
@@ -350,7 +354,7 @@ elif IS_LINUX:
                     except IOError:
                         # 无法获取锁，说明有其他进程在运行
                         IS_SINGLE_INSTANCE = False
-            except:
+            except OSError:
                 pass
         
         # 创建锁文件
@@ -360,7 +364,7 @@ elif IS_LINUX:
                 fcntl.flock(SINGLE_INSTANCE_LOCK_FD, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 SINGLE_INSTANCE_LOCK_FD.write(str(os.getpid()))
                 SINGLE_INSTANCE_LOCK_FD.flush()
-            except:
+            except OSError:
                 IS_SINGLE_INSTANCE = False
                 
     except ImportError:
@@ -448,6 +452,7 @@ class AutoClicker:
 
         # 防锁屏保活：初始化状态，并根据默认/已保存配置自动启动（独立于点击运行）
         self.keepalive_running = threading.Event()
+        self.keepalive_stop_event = threading.Event()
         self.keepalive_thread = None
         if self.prevent_sleep_var.get():
             self.start_keepalive()
@@ -485,15 +490,15 @@ class AutoClicker:
             'mouse_move_only': False,  # 只移动不点击
             # P0 安全与体验止血（CX-02 / CX-04 / CX-06）
             'startup_countdown': 3,  # 启动倒计时（秒，0-5）
-            'click_limit': 0,  # 点击次数上限（0=无限）
-            'duration_limit': 0,  # 运行时长上限（分钟，0=无限）
+            'click_limit': 0,  # 点击次数上限（0 表示无限）
+            'duration_limit': 0,  # 运行时长上限（分钟，0 表示无限）
             'failsafe_enabled': False,  # 鼠标位移即停
             'close_to_tray': True,  # 关闭窗口最小化到托盘（否则直接退出）
             # P1 功能扩展（FN-01 / FN-02 / CX-07 / CX-08 / CX-11 / FN-03）
             'click_button': 'left',  # 鼠标按键：left/right/middle/double
             'hold_ms': 10,  # 按住时长（毫秒）
-            'interval_unit': 's',  # 间隔单位：s=秒 / ms=毫秒
-            'jitter_pct': 0,  # 随机抖动百分比（0=关闭）
+            'interval_unit': 's',  # 间隔单位：s 表示秒，ms 表示毫秒
+            'jitter_pct': 0,  # 随机抖动百分比（0 表示关闭）
             'hotkey_start': 'f6',  # 启动/停止热键（可自定义）
             'hotkey_emergency': 'f8',  # 紧急停止热键（可自定义）
             'autostart': False,  # 开机自启
@@ -701,36 +706,43 @@ class AutoClicker:
             mode = 'dark' if self._system_is_dark() else 'light'
         return self.THEMES.get(mode, self.THEMES['light'])
 
+    def _apply_ttkbootstrap_theme(self):
+        """切换 ttkbootstrap 主题（TH-01）；未安装或切换失败时静默降级。"""
+        if self._ttkb_style is None:
+            return
+        try:
+            effective = self.theme_mode
+            if effective == 'system':
+                effective = 'dark' if self._system_is_dark() else 'light'
+            tb_name = 'darkly' if effective == 'dark' else 'cosmo'
+            self._ttkb_style.theme_use(tb_name)
+        except Exception:
+            pass
+
+    def _recolor_action_buttons(self, pal):
+        """按语义色重着色操作按钮（TH-02）。"""
+        button_colors = (
+            ('start_btn', 'success'),
+            ('stop_btn', 'danger'),
+            ('test_btn', 'primary'),
+            ('set_area_btn', 'muted'),
+        )
+        for attr, key in button_colors:
+            btn = getattr(self, attr, None)
+            if btn:
+                btn.configure(bg=pal[key], activebackground=self._shade(pal[key]),
+                              fg='white', activeforeground='white')
+
     def _apply_theme(self):
         """运行时应用主题：切换 ttkbootstrap 主题 + 重着色语义化控件（TH-01/TH-02）"""
         try:
             pal = self._resolve_palette()
             self._current_palette = pal
-            # ttkbootstrap 主题切换（TH-01）
-            if self._ttkb_style is not None:
-                try:
-                    effective = self.theme_mode
-                    if effective == 'system':
-                        effective = 'dark' if self._system_is_dark() else 'light'
-                    tb_name = 'darkly' if effective == 'dark' else 'cosmo'
-                    self._ttkb_style.theme_use(tb_name)
-                except Exception:
-                    pass
+            self._apply_ttkbootstrap_theme()
             # theme_use 会重置 ttk 样式字体，切换后需按统一基准重新覆盖
             self._apply_ttk_fonts()
             # 语义化重着色已知 tk 控件（TH-02）
-            if getattr(self, 'start_btn', None):
-                self.start_btn.configure(bg=pal['success'], activebackground=self._shade(pal['success']),
-                                         fg='white', activeforeground='white')
-            if getattr(self, 'stop_btn', None):
-                self.stop_btn.configure(bg=pal['danger'], activebackground=self._shade(pal['danger']),
-                                        fg='white', activeforeground='white')
-            if getattr(self, 'test_btn', None):
-                self.test_btn.configure(bg=pal['primary'], activebackground=self._shade(pal['primary']),
-                                        fg='white', activeforeground='white')
-            if getattr(self, 'set_area_btn', None):
-                self.set_area_btn.configure(bg=pal['muted'], activebackground=self._shade(pal['muted']),
-                                            fg='white', activeforeground='white')
+            self._recolor_action_buttons(pal)
             if getattr(self, 'log_text', None):
                 try:
                     self.log_text.configure(bg=pal['surface'], fg=pal['fg'])
@@ -776,7 +788,7 @@ class AutoClicker:
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            print("保存配置失败: " + str(e))
+            print(MSG_SAVE_CONFIG_FAILED + str(e))
     
     def save_config_if_running(self):
         """保存配置，如果程序正在运行则保存当前配置"""
@@ -795,7 +807,7 @@ class AutoClicker:
                 self.config['close_to_tray'] = self.close_to_tray_var.get()
             self.save_config()
         except Exception as e:
-            print("保存配置失败: " + str(e))
+            print(MSG_SAVE_CONFIG_FAILED + str(e))
     
     def on_prevent_sleep_changed(self):
         """防止系统锁屏选项改变时的回调（即时启停后台保活）"""
@@ -810,7 +822,7 @@ class AutoClicker:
                 self.allow_system_sleep()
                 self.log_message("已禁用防止系统锁屏")
         except Exception as e:
-            print("保存配置失败: " + str(e))
+            print(MSG_SAVE_CONFIG_FAILED + str(e))
 
     def on_mouse_follow_changed(self):
         """鼠标跟随选项改变时的回调"""
@@ -822,7 +834,7 @@ class AutoClicker:
             else:
                 self.log_message("已禁用鼠标跟随移动")
         except Exception as e:
-            print("保存配置失败: " + str(e))
+            print(MSG_SAVE_CONFIG_FAILED + str(e))
             
     def on_mouse_move_only_changed(self):
         """只移动不点击选项改变时的回调"""
@@ -837,7 +849,7 @@ class AutoClicker:
             else:
                 self.log_message("已禁用只移动不点击模式")
         except Exception as e:
-            print("保存配置失败: " + str(e))
+            print(MSG_SAVE_CONFIG_FAILED + str(e))
 
     def on_close_behavior_changed(self):
         """关闭行为选项改变时的回调（CX-06）"""
@@ -935,33 +947,50 @@ class AutoClicker:
         """CX-11：开机自启开关"""
         self.set_autostart(self.autostart_var.get())
 
+    @staticmethod
+    def _autostart_executable():
+        """返回开机自启应指向的可执行路径（打包后为 exe，源码运行为脚本）。"""
+        if getattr(sys, 'frozen', False):
+            return os.path.abspath(sys.argv[0])
+        return os.path.abspath(__file__)
+
+    def _set_autostart_windows(self, enable):
+        """写入/删除 Windows 注册表 Run 项。"""
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Run",
+                             0, winreg.KEY_SET_VALUE)
+        try:
+            if enable:
+                winreg.SetValueEx(key, "AutoClicker", 0, winreg.REG_SZ,
+                                  '"' + self._autostart_executable() + '"')
+            else:
+                try:
+                    winreg.DeleteValue(key, "AutoClicker")
+                except FileNotFoundError:
+                    pass
+        finally:
+            winreg.CloseKey(key)
+
+    def _set_autostart_linux(self, enable):
+        """写入/删除 Linux autostart desktop 文件。"""
+        adir = os.path.expanduser("~/.config/autostart")
+        os.makedirs(adir, exist_ok=True)
+        desk = os.path.join(adir, "autoclicker.desktop")
+        if enable:
+            with open(desk, 'w', encoding='utf-8') as f:
+                f.write("[Desktop Entry]\nType=Application\nName=AutoClicker\n"
+                        "Exec=\"%s\"\nHidden=false\nX-GNOME-Autostart-enabled=true\n"
+                        % self._autostart_executable())
+        elif os.path.exists(desk):
+            os.remove(desk)
+
     def set_autostart(self, enable):
         try:
             if IS_WINDOWS:
-                import winreg
-                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                    r"Software\Microsoft\Windows\CurrentVersion\Run",
-                                    0, winreg.KEY_SET_VALUE)
-                exe = os.path.abspath(sys.argv[0]) if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
-                if enable:
-                    winreg.SetValueEx(key, "AutoClicker", 0, winreg.REG_SZ, '"' + exe + '"')
-                else:
-                    try:
-                        winreg.DeleteValue(key, "AutoClicker")
-                    except FileNotFoundError:
-                        pass
-                winreg.CloseKey(key)
+                self._set_autostart_windows(enable)
             elif IS_LINUX:
-                adir = os.path.expanduser("~/.config/autostart")
-                os.makedirs(adir, exist_ok=True)
-                desk = os.path.join(adir, "autoclicker.desktop")
-                if enable:
-                    exe = os.path.abspath(sys.argv[0]) if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
-                    with open(desk, 'w', encoding='utf-8') as f:
-                        f.write("[Desktop Entry]\nType=Application\nName=AutoClicker\n"
-                                "Exec=\"%s\"\nHidden=false\nX-GNOME-Autostart-enabled=true\n" % exe)
-                elif os.path.exists(desk):
-                    os.remove(desk)
+                self._set_autostart_linux(enable)
             else:
                 messagebox.showinfo("提示", "当前平台不支持开机自启")
                 return
@@ -1028,7 +1057,7 @@ class AutoClicker:
                 return
             path = filedialog.asksaveasfilename(
                 defaultextension=".json",
-                filetypes=[("JSON", "*.json"), ("CSV", "*.csv")],
+                filetypes=[("JSON", JSON_FILE_PATTERN), ("CSV", "*.csv")],
                 title="导出运行统计")
             if not path:
                 return
@@ -1119,7 +1148,7 @@ class AutoClicker:
     def profile_export(self):
         try:
             path = filedialog.asksaveasfilename(defaultextension=".json",
-                                               filetypes=[("JSON", "*.json")],
+                                               filetypes=[("JSON", JSON_FILE_PATTERN)],
                                                title="导出配置方案")
             if not path:
                 return
@@ -1131,7 +1160,7 @@ class AutoClicker:
 
     def profile_import(self):
         try:
-            path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")], title="导入配置方案")
+            path = filedialog.askopenfilename(filetypes=[("JSON", JSON_FILE_PATTERN)], title="导入配置方案")
             if not path:
                 return
             with open(path, 'r', encoding='utf-8') as f:
@@ -1178,7 +1207,7 @@ class AutoClicker:
             self.save_config()
             self.mouse_speed_label.config(text=f"{speed:.2f}")
         except Exception as e:
-            print("保存配置失败: " + str(e))
+            print(MSG_SAVE_CONFIG_FAILED + str(e))
                 
     def setup_ui(self):
         """设置现代化UI界面 - 采用卡片式布局和响应式设计"""
@@ -1702,7 +1731,7 @@ class AutoClicker:
         if not keyboard:
             return
         # 清除旧热键，避免重复注册
-        for k in list(getattr(self, '_hk_keys', [])):
+        for k in getattr(self, '_hk_keys', []):
             try:
                 keyboard.remove_hotkey(k)
             except Exception:
@@ -1796,7 +1825,7 @@ class AutoClicker:
                 time.sleep(step_time)
 
             move_mouse(x, y)
-            self.log_message(f"[平滑移动] 完成")
+            self.log_message("[平滑移动] 完成")
         except Exception as e:
             self.log_message(f"鼠标移动失败: {e}")
         
@@ -1818,7 +1847,7 @@ class AutoClicker:
                     subprocess.Popen(['xdg-screensaver', 'suspend'], 
                                    stdout=subprocess.PIPE, 
                                    stderr=subprocess.PIPE)
-                except:
+                except Exception:
                     try:
                         import subprocess
                         subprocess.Popen(['xset', 's', 'off'], 
@@ -1827,7 +1856,7 @@ class AutoClicker:
                         subprocess.Popen(['xset', '-dpms'], 
                                        stdout=subprocess.PIPE, 
                                        stderr=subprocess.PIPE)
-                    except:
+                    except Exception:
                         pass
                 print("已设置Linux防休眠")
             elif IS_MACOS:
@@ -1847,8 +1876,11 @@ class AutoClicker:
         if getattr(self, 'keepalive_running', None) is None:
             self.keepalive_running = threading.Event()
             self.keepalive_thread = None
+        if getattr(self, 'keepalive_stop_event', None) is None:
+            self.keepalive_stop_event = threading.Event()
         if self.keepalive_running.is_set():
             return
+        self.keepalive_stop_event.clear()
         self.keepalive_running.set()
         self.keepalive_thread = threading.Thread(target=self._keepalive_loop, daemon=True)
         self.keepalive_thread.start()
@@ -1859,6 +1891,8 @@ class AutoClicker:
         if not getattr(self, 'keepalive_running', None) or not self.keepalive_running.is_set():
             return
         self.keepalive_running.clear()
+        if getattr(self, 'keepalive_stop_event', None) is not None:
+            self.keepalive_stop_event.set()
         self.log_message("已停止后台防锁屏保活")
 
     def _keepalive_loop(self):
@@ -1868,8 +1902,10 @@ class AutoClicker:
         except Exception:
             pass
         while self.keepalive_running.is_set():
-            # 等一个间隔，期间可被 stop_keepalive 立即唤醒退出
-            self.keepalive_running.wait(KEEPALIVE_INTERVAL)
+            # 等待一个间隔；stop_keepalive 通过独立停止事件立即唤醒退出。
+            # 注意不能等待 keepalive_running 本身：Event 已 set 时 wait 会立即返回，形成忙循环。
+            if self.keepalive_stop_event.wait(KEEPALIVE_INTERVAL):
+                break
             if not self.keepalive_running.is_set():
                 break
             try:
@@ -1907,7 +1943,7 @@ class AutoClicker:
                     subprocess.Popen(['xset', 'dpms'],
                                    stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE)
-                except:
+                except Exception:
                     pass
                 print("已恢复Linux休眠设置")
         except Exception as e:
@@ -2033,6 +2069,64 @@ class AutoClicker:
             self._set_next("ms 模式")
         return self.is_running
 
+    def _failsafe_triggered(self, base_pos):
+        """鼠标相对基线位移超过 20px 时视为触发 failsafe。"""
+        if not base_pos:
+            return False
+        cur = get_cursor_pos()
+        dx = cur[0] - base_pos[0]
+        dy = cur[1] - base_pos[1]
+        return (dx * dx + dy * dy) ** 0.5 > 20
+
+    def _next_click_point(self, points, point_idx):
+        """按多点位序列或当前点击模式取下一个坐标。"""
+        if points:
+            pt = points[point_idx % len(points)]
+            return int(pt['x']), int(pt['y']), point_idx + 1
+        x, y = self.get_click_position()
+        return x, y, point_idx
+
+    def _move_before_click(self, x, y):
+        """鼠标跟随开启时平滑移动到目标点。"""
+        if not self.mouse_follow_var.get():
+            return
+        try:
+            speed = float(self.mouse_speed_var.get())
+            duration = max(0.1, 1.0 - speed)
+            self.smooth_move_to(x, y, duration=duration)
+            time.sleep(0.1)
+        except Exception as e:
+            self.log_message(f"鼠标跟随失败: {e}")
+
+    def _click_once_at(self, x, y):
+        """执行一次点击（或仅移动），并刷新计数显示。"""
+        if self.mouse_move_only_var.get():
+            self.log_message(f"仅移动到位置 ({x}, {y})，未执行点击")
+            return
+        # FN-01/FN-02：支持按键类型与按住时长
+        ok = click_mouse(x, y, button=self.click_button, hold_ms=self.hold_ms)
+        if ok:
+            self.log_message(f"在位置 ({x}, {y}) 执行点击[按键={self.click_button}]")
+        else:
+            pyautogui.click(x, y)
+            self.log_message(f"使用pyautogui在位置 ({x}, {y}) 执行点击")
+        self.click_count += 1
+        self.success_count = self.click_count
+        self.click_count_label.config(text=str(self.click_count))
+        self._ui(self._set_sb_counts)
+
+    def _limit_reached(self):
+        """点击次数/运行时长达到上限时停止并返回 True。"""
+        if self.click_limit and self.click_count >= self.click_limit:
+            self.stop_clicking(reason=f"达到点击次数上限 ({self.click_limit} 次)")
+            return True
+        if self.duration_limit:
+            elapsed_min = (time.time() - self.start_time) / 60.0
+            if elapsed_min >= self.duration_limit:
+                self.stop_clicking(reason=f"达到运行时长上限 ({self.duration_limit} 分钟)")
+                return True
+        return False
+
     def click_loop(self):
         # 多点位序列模式（FN-03）
         points = self.multi_points if self.use_multi_points else None
@@ -2044,69 +2138,25 @@ class AutoClicker:
                     self.prevent_system_sleep()
 
                 # 安全：鼠标位移 failsafe 基线（CX-01）
-                if self.failsafe_enabled:
-                    failsafe_base = get_cursor_pos()
+                failsafe_base = get_cursor_pos() if self.failsafe_enabled else None
 
                 # 等待一个间隔（含随机抖动），期间可响应停止（CX-07）
                 if not self._wait_interval(base):
                     break
 
                 # 安全：运行中若开启 failsafe 且鼠标被移动 >20px，立即急停（CX-01）
-                if self.failsafe_enabled and self.is_running:
-                    cur = get_cursor_pos()
-                    dx = cur[0] - failsafe_base[0]
-                    dy = cur[1] - failsafe_base[1]
-                    if (dx * dx + dy * dy) ** 0.5 > 20:
-                        self.stop_clicking(reason="鼠标位移触发安全停止 (failsafe)")
-                        return
+                if self.failsafe_enabled and self.is_running and self._failsafe_triggered(failsafe_base):
+                    self.stop_clicking(reason="鼠标位移触发安全停止 (failsafe)")
+                    return
 
-                # 计算本次点击坐标：多点位模式按序列循环，否则按模式取点
-                if points:
-                    if not points:
-                        break
-                    pt = points[point_idx % len(points)]
-                    x, y = int(pt['x']), int(pt['y'])
-                    point_idx += 1
-                else:
-                    x, y = self.get_click_position()
+                # 计算本次点击坐标并执行（含鼠标跟随/仅移动模式）
+                x, y, point_idx = self._next_click_point(points, point_idx)
+                self._move_before_click(x, y)
+                self._click_once_at(x, y)
 
-                # 鼠标跟随移动
-                if self.mouse_follow_var.get():
-                    try:
-                        speed = float(self.mouse_speed_var.get())
-                        duration = max(0.1, 1.0 - speed)
-                        self.smooth_move_to(x, y, duration=duration)
-                        time.sleep(0.1)
-                    except Exception as e:
-                        self.log_message(f"鼠标跟随失败: {e}")
-
-                # 只移动不点击模式下不执行点击
-                if not self.mouse_move_only_var.get():
-                    # FN-01/FN-02：支持按键类型与按住时长
-                    ok = click_mouse(x, y, button=self.click_button, hold_ms=self.hold_ms)
-                    if ok:
-                        self.log_message(f"在位置 ({x}, {y}) 执行点击[按键={self.click_button}]")
-                    else:
-                        pyautogui.click(x, y)
-                        self.log_message(f"使用pyautogui在位置 ({x}, {y}) 执行点击")
-                    self.click_count += 1
-                    self.success_count = self.click_count
-                    self.click_count_label.config(text=str(self.click_count))
-                    self._ui(self._set_sb_counts)
-                else:
-                    self.log_message(f"仅移动到位置 ({x}, {y})，未执行点击")
-
-                # 安全：点击次数上限（CX-02）
-                if self.click_limit and self.click_count >= self.click_limit:
-                    self.stop_clicking(reason=f"达到点击次数上限 ({self.click_limit} 次)")
+                # 安全：点击次数 / 运行时长上限（CX-02）
+                if self._limit_reached():
                     break
-
-                # 安全：运行时长上限（CX-02）
-                if self.duration_limit:
-                    elapsed_min = (time.time() - self.start_time) / 60.0
-                    if elapsed_min >= self.duration_limit:
-                        self.stop_clicking(reason=f"达到运行时长上限 ({self.duration_limit} 分钟)")
-                        break
 
             except Exception as e:
                 self.log_message(f"点击过程中发生错误: {e}")
@@ -2114,62 +2164,122 @@ class AutoClicker:
                 self._ui(self._set_sb_counts)
                 time.sleep(1)
                 
+    def _read_interval(self):
+        """读取并校验点击间隔，非法时弹窗并返回 None。"""
+        try:
+            value = int(self.interval_var.get())
+        except ValueError:
+            messagebox.showerror("错误", "点击间隔必须为整数")
+            return None
+        if value < 1:
+            messagebox.showerror("错误", "点击间隔必须 >= 1")
+            return None
+        return value
+
+    def _read_countdown(self):
+        """读取并校验启动倒计时（0-5 秒）。"""
+        try:
+            value = int(self.countdown_var.get())
+        except ValueError:
+            messagebox.showerror("错误", "启动倒计时必须为整数")
+            return None
+        if value < 0 or value > 5:
+            messagebox.showerror("错误", "启动倒计时必须在 0-5 秒之间")
+            return None
+        return value
+
+    def _read_click_limit(self):
+        """读取并校验点击次数上限（0 表示无限）。"""
+        try:
+            value = int(self.click_limit_var.get())
+        except ValueError:
+            messagebox.showerror("错误", "点击次数上限必须为整数")
+            return None
+        if value < 0:
+            messagebox.showerror("错误", "点击次数上限不能为负数")
+            return None
+        return value
+
+    def _read_duration_limit(self):
+        """读取并校验运行时长上限（分钟，0 表示无限）。"""
+        try:
+            value = int(self.duration_limit_var.get())
+        except ValueError:
+            messagebox.showerror("错误", "运行时长上限必须为整数")
+            return None
+        if value < 0:
+            messagebox.showerror("错误", "运行时长上限不能为负数")
+            return None
+        return value
+
+    def _read_jitter(self):
+        """读取并校验随机抖动百分比（0-100）。"""
+        try:
+            value = int(self.jitter_var.get())
+        except ValueError:
+            messagebox.showerror("错误", "随机抖动必须为整数")
+            return None
+        if value < 0 or value > 100:
+            messagebox.showerror("错误", "随机抖动必须在 0-100 之间")
+            return None
+        return value
+
+    def _read_hold_ms(self):
+        """读取并校验按住时长（毫秒）。"""
+        try:
+            value = int(self.hold_ms_var.get())
+        except ValueError:
+            messagebox.showerror("错误", "按住时长必须为整数")
+            return None
+        if value < 0:
+            messagebox.showerror("错误", "按住时长不能为负数")
+            return None
+        return value
+
+    def _startup_summary(self, interval, countdown, click_limit, duration_limit, jitter, hold_ms):
+        """拼装启动日志摘要（把可选片段从主流程中拆出，降低认知复杂度）。"""
+        unit_text = "毫秒" if self.interval_unit == 'ms' else "秒"
+        parts = [
+            "启动配置: 模式=" + str(self.config['click_mode']) + ", 间隔=" + str(interval) + unit_text,
+            ", 按键=" + str(self.click_button) + ", 按住=" + str(hold_ms) + "ms",
+        ]
+        if jitter:
+            parts.append(f", 抖动={jitter}%")
+        if self.use_multi_points:
+            parts.append(", 多点位")
+        if countdown:
+            parts.append(", 倒计时=" + str(countdown) + "秒")
+        if click_limit:
+            parts.append(", 次数上限=" + str(click_limit))
+        if duration_limit:
+            parts.append(", 时长上限=" + str(duration_limit) + "分钟")
+        if self.failsafe_enabled:
+            parts.append(", failsafe开")
+        return "".join(parts)
+
     def start_clicking(self):
         # FR-L01：统一守卫，按钮与 F6 热键（toggle_clicking）都经过此处，避免绕过 UI 禁用
         if not self.input_ok:
             messagebox.showerror("启动已禁用", self.input_reason)
             return
         try:
-            interval = int(self.interval_var.get())
-            if interval < 1:
-                messagebox.showerror("错误", "点击间隔必须 >= 1")
+            interval = self._read_interval()
+            if interval is None:
                 return
-
-            # P0 安全/体验参数校验（CX-02 / CX-04）
-            try:
-                countdown = int(self.countdown_var.get())
-                if countdown < 0 or countdown > 5:
-                    messagebox.showerror("错误", "启动倒计时必须在 0-5 秒之间")
-                    return
-            except ValueError:
-                messagebox.showerror("错误", "启动倒计时必须为整数")
+            countdown = self._read_countdown()
+            if countdown is None:
                 return
-
-            try:
-                click_limit = int(self.click_limit_var.get())
-                if click_limit < 0:
-                    messagebox.showerror("错误", "点击次数上限不能为负数")
-                    return
-            except ValueError:
-                messagebox.showerror("错误", "点击次数上限必须为整数")
+            click_limit = self._read_click_limit()
+            if click_limit is None:
                 return
-
-            try:
-                duration_limit = int(self.duration_limit_var.get())
-                if duration_limit < 0:
-                    messagebox.showerror("错误", "运行时长上限不能为负数")
-                    return
-            except ValueError:
-                messagebox.showerror("错误", "运行时长上限必须为整数")
+            duration_limit = self._read_duration_limit()
+            if duration_limit is None:
                 return
-
-            # P1 参数校验（CX-07 / FN-02）
-            try:
-                jitter = int(self.jitter_var.get())
-                if jitter < 0 or jitter > 100:
-                    messagebox.showerror("错误", "随机抖动必须在 0-100 之间")
-                    return
-            except ValueError:
-                messagebox.showerror("错误", "随机抖动必须为整数")
+            jitter = self._read_jitter()
+            if jitter is None:
                 return
-
-            try:
-                hold_ms = int(self.hold_ms_var.get())
-                if hold_ms < 0:
-                    messagebox.showerror("错误", "按住时长不能为负数")
-                    return
-            except ValueError:
-                messagebox.showerror("错误", "按住时长必须为整数")
+            hold_ms = self._read_hold_ms()
+            if hold_ms is None:
                 return
 
             self.is_running = True
@@ -2209,16 +2319,8 @@ class AutoClicker:
             self.config['use_multi_points'] = self.use_multi_points
             self.save_config()
 
-            unit_text = "毫秒" if self.interval_unit == 'ms' else "秒"
-            self.log_message(
-                "启动配置: 模式=" + str(self.config['click_mode']) + ", 间隔=" + str(interval) + unit_text
-                + ", 按键=" + str(self.click_button) + ", 按住=" + str(hold_ms) + "ms"
-                + (f", 抖动={jitter}%" if jitter else "")
-                + (", 多点位" if self.use_multi_points else "")
-                + (", 倒计时=" + str(countdown) + "秒" if countdown else "")
-                + (", 次数上限=" + str(click_limit) if click_limit else "")
-                + (", 时长上限=" + str(duration_limit) + "分钟" if duration_limit else "")
-                + (", failsafe开" if self.failsafe_enabled else ""))
+            self.log_message(self._startup_summary(
+                interval, countdown, click_limit, duration_limit, jitter, hold_ms))
             if self.mouse_move_only_var.get():
                 self.log_message("只移动不点击模式: 启用")
 
@@ -2381,6 +2483,15 @@ class AutoClicker:
             return 'warn'
         return ''
 
+    @staticmethod
+    def _log_tag(level):
+        """日志级别到 Text tag 的映射（S3358：避免嵌套三元表达式）"""
+        if level == 'err':
+            return 'lvl_err'
+        if level == 'warn':
+            return 'lvl_warn'
+        return ''
+
     def _render_log(self):
         """按当前过滤条件重绘日志文本框（UI-04）"""
         try:
@@ -2390,7 +2501,7 @@ class AutoClicker:
             for entry, level in self._log_buffer:
                 if flt and flt not in entry.lower():
                     continue
-                tag = 'lvl_err' if level == 'err' else ('lvl_warn' if level == 'warn' else '')
+                tag = self._log_tag(level)
                 self.log_text.insert(tk.END, entry, tag)
             self.log_text.see(tk.END)
             self.log_text.config(state=tk.DISABLED)
@@ -2453,7 +2564,7 @@ class AutoClicker:
             else:
                 try:
                     self.log_text.config(state=tk.NORMAL)
-                    tag = 'lvl_err' if level == 'err' else ('lvl_warn' if level == 'warn' else '')
+                    tag = self._log_tag(level)
                     self.log_text.insert(tk.END, log_entry, tag)
                     self.log_text.see(tk.END)
                     self.log_text.config(state=tk.DISABLED)
@@ -2508,7 +2619,7 @@ class AutoClicker:
             if icon_path and os.path.exists(icon_path):
                 try:
                     image = Image.open(icon_path)
-                except:
+                except Exception:
                     image = self._create_default_icon()
             else:
                 image = self._create_default_icon()
@@ -2539,7 +2650,7 @@ class AutoClicker:
             draw.rectangle([10, 10, 54, 54], fill='#ffffff', outline='#28a745', width=3)
             draw.ellipse([20, 20, 44, 44], fill='#28a745')
             return img
-        except:
+        except Exception:
             return None
     
     def _create_windows_tray_icon(self):
@@ -2667,7 +2778,7 @@ class AutoClicker:
             print(f"最小化到托盘失败: {e}")
     
     def show_tray_menu(self, event=None):
-        """显示托盘右键菜单 - 带自适应定位"""
+        """显示托盘右键菜单：根据鼠标位置自适应定位，避免菜单超出屏幕边界。"""
         try:
             if hasattr(self, 'tray_menu'):
                 # 使用Windows API获取鼠标位置（更可靠）
@@ -2680,28 +2791,21 @@ class AutoClicker:
                     x = self.root.winfo_pointerx()
                     y = self.root.winfo_pointery()
                 
-                # 获取屏幕尺寸
                 screen_width = self.root.winfo_screenwidth()
                 screen_height = self.root.winfo_screenheight()
-                
-                # 菜单尺寸（估算）
+
                 menu_width = 150
                 menu_height = 80
-                
-                # 自适应定位：确保菜单不会超出屏幕边缘
-                # 如果鼠标位置太靠右，菜单向左弹出
+
                 if x + menu_width > screen_width:
                     x = x - menu_width
-                
-                # 如果鼠标位置太靠下，菜单向上弹出
+
                 if y + menu_height > screen_height:
                     y = y - menu_height
-                
-                # 确保菜单不会超出左边界和上边界
+
                 x = max(0, x)
                 y = max(0, y)
-                
-                # 使用 tkinter Menu 的 post 方法显示菜单
+
                 self.tray_menu.post(x, y)
                 
         except Exception as e:
@@ -2744,37 +2848,33 @@ class AutoClicker:
         else:
             self.exit_application()
     
-    def exit_application(self):
-        """完全退出应用程序 - 从托盘菜单调用（跨平台）"""
-        self.is_running = False
-        
+    def _shutdown_runtime(self):
+        """停止托盘、点击线程、保活与全局热键。"""
         try:
             self._remove_tray_icon()
         except Exception:
             pass
-        
         if self.click_thread and self.click_thread.is_alive():
             try:
                 self.click_thread.join(timeout=0.2)
             except Exception:
                 pass
-
         try:
             self.stop_keepalive()
         except Exception:
             pass
-
         try:
             self.allow_system_sleep()
         except Exception:
             pass
-        
         if keyboard:
             try:
                 keyboard.unhook_all()
             except Exception:
                 pass
-        
+
+    def _persist_state_on_exit(self):
+        """退出前把当前 UI 状态写回配置。"""
         try:
             self.config['interval_seconds'] = int(self.interval_var.get())
             self.config['click_mode'] = self.mode_var.get()
@@ -2785,19 +2885,27 @@ class AutoClicker:
             self.save_config()
         except Exception:
             pass
-        
-        # 清理 Linux 锁文件
-        if IS_LINUX and SINGLE_INSTANCE_LOCK_FD:
-            try:
-                SINGLE_INSTANCE_LOCK_FD.close()
-            except:
-                pass
-            try:
-                if os.path.exists(SINGLE_INSTANCE_LOCK_FILE):
-                    os.remove(SINGLE_INSTANCE_LOCK_FILE)
-            except:
-                pass
-        
+
+    def _cleanup_linux_instance_lock(self):
+        """清理 Linux 单实例锁文件。"""
+        if not (IS_LINUX and SINGLE_INSTANCE_LOCK_FD):
+            return
+        try:
+            SINGLE_INSTANCE_LOCK_FD.close()
+        except OSError:
+            pass
+        try:
+            if os.path.exists(SINGLE_INSTANCE_LOCK_FILE):
+                os.remove(SINGLE_INSTANCE_LOCK_FILE)
+        except OSError:
+            pass
+
+    def exit_application(self):
+        """完全退出应用程序 - 从托盘菜单调用（跨平台）"""
+        self.is_running = False
+        self._shutdown_runtime()
+        self._persist_state_on_exit()
+        self._cleanup_linux_instance_lock()
         self.root.destroy()
 
 
@@ -2859,7 +2967,7 @@ def main():
 
     app = AutoClicker(root)
 
-    root.mainloop()
+    app.root.mainloop()
 
 
 if __name__ == "__main__":

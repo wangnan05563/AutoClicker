@@ -71,25 +71,9 @@ def clean_build(cfg):
             shutil.rmtree(path, ignore_errors=True)
 
 
-def build_exe():
-    cfg = load_build_config()
-    project = cfg['project']
-    build = cfg['build']
-    pyi = build['pyinstaller']
-
-    # 确保在项目根目录执行，PyInstaller 才能解析主脚本与资源路径
-    os.chdir(ROOT_DIR)
-    os.makedirs(abs_from_root(build['release_dir']), exist_ok=True)
-
-    print("=" * 60)
-    print(f"开始打包 {project['name']}...")
-    print("=" * 60)
-
-    clean_build(cfg)
-
-    # PyInstaller 可用性自检（缺失时按配置安装）
+def _ensure_pyinstaller(pyi):
+    """检查 PyInstaller，缺失时按配置安装。"""
     try:
-        importlib.util.find_spec(pyi['module'])
         __import__(pyi['module'])
         print(f"✓ {pyi['module']} 已安装")
     except (ImportError, ValueError):
@@ -97,17 +81,33 @@ def build_exe():
         print(f"✗ {pyi['module']} 未安装，正在安装 {pkg} ...")
         subprocess.check_call([sys.executable, '-m', 'pip', 'install', pkg])
 
-    # 图标（绝对路径：spec 落在 scripts/ 时，spec 内相对路径按 spec 目录二次解析）
+
+def _resolve_icon(pyi):
+    """解析并校验图标路径；缺失时退回默认图标。"""
     icon_path = abs_from_root(pyi['icon']) if pyi.get('icon') else None
     if icon_path and not os.path.isfile(icon_path):
         print(f"⚠ 未找到图标文件，将使用默认图标: {icon_path}")
-        icon_path = None
-    elif icon_path:
+        return None
+    if icon_path:
         print(f"✓ 使用图标: {icon_path}")
+    return icon_path
 
-    exe_name = build['exe_name']
-    app_name = os.path.splitext(exe_name)[0]
 
+def _collect_hidden_imports(pyi):
+    """合并显式声明的 hidden import 与当前环境实际可用的可选依赖。"""
+    hidden = list(pyi.get('hidden_imports', []))
+    for opt in pyi.get('optional_hidden_imports', []):
+        try:
+            if importlib.util.find_spec(opt) is not None:
+                hidden.append(opt)
+        except (ImportError, ValueError):
+            pass
+    return hidden
+
+
+def _build_command(pyi, build, project, icon_path, hidden):
+    """按配置组装 PyInstaller 命令行参数。"""
+    app_name = os.path.splitext(build['exe_name'])[0]
     cmd = [
         sys.executable, '-m', pyi['module'],
         f"--name={app_name}",
@@ -127,13 +127,6 @@ def build_exe():
         else:
             print(f"⚠ 数据路径不存在，跳过: {source}")
 
-    hidden = list(pyi.get('hidden_imports', []))
-    for opt in pyi.get('optional_hidden_imports', []):
-        try:
-            if importlib.util.find_spec(opt) is not None:
-                hidden.append(opt)
-        except (ImportError, ValueError):
-            pass
     for imp in hidden:
         cmd.extend(['--hidden-import', imp])
 
@@ -142,6 +135,33 @@ def build_exe():
         print(f"✓ 排除模块: {mod}")
 
     cmd.append(project['main_script'])
+    return cmd
+
+
+def build_exe():
+    cfg = load_build_config()
+    project = cfg['project']
+    build = cfg['build']
+    pyi = build['pyinstaller']
+
+    # 确保在项目根目录执行，PyInstaller 才能解析主脚本与资源路径
+    os.chdir(ROOT_DIR)
+    os.makedirs(abs_from_root(build['release_dir']), exist_ok=True)
+
+    print("=" * 60)
+    print(f"开始打包 {project['name']}...")
+    print("=" * 60)
+
+    clean_build(cfg)
+
+    # PyInstaller 可用性自检（缺失时按配置安装）
+    _ensure_pyinstaller(pyi)
+
+    # 图标（绝对路径：spec 落在 scripts/ 时，spec 内相对路径按 spec 目录二次解析）
+    icon_path = _resolve_icon(pyi)
+
+    hidden = _collect_hidden_imports(pyi)
+    cmd = _build_command(pyi, build, project, icon_path, hidden)
 
     print("\n执行命令:")
     print(" ".join(cmd))
@@ -153,7 +173,7 @@ def build_exe():
         print("✅ 打包成功!")
         print("=" * 60)
 
-        exe_path = os.path.join(abs_from_root(build['dist_dir']), exe_name)
+        exe_path = os.path.join(abs_from_root(build['dist_dir']), build['exe_name'])
         if os.path.exists(exe_path):
             size_mb = os.path.getsize(exe_path) / (1024 * 1024)
             print(f"\n📦 可执行文件: {exe_path}")
