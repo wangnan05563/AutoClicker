@@ -132,7 +132,7 @@ try {
     Write-Host "[OK] 发布包总大小: $('{0:F2}' -f $zipSizeMB) MB" -ForegroundColor Green
 
     # ===================================================================
-    # 步骤 5/5：发布到 GitHub（真正的“发布”——把源码推送到远程仓库）
+    # 步骤 5/5：发布到 GitHub（真正的'发布'——把源码推送到远程仓库）
 # 说明：release/publish 下的 zip 是本地构建产物（已被 .gitignore 忽略），
 #       此处推送的是源码；并通过 .env 的 GH_TOKEN（或环境变量 / gh）创建带
 #       zip 的 GitHub Release（自动 Tag=v{version}，重跑可重发）。
@@ -258,9 +258,9 @@ try {
     $relName = "$($config.project.name) $($config.release.version)"
     $relNotes = "AutoClicker $($config.release.version) 发布包（Windows $($config.release.arch)）`n`n" +
                 "本次为 $($config.release.version) 版本，主要变更：`n`n" +
-                "- 修复：防止系统锁屏改为独立后台保活线程，勾选即生效（不再依赖点击运行），并周期性做 1px 鼠标微抖动以击败策略型锁屏/屏保（同时解决“鼠标自动移动”不生效问题）。`n" +
+                "- 修复：防止系统锁屏改为独立后台保活线程，勾选即生效（不再依赖点击运行），并周期性做 1px 鼠标微抖动以击败策略型锁屏/屏保（同时解决'鼠标自动移动'不生效问题）。`n" +
                 "- 加固：windows_move_mouse 改用 ctypes 直连、去除对 pywin32 的硬依赖；win32gui/win32api/win32con 显式加入 hidden_imports，确保冻结 exe 中鼠标移动与防锁屏始终可用。`n" +
-                "- 文档：README 同步说明“防止系统锁屏”现已为独立后台保活。`n" +
+                "- 文档：README 同步说明'防止系统锁屏'现已为独立后台保活。`n" +
                 "- 版本：升 2.0.2（小版本迭代）。`n`n" +
                 "由 scripts/publish_package.ps1 自动构建并发布，包含 AutoClicker.exe + 文档。"
     $remoteUrl = (& git -C $gitDir remote get-url origin).Trim()
