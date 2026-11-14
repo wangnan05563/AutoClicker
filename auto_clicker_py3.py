@@ -12,12 +12,15 @@ from tkinter import ttk, messagebox, filedialog, simpledialog
 import subprocess
 import threading
 import time
-import random
+import secrets
 import json
 import logging
 import shutil
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
+
+# 点击抖动使用系统安全随机源，避免可预测的伪随机序列
+_RANDOM = secrets.SystemRandom()
 
 # ==================== 平台检测 ====================
 PLATFORM = sys.platform
@@ -1791,8 +1794,8 @@ class AutoClicker:
             x = area['x'] + area['width'] // 2
             y = area['y'] + area['height'] // 2
         else:
-            x = random.randint(area['x'], area['x'] + area['width'])
-            y = random.randint(area['y'], area['y'] + area['height'])
+            x = _RANDOM.randint(area['x'], area['x'] + area['width'])
+            y = _RANDOM.randint(area['y'], area['y'] + area['height'])
         return x, y
     
     def smooth_move_to(self, x, y, duration=0.5):
@@ -1860,7 +1863,8 @@ class AutoClicker:
                         pass
                 print("已设置Linux防休眠")
             elif IS_MACOS:
-                os.system("caffeinate -u -t 1")
+                subprocess.run(["caffeinate", "-u", "-t", "1"], check=False,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 print("已设置macOS防休眠")
         except Exception as e:
             print(f"防止系统休眠失败: {e}")
@@ -2052,7 +2056,7 @@ class AutoClicker:
             return self.is_running
         jp = self.jitter_pct
         if jp and jp > 0:
-            factor = 1.0 + random.uniform(-jp / 100.0, jp / 100.0)
+            factor = 1.0 + _RANDOM.uniform(-jp / 100.0, jp / 100.0)
             wait = max(0.0, base_seconds * factor)
         else:
             wait = base_seconds

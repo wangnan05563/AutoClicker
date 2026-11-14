@@ -11,6 +11,10 @@ _TMP_HOME = tempfile.mkdtemp(prefix='autoclicker_smoke_')
 os.environ['USERPROFILE'] = _TMP_HOME
 os.environ['HOME'] = _TMP_HOME
 
+# 预置空配置，避免首次运行引导弹窗阻塞冒烟流程（AutoClicker 会自动补齐默认值）
+with open(os.path.join(_TMP_HOME, '.auto_clicker_config_py3.json'), 'w', encoding='utf-8') as _f:
+    _f.write('{}')
+
 import tkinter as tk  # noqa: E402
 
 import auto_clicker_py3 as app_module  # noqa: E402

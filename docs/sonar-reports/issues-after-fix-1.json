@@ -1,0 +1,375 @@
+{
+  "total": 2,
+  "p": 1,
+  "ps": 500,
+  "paging": {
+    "pageIndex": 1,
+    "pageSize": 500,
+    "total": 2
+  },
+  "effortTotal": 12,
+  "issues": [
+    {
+      "key": "ac4dda21-6cf5-40c5-ac23-595b2410d964",
+      "rule": "python:S125",
+      "severity": "MAJOR",
+      "component": "AutoClicker:auto_clicker_py3.py",
+      "project": "AutoClicker",
+      "line": 2781,
+      "hash": "a7cbdc4afe0e5c048cc00f9105343549",
+      "textRange": {
+        "startLine": 2781,
+        "endLine": 2781,
+        "startOffset": 16,
+        "endOffset": 34
+      },
+      "flows": [],
+      "status": "OPEN",
+      "message": "Remove this commented out code.",
+      "effort": "5min",
+      "debt": "5min",
+      "author": "",
+      "tags": [
+        "unused"
+      ],
+      "creationDate": "2026-11-14T17:33:50+08:00",
+      "updateDate": "2026-11-14T17:33:50+08:00",
+      "type": "CODE_SMELL",
+      "scope": "MAIN",
+      "quickFixAvailable": false,
+      "messageFormattings": [],
+      "codeVariants": [],
+      "cleanCodeAttribute": "CLEAR",
+      "cleanCodeAttributeCategory": "INTENTIONAL",
+      "impacts": [
+        {
+          "softwareQuality": "MAINTAINABILITY",
+          "severity": "MEDIUM"
+        }
+      ],
+      "issueStatus": "OPEN",
+      "prioritizedRule": false,
+      "fromSonarQubeUpdate": false,
+      "internalTags": [],
+      "linkedTicketStatus": "NOT_LINKED"
+    },
+    {
+      "key": "b3157b33-e63d-4a21-9b55-90d5cd3fb7f6",
+      "rule": "python:S3776",
+      "severity": "CRITICAL",
+      "component": "AutoClicker:auto_clicker_py3.py",
+      "project": "AutoClicker",
+      "line": 2231,
+      "hash": "88d75b84d1e169658bad9fa035470adb",
+      "textRange": {
+        "startLine": 2231,
+        "endLine": 2231,
+        "startOffset": 8,
+        "endOffset": 22
+      },
+      "flows": [
+        {
+          "locations": [
+            {
+              "component": "AutoClicker:auto_clicker_py3.py",
+              "textRange": {
+                "startLine": 2233,
+                "endLine": 2233,
+                "startOffset": 8,
+                "endOffset": 10
+              },
+              "msg": "+1",
+              "msgFormattings": []
+            }
+          ]
+        },
+        {
+          "locations": [
+            {
+              "component": "AutoClicker:auto_clicker_py3.py",
+              "textRange": {
+                "startLine": 2238,
+                "endLine": 2238,
+                "startOffset": 12,
+                "endOffset": 14
+              },
+              "msg": "+1",
+              "msgFormattings": []
+            }
+          ]
+        },
+        {
+          "locations": [
+            {
+              "component": "AutoClicker:auto_clicker_py3.py",
+              "textRange": {
+                "startLine": 2241,
+                "endLine": 2241,
+                "startOffset": 12,
+                "endOffset": 14
+              },
+              "msg": "+1",
+              "msgFormattings": []
+            }
+          ]
+        },
+        {
+          "locations": [
+            {
+              "component": "AutoClicker:auto_clicker_py3.py",
+              "textRange": {
+                "startLine": 2244,
+                "endLine": 2244,
+                "startOffset": 12,
+                "endOffset": 14
+              },
+              "msg": "+1",
+              "msgFormattings": []
+            }
+          ]
+        },
+        {
+          "locations": [
+            {
+              "component": "AutoClicker:auto_clicker_py3.py",
+              "textRange": {
+                "startLine": 2247,
+                "endLine": 2247,
+                "startOffset": 12,
+                "endOffset": 14
+              },
+              "msg": "+1",
+              "msgFormattings": []
+            }
+          ]
+        },
+        {
+          "locations": [
+            {
+              "component": "AutoClicker:auto_clicker_py3.py",
+              "textRange": {
+                "startLine": 2250,
+                "endLine": 2250,
+                "startOffset": 12,
+                "endOffset": 14
+              },
+              "msg": "+1",
+              "msgFormattings": []
+            }
+          ]
+        },
+        {
+          "locations": [
+            {
+              "component": "AutoClicker:auto_clicker_py3.py",
+              "textRange": {
+                "startLine": 2253,
+                "endLine": 2253,
+                "startOffset": 12,
+                "endOffset": 14
+              },
+              "msg": "+1",
+              "msgFormattings": []
+            }
+          ]
+        },
+        {
+          "locations": [
+            {
+              "component": "AutoClicker:auto_clicker_py3.py",
+              "textRange": {
+                "startLine": 2293,
+                "endLine": 2293,
+                "startOffset": 29,
+                "endOffset": 31
+              },
+              "msg": "+1",
+              "msgFormattings": []
+            }
+          ]
+        },
+        {
+          "locations": [
+            {
+              "component": "AutoClicker:auto_clicker_py3.py",
+              "textRange": {
+                "startLine": 2297,
+                "endLine": 2297,
+                "startOffset": 37,
+                "endOffset": 39
+              },
+              "msg": "+1",
+              "msgFormattings": []
+            }
+          ]
+        },
+        {
+          "locations": [
+            {
+              "component": "AutoClicker:auto_clicker_py3.py",
+              "textRange": {
+                "startLine": 2298,
+                "endLine": 2298,
+                "startOffset": 27,
+                "endOffset": 29
+              },
+              "msg": "+1",
+              "msgFormattings": []
+            }
+          ]
+        },
+        {
+          "locations": [
+            {
+              "component": "AutoClicker:auto_clicker_py3.py",
+              "textRange": {
+                "startLine": 2299,
+                "endLine": 2299,
+                "startOffset": 51,
+                "endOffset": 53
+              },
+              "msg": "+1",
+              "msgFormattings": []
+            }
+          ]
+        },
+        {
+          "locations": [
+            {
+              "component": "AutoClicker:auto_clicker_py3.py",
+              "textRange": {
+                "startLine": 2300,
+                "endLine": 2300,
+                "startOffset": 48,
+                "endOffset": 50
+              },
+              "msg": "+1",
+              "msgFormattings": []
+            }
+          ]
+        },
+        {
+          "locations": [
+            {
+              "component": "AutoClicker:auto_clicker_py3.py",
+              "textRange": {
+                "startLine": 2301,
+                "endLine": 2301,
+                "startOffset": 58,
+                "endOffset": 60
+              },
+              "msg": "+1",
+              "msgFormattings": []
+            }
+          ]
+        },
+        {
+          "locations": [
+            {
+              "component": "AutoClicker:auto_clicker_py3.py",
+              "textRange": {
+                "startLine": 2302,
+                "endLine": 2302,
+                "startOffset": 33,
+                "endOffset": 35
+              },
+              "msg": "+1",
+              "msgFormattings": []
+            }
+          ]
+        },
+        {
+          "locations": [
+            {
+              "component": "AutoClicker:auto_clicker_py3.py",
+              "textRange": {
+                "startLine": 2303,
+                "endLine": 2303,
+                "startOffset": 12,
+                "endOffset": 14
+              },
+              "msg": "+1",
+              "msgFormattings": []
+            }
+          ]
+        },
+        {
+          "locations": [
+            {
+              "component": "AutoClicker:auto_clicker_py3.py",
+              "textRange": {
+                "startLine": 2323,
+                "endLine": 2323,
+                "startOffset": 8,
+                "endOffset": 14
+              },
+              "msg": "+1",
+              "msgFormattings": []
+            }
+          ]
+        },
+        {
+          "locations": [
+            {
+              "component": "AutoClicker:auto_clicker_py3.py",
+              "textRange": {
+                "startLine": 2325,
+                "endLine": 2325,
+                "startOffset": 8,
+                "endOffset": 14
+              },
+              "msg": "+1",
+              "msgFormattings": []
+            }
+          ]
+        }
+      ],
+      "status": "OPEN",
+      "message": "Refactor this function to reduce its Cognitive Complexity from 17 to the 15 allowed.",
+      "effort": "7min",
+      "debt": "7min",
+      "author": "wangnan@hundsun.com",
+      "tags": [
+        "brain-overload"
+      ],
+      "creationDate": "2026-11-11T23:41:30+08:00",
+      "updateDate": "2026-11-14T17:33:50+08:00",
+      "type": "CODE_SMELL",
+      "scope": "MAIN",
+      "quickFixAvailable": false,
+      "messageFormattings": [],
+      "codeVariants": [],
+      "cleanCodeAttribute": "FOCUSED",
+      "cleanCodeAttributeCategory": "ADAPTABLE",
+      "impacts": [
+        {
+          "softwareQuality": "MAINTAINABILITY",
+          "severity": "HIGH"
+        }
+      ],
+      "issueStatus": "OPEN",
+      "prioritizedRule": false,
+      "fromSonarQubeUpdate": false,
+      "internalTags": [],
+      "linkedTicketStatus": "NOT_LINKED"
+    }
+  ],
+  "components": [
+    {
+      "key": "AutoClicker",
+      "enabled": true,
+      "qualifier": "TRK",
+      "name": "AutoClicker",
+      "longName": "AutoClicker"
+    },
+    {
+      "key": "AutoClicker:auto_clicker_py3.py",
+      "enabled": true,
+      "qualifier": "FIL",
+      "name": "auto_clicker_py3.py",
+      "longName": "auto_clicker_py3.py",
+      "path": "auto_clicker_py3.py"
+    }
+  ],
+  "facets": []
+}

@@ -33,6 +33,9 @@ Thumbs.db
 *.log
 .pytest_cache/
 
+# SonarQube 扫描临时目录
+.scannerwork/
+
 # 代理/助手工作目录（含个人数据，绝不入库）
 .workbuddy-ai/
 .workbuddy/
