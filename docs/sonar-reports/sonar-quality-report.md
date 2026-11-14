@@ -89,7 +89,7 @@
 ## 七、Git 提交
 
 - `aaf2e68`：`refactor(quality): 修复 SonarQube 规范与复杂度问题并新增自动化测试`
-- 第二次提交：安全随机源、`subprocess` 替换 `os.system`、测试冒烟修复、扫描器配置与质量报告
+- `2ae3a8e`：`fix(security): 消除安全热点并补强测试与质量报告`
 
 ## 八、残余事项
 
