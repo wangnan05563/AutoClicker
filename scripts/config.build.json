@@ -35,7 +35,10 @@
         "PIL.Image",
         "PIL.ImageTk",
         "tkinter",
-        "tkinter.ttk"
+        "tkinter.ttk",
+        "win32gui",
+        "win32api",
+        "win32con"
       ],
       "optional_hidden_imports": [
         "ttkbootstrap",
@@ -91,7 +94,7 @@
     }
   },
   "release": {
-    "version": "2.0.1",
+    "version": "2.0.2",
     "arch": "win64",
     "package_name": "AutoClicker-{version}-{arch}",
     "archive_extension": ".zip",

@@ -123,17 +123,23 @@ MOUSEEVENTF_MIDDLEDOWN = 0x0020
 MOUSEEVENTF_MIDDLEUP = 0x0040
 MOUSEEVENTF_ABSOLUTE = 0x8000
 
+# ==================== 防锁屏保活参数 ====================
+# 后台保活线程每隔该秒数重新断言“系统/显示器保持唤醒”并做一次 1px 微抖动，
+# 远小于常见 1~5 分钟的系统空闲锁屏/屏保阈值，从而独立于“点击运行”持续保活。
+KEEPALIVE_INTERVAL = 30
+
 # ==================== 平台通用函数 ====================
 def windows_move_mouse(x, y):
-    """使用 Windows API 移动鼠标"""
-    if HAS_WIN32API:
-        try:
-            ctypes.windll.user32.SetCursorPos(int(x), int(y))
-            return True
-        except Exception as e:
-            print(f"移动鼠标失败：{e}")
+    """使用 Windows API 移动鼠标（ctypes 直连，不依赖 pywin32 是否可用）"""
+    try:
+        ok = ctypes.windll.user32.SetCursorPos(int(x), int(y))
+        if not ok:
+            print(f"移动鼠标失败：SetCursorPos 返回 {ok}")
             return False
-    return False
+        return True
+    except Exception as e:
+        print(f"移动鼠标失败：{e}")
+        return False
 
 def windows_click(x, y, button='left', hold_ms=0):
     """使用 Windows API 执行鼠标点击（支持左/右/中键、双击与按住时长）"""
@@ -291,7 +297,7 @@ ERROR_ALREADY_EXISTS = 183
 # 单实例检查 - 使用互斥锁
 SINGLE_INSTANCE_MUTEX_NAME = "AutoClicker_SingleInstance_Mutex"
 SINGLE_INSTANCE_LOCK_FILE = os.path.expanduser("~/.autoclicker.lock")
-WINDOW_TITLE = "桌面自动点击工具 v2.0.1 (Python 3.14)"
+WINDOW_TITLE = "桌面自动点击工具 v2.0.2 (Python 3.14)"
 IS_SINGLE_INSTANCE = True
 EXISTING_WINDOW_HWND = None
 SINGLE_INSTANCE_LOCK_FD = None
@@ -439,6 +445,12 @@ class AutoClicker:
         
         # 关闭按钮直接退出程序
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        # 防锁屏保活：初始化状态，并根据默认/已保存配置自动启动（独立于点击运行）
+        self.keepalive_running = threading.Event()
+        self.keepalive_thread = None
+        if self.prevent_sleep_var.get():
+            self.start_keepalive()
         
     def setup_logging(self):
         """CX-10：初始化磁盘日志（RotatingFileHandler，单文件 5MB × 5 备份）"""
@@ -786,13 +798,16 @@ class AutoClicker:
             print("保存配置失败: " + str(e))
     
     def on_prevent_sleep_changed(self):
-        """防止系统锁屏选项改变时的回调"""
+        """防止系统锁屏选项改变时的回调（即时启停后台保活）"""
         try:
             self.config['prevent_sleep'] = self.prevent_sleep_var.get()
             self.save_config()
             if self.prevent_sleep_var.get():
+                self.start_keepalive()
                 self.log_message("已启用防止系统锁屏")
             else:
+                self.stop_keepalive()
+                self.allow_system_sleep()
                 self.log_message("已禁用防止系统锁屏")
         except Exception as e:
             print("保存配置失败: " + str(e))
@@ -1660,7 +1675,7 @@ class AutoClicker:
                  font=('微软雅黑', 9), foreground=self._color('muted')).pack(anchor=tk.CENTER)
         
         # 版本信息
-        version_label = ttk.Label(footer_frame, text="v2.0.1 (Python 3.14)", 
+        version_label = ttk.Label(footer_frame, text="v2.0.2 (Python 3.14)", 
                                  font=('微软雅黑', 8), foreground=self._color('muted'))
         version_label.pack(anchor=tk.CENTER)
         
@@ -1821,8 +1836,62 @@ class AutoClicker:
         except Exception as e:
             print(f"防止系统休眠失败: {e}")
                 
+    # ==================== 后台防锁屏保活（独立于点击运行） ====================
+    def start_keepalive(self):
+        """启动后台防锁屏保活线程。
+
+        只要“防止系统锁屏”开启即持续生效，不再依赖点击是否在运行：
+        周期性断言 SetThreadExecutionState 并做一次 1px 微抖动鼠标，
+        以击败“策略型锁屏/屏保”（也兼顾用户期望的“鼠标自动移动”诉求）。
+        """
+        if getattr(self, 'keepalive_running', None) is None:
+            self.keepalive_running = threading.Event()
+            self.keepalive_thread = None
+        if self.keepalive_running.is_set():
+            return
+        self.keepalive_running.set()
+        self.keepalive_thread = threading.Thread(target=self._keepalive_loop, daemon=True)
+        self.keepalive_thread.start()
+        self.log_message("已启动后台防锁屏保活（每 %d 秒保活一次）" % KEEPALIVE_INTERVAL)
+
+    def stop_keepalive(self):
+        """停止后台防锁屏保活线程（不在此清除系统唤醒状态，交由 allow_system_sleep 统一处理）。"""
+        if not getattr(self, 'keepalive_running', None) or not self.keepalive_running.is_set():
+            return
+        self.keepalive_running.clear()
+        self.log_message("已停止后台防锁屏保活")
+
+    def _keepalive_loop(self):
+        """保活循环：断言系统/显示器唤醒 + 1px 微抖动，直到被停止。"""
+        try:
+            self.prevent_system_sleep()
+        except Exception:
+            pass
+        while self.keepalive_running.is_set():
+            # 等一个间隔，期间可被 stop_keepalive 立即唤醒退出
+            self.keepalive_running.wait(KEEPALIVE_INTERVAL)
+            if not self.keepalive_running.is_set():
+                break
+            try:
+                self.prevent_system_sleep()
+            except Exception:
+                pass
+            # 1px 微抖动：先右移/下移 1 像素再回原位，几乎无感但足以重置空闲计时
+            try:
+                cx, cy = get_cursor_pos()
+                move_mouse(cx + 1, cy + 1)
+                move_mouse(cx, cy)
+            except Exception:
+                pass
+
     def allow_system_sleep(self):
-        """跨平台恢复系统休眠设置"""
+        """跨平台恢复系统休眠设置。
+
+        若后台保活仍在运行（防止系统锁屏开启），则不清除唤醒状态，
+        避免 stop_clicking 误清导致保活中断（由 keep-alive 继续持有状态）。
+        """
+        if getattr(self, 'keepalive_running', None) and self.keepalive_running.is_set():
+            return
         try:
             if IS_WINDOWS:
                 import ctypes
@@ -1832,18 +1901,18 @@ class AutoClicker:
             elif IS_LINUX:
                 try:
                     import subprocess
-                    subprocess.Popen(['xset', 's', 'on'], 
-                                   stdout=subprocess.PIPE, 
+                    subprocess.Popen(['xset', 's', 'on'],
+                                   stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE)
-                    subprocess.Popen(['xset', 'dpms'], 
-                                   stdout=subprocess.PIPE, 
+                    subprocess.Popen(['xset', 'dpms'],
+                                   stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE)
                 except:
                     pass
                 print("已恢复Linux休眠设置")
         except Exception as e:
             print(f"恢复系统休眠设置失败: {e}")
-                
+
     # ==================== 线程安全的 UI 更新辅助方法 ====================
     def _ui(self, fn, *args):
         try:
@@ -2689,7 +2758,12 @@ class AutoClicker:
                 self.click_thread.join(timeout=0.2)
             except Exception:
                 pass
-        
+
+        try:
+            self.stop_keepalive()
+        except Exception:
+            pass
+
         try:
             self.allow_system_sleep()
         except Exception:

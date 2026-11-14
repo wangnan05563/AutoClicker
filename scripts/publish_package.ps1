@@ -211,7 +211,7 @@ try {
         Write-Host "[OK] 源码已推送至 GitHub ($branch)。" -ForegroundColor Green
     }
 
-    # 5.3.5 载入 GitHub Token（优先级：环境变量 > 项目根 .env；绝不回显 token 值）
+    # 5.3.5 载入 GitHub Token（优先级：环境变量 > 项目根 .env > ~/.git-credentials；绝不回显 token 值）
     if (-not $env:GITHUB_TOKEN) {
         $envFilePath = Join-Path $gitDir ".env"
         if (Test-Path $envFilePath) {
@@ -232,15 +232,36 @@ try {
             }
         }
     }
+    # 回退：从 ~/.git-credentials（credential.helper=store）提取 token
+    if (-not $env:GITHUB_TOKEN) {
+        $credPath = Join-Path $env:USERPROFILE ".git-credentials"
+        if (Test-Path $credPath) {
+            foreach ($line in (Get-Content $credPath -Encoding UTF8)) {
+                if ($line -match 'github\.com') {
+                    # 形如 https://<token>@github.com 或 https://<user>:<token>@github.com
+                    if ($line -match 'https://([^:@]+):([^@]+)@github\.com') {
+                        $env:GITHUB_TOKEN = $Matches[2]
+                        Write-Host "[OK] 已从 ~/.git-credentials 载入 GitHub Token（用于创建 Release）。" -ForegroundColor Gray
+                        break
+                    } elseif ($line -match 'https://([^:@]+)@github\.com') {
+                        $env:GITHUB_TOKEN = $Matches[1]
+                        Write-Host "[OK] 已从 ~/.git-credentials 载入 GitHub Token（用于创建 Release）。" -ForegroundColor Gray
+                        break
+                    }
+                }
+            }
+        }
+    }
 
     # 5.4 创建 GitHub Release 并上传 zip（自动 Tag=v{version}，重跑可重发）
     $relTag = "v$($config.release.version)"
     $relName = "$($config.project.name) $($config.release.version)"
     $relNotes = "AutoClicker $($config.release.version) 发布包（Windows $($config.release.arch)）`n`n" +
                 "本次为 $($config.release.version) 版本，主要变更：`n`n" +
-                "- UI 修复：修正主题下拉框与选项字号过大、按钮被 DPI 二次放大导致文字被撑爆的问题（统一 9pt 字体基准，适配高 DPI 屏幕）。`n" +
-                "- 构建修复：一键发布改用零删除的原子替换，兼容安全删除钩子，修复重复发布失败。`n" +
-                "- 发布修复：GitHub Release 说明强制 UTF-8 编码，修正中文乱码。`n`n" +
+                "- 修复：防止系统锁屏改为独立后台保活线程，勾选即生效（不再依赖点击运行），并周期性做 1px 鼠标微抖动以击败策略型锁屏/屏保（同时解决“鼠标自动移动”不生效问题）。`n" +
+                "- 加固：windows_move_mouse 改用 ctypes 直连、去除对 pywin32 的硬依赖；win32gui/win32api/win32con 显式加入 hidden_imports，确保冻结 exe 中鼠标移动与防锁屏始终可用。`n" +
+                "- 文档：README 同步说明“防止系统锁屏”现已为独立后台保活。`n" +
+                "- 版本：升 2.0.2（小版本迭代）。`n`n" +
                 "由 scripts/publish_package.ps1 自动构建并发布，包含 AutoClicker.exe + 文档。"
     $remoteUrl = (& git -C $gitDir remote get-url origin).Trim()
     $repoOk = $remoteUrl -match 'github\.com[:/]([^/]+)/(.+?)(?:\.git)?$'
