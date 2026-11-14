@@ -74,6 +74,7 @@
 - 产物：`release/dist/AutoClicker.exe`
 - 构建结果：**成功**（exit code 0）
 - 产物大小：22,391,229 字节（约 21.35 MB）
+- 启动冒烟：在隔离 `USERPROFILE` 下启动 exe，进程正常驻留 18 秒后由测试脚本结束（无启动崩溃）
 - 构建日志：`docs/sonar-reports/build-run.log`
 
 ## 六、扫描配置说明
