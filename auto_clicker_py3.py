@@ -415,6 +415,8 @@ class AutoClicker:
         self.click_button = 'left'
         self.hold_ms = 10
         self.interval_unit = 's'
+        self._interval_change_event = threading.Event()
+        self._interval_hot_after_id = None
         self.jitter_pct = 0
         self.use_multi_points = False
         self.multi_points = []
@@ -1565,6 +1567,7 @@ class AutoClicker:
         
         # 添加trace，当间隔改变时自动保存配置
         self.interval_var.trace_add('write', lambda *args: self.save_config_if_running())
+        self.interval_var.trace_add('write', self._on_interval_hot_update)
         
         ttk.Label(interval_input_frame, text="秒 (1-3600)", 
                  font=('微软雅黑', 9), foreground='gray').pack(side=tk.LEFT)
@@ -1753,6 +1756,7 @@ class AutoClicker:
         row2.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(row2, text="间隔单位", font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
         self.interval_unit_var = tk.StringVar(value=self.config.get('interval_unit', 's'))
+        self.interval_unit_var.trace_add('write', self._on_interval_hot_update)
         ttk.Combobox(row2, textvariable=self.interval_unit_var, width=8,
                      values=['s', 'ms'], state='readonly').pack(side=tk.LEFT, padx=(5, 15))
         ttk.Label(row2, text="随机抖动(%)", font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
@@ -2261,20 +2265,61 @@ class AutoClicker:
             return val / 1000.0
         return val
 
-    def _wait_interval(self, base_seconds):
-        """按 jitter 随机化后分段等待，期间可响应停止与 failsafe（CX-07）"""
+    def _on_interval_hot_update(self, *args):
+        """FR-A03：运行中修改间隔后防抖 120ms 生效，避免逐字符改缓存。"""
+        if not getattr(self, 'is_running', False):
+            return
+        try:
+            if self._interval_hot_after_id is not None:
+                self.root.after_cancel(self._interval_hot_after_id)
+            self._interval_hot_after_id = self.root.after(120, self._apply_interval_hot_update)
+        except Exception:
+            pass
+
+    def _apply_interval_hot_update(self):
+        self._interval_hot_after_id = None
+        if not getattr(self, 'is_running', False):
+            return
+        try:
+            value = int(self.interval_var.get().strip())
+            unit = self.interval_unit_var.get()
+            if value < 0 or unit not in ('s', 'ms'):
+                return
+            self.interval_unit = unit
+            self.interval_seconds_cache = value / 1000.0 if unit == 'ms' else float(value)
+            self.config['interval_seconds'] = value
+            self.config['interval_unit'] = unit
+            self._interval_change_event.set()
+            self.log_message("运行参数热更新：间隔=" + str(value) + ("毫秒" if unit == 'ms' else "秒"))
+        except (ValueError, tk.TclError):
+            pass
+
+    def _jittered_wait(self, base_seconds):
+        """返回叠加 jitter 后的等待秒数。"""
         if base_seconds <= 0:
-            return self.is_running
+            return 0.0
         jp = self.jitter_pct
         if jp and jp > 0:
             factor = 1.0 + _RANDOM.uniform(-jp / 100.0, jp / 100.0)
-            wait = max(0.0, base_seconds * factor)
-        else:
-            wait = base_seconds
+            return max(0.0, base_seconds * factor)
+        return base_seconds
+
+    def _wait_interval(self, base_seconds):
+        """按 jitter 随机化后分段等待，期间可响应停止、failsafe 与参数热更新"""
+        wait = self._jittered_wait(base_seconds)
+        if wait <= 0:
+            return self.is_running
         show_countdown = base_seconds >= 1.0 and self.interval_unit == 's'
         step = 0.05
         remaining = wait
         while remaining > 0 and self.is_running:
+            if self._interval_change_event.is_set():
+                self._interval_change_event.clear()
+                base_seconds = self._effective_interval_seconds()
+                wait = self._jittered_wait(base_seconds)
+                show_countdown = base_seconds >= 1.0 and self.interval_unit == 's'
+                remaining = wait
+                continue
             if show_countdown:
                 self._set_next(f"{max(0, int(remaining))}秒")
             chunk = min(step, remaining)
@@ -2503,6 +2548,7 @@ class AutoClicker:
             self.is_running = True
             self.click_count = 0
             self.countdown_cancelled = False
+            self._interval_change_event.clear()
             self.startup_countdown = countdown
             self.click_limit = click_limit
             self.duration_limit = duration_limit
@@ -2558,7 +2604,8 @@ class AutoClicker:
             # 更新按钮状态（倒计时期间停止按钮即作为取消键）
             self.start_btn.config(state=tk.DISABLED)
             self.stop_btn.config(state=tk.NORMAL)
-            self.interval_entry.config(state=tk.DISABLED)
+            # FR-A03：运行中允许修改间隔，由 trace 热更新到点击线程缓存
+            self.interval_entry.config(state=tk.NORMAL)
 
             self.log_message("自动点击已启动")
 
