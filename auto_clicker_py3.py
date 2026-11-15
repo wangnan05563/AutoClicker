@@ -380,11 +380,19 @@ class AutoClicker:
     def __init__(self, root):
         self.root = root
         self.root.title(WINDOW_TITLE)
-        
-        # 窗口尺寸（修正 geometry 与 minsize 矛盾：F-10 / CX-05）
-        self.root.geometry("720x800")
-        self.root.minsize(700, 760)
         self._init_dpi_awareness()
+
+        # 窗口尺寸按 DPI 缩放（F-10 / CX-05）：720x800 是 96dpi 基准；
+        # 高 DPI 下若仍用固定物理像素，字体会把按钮挤成 1px（T05247 实测 200% 裁切）。
+        dpi_ratio = max(1.0, min(getattr(self, '_dpi_scale', 1.3333) / 1.3333, 2.0))
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        win_w = min(int(720 * dpi_ratio), int(screen_w * 0.9))
+        win_h = min(int(800 * dpi_ratio), int(screen_h * 0.9))
+        self.root.geometry("%dx%d" % (win_w, win_h))
+        self._min_w = min(int(700 * dpi_ratio), win_w)
+        self._min_h = min(int(760 * dpi_ratio), win_h)
+        self.root.minsize(self._min_w, self._min_h)
         
         self.is_running = False
         self.click_thread = None
@@ -758,16 +766,129 @@ class AutoClicker:
                 btn.configure(bg=pal[key], activebackground=self._shade(pal[key]),
                               fg='white', activeforeground='white')
 
+    def _apply_ttk_theme_styles(self, pal):
+        """TH-01/TH-02：把语义调色板落到 ttk 全局样式，深色主题不能只改变量。
+
+        纯 ttk（无 ttkbootstrap）时，vista 主题忽略多数颜色选项；深色模式改用
+        内置 clam 主题承载颜色，浅色模式回到 vista（非 Windows 用 clam）。
+        """
+        try:
+            style = ttk.Style(self.root)
+            dark = pal.get('bg') == self.THEMES['dark']['bg']
+            available = set(style.theme_names())
+            if dark:
+                if 'clam' in available:
+                    style.theme_use('clam')
+            elif IS_WINDOWS and 'vista' in available:
+                style.theme_use('vista')
+            elif 'clam' in available:
+                style.theme_use('clam')
+
+            common = {
+                'TFrame': {'background': pal['bg']},
+                'TLabelframe': {'background': pal['bg'], 'foreground': pal['fg'],
+                                'bordercolor': pal['border']},
+                'TLabelframe.Label': {'background': pal['bg'], 'foreground': pal['fg']},
+                'TLabel': {'background': pal['bg'], 'foreground': pal['fg']},
+                'TButton': {'background': pal['surface'], 'foreground': pal['fg'],
+                            'bordercolor': pal['border']},
+                'TEntry': {'fieldbackground': pal['surface'], 'foreground': pal['fg'],
+                           'insertcolor': pal['fg'], 'bordercolor': pal['border']},
+                'TCombobox': {'fieldbackground': pal['surface'], 'foreground': pal['fg'],
+                              'background': pal['surface'], 'arrowcolor': pal['fg'],
+                              'bordercolor': pal['border'],
+                              'selectbackground': pal['primary'], 'selectforeground': 'white'},
+                'TCheckbutton': {'background': pal['bg'], 'foreground': pal['fg'],
+                                 'indicatorbackground': pal['surface'],
+                                 'indicatorforeground': pal['fg'],
+                                 'bordercolor': pal['border']},
+                'TRadiobutton': {'background': pal['bg'], 'foreground': pal['fg'],
+                                 'indicatorbackground': pal['surface'],
+                                 'bordercolor': pal['border']},
+                'TScale': {'background': pal['bg'], 'troughcolor': pal['surface'],
+                           'bordercolor': pal['border']},
+                'TProgressbar': {'background': pal['primary'], 'troughcolor': pal['surface'],
+                                 'bordercolor': pal['border']},
+                'TScrollbar': {'background': pal['surface'], 'troughcolor': pal['bg'],
+                               'arrowcolor': pal['fg'], 'bordercolor': pal['border'],
+                               'darkcolor': pal['surface'], 'lightcolor': pal['bg']},
+                'Vertical.TScrollbar': {'background': pal['surface'], 'troughcolor': pal['bg'],
+                                        'arrowcolor': pal['fg'], 'bordercolor': pal['border'],
+                                        'darkcolor': pal['surface'], 'lightcolor': pal['bg']},
+                'Horizontal.TScrollbar': {'background': pal['surface'], 'troughcolor': pal['bg'],
+                                          'arrowcolor': pal['fg'], 'bordercolor': pal['border'],
+                                          'darkcolor': pal['surface'], 'lightcolor': pal['bg']},
+                'Treeview': {'background': pal['surface'], 'fieldbackground': pal['surface'],
+                             'foreground': pal['fg'], 'bordercolor': pal['border']},
+                'Treeview.Heading': {'background': pal['bg'], 'foreground': pal['fg']},
+            }
+            for name, opts in common.items():
+                try:
+                    style.configure(name, **opts)
+                except Exception:
+                    pass
+            for name, opts in (
+                ('TCombobox', {'fieldbackground': [('readonly', pal['surface'])],
+                               'foreground': [('readonly', pal['fg'])],
+                               'background': [('readonly', pal['surface'])],
+                               'arrowcolor': [('readonly', pal['fg'])]}),
+                ('TEntry', {'fieldbackground': [('disabled', pal['surface'])]}),
+                ('TCheckbutton', {'background': [('active', pal['bg'])],
+                                  'foreground': [('active', pal['fg'])]}),
+                ('TButton', {'background': [('active', pal['bg'])],
+                             'foreground': [('active', pal['fg'])]}),
+            ):
+                try:
+                    style.map(name, **opts)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _recolor_semantic_labels(self, pal):
+        """TH-02：主题切换后同步语义色标签/画布，避免残留上一主题的硬编码色。"""
+        try:
+            status_key = 'success' if getattr(self, 'is_running', False) else 'danger'
+            pairs = (
+                ('status_text_label', status_key),
+                ('sb_status_label', status_key),
+                ('sb_success_label', 'success'),
+                ('sb_fail_label', 'danger'),
+                ('sb_runtime_label', 'primary'),
+                ('sb_countdown_label', 'muted'),
+                ('area_label', 'primary'),
+                ('next_click_label', 'primary'),
+                ('click_count_label', 'success'),
+                ('mouse_speed_label', 'primary'),
+            )
+            for attr, key in pairs:
+                widget = getattr(self, attr, None)
+                if widget is not None:
+                    try:
+                        widget.configure(foreground=pal[key])
+                    except Exception:
+                        pass
+            canvas = getattr(self, 'main_canvas', None)
+            if canvas is not None:
+                canvas.configure(bg=pal['bg'], highlightbackground=pal['bg'])
+            indicator = getattr(self, 'status_indicator', None)
+            if indicator is not None:
+                indicator.configure(bg=pal['bg'])
+        except Exception:
+            pass
+
     def _apply_theme(self):
-        """运行时应用主题：切换 ttkbootstrap 主题 + 重着色语义化控件（TH-01/TH-02）"""
+        """运行时应用主题：切换 ttk 主题 + 重着色语义化控件（TH-01/TH-02）"""
         try:
             pal = self._resolve_palette()
             self._current_palette = pal
             self._apply_ttkbootstrap_theme()
+            self._apply_ttk_theme_styles(pal)
             # theme_use 会重置 ttk 样式字体，切换后需按统一基准重新覆盖
             self._apply_ttk_fonts()
-            # 语义化重着色已知 tk 控件（TH-02）
+            # 语义化重着色已知 tk/ttk 控件（TH-02）
             self._recolor_action_buttons(pal)
+            self._recolor_semantic_labels(pal)
             if getattr(self, 'log_text', None):
                 try:
                     self.log_text.configure(bg=pal['surface'], fg=pal['fg'])
@@ -788,6 +909,8 @@ class AutoClicker:
             self.theme_mode = mode
             self.config['theme_mode'] = mode
             self.save_config()
+            if getattr(self, 'theme_var', None) is not None:
+                self.theme_var.set({'light': '浅色', 'dark': '深色', 'system': '跟随系统'}.get(mode, '浅色'))
             self._apply_theme()
             # 跟随系统模式：启动轮询，随系统深浅色变化
             if mode == 'system':
@@ -1236,8 +1359,8 @@ class AutoClicker:
                 
     def setup_ui(self):
         """设置现代化UI界面 - 采用卡片式布局和响应式设计"""
-        # 设置窗口最小尺寸（与 __init__ 保持一致，避免矛盾：CX-05）
-        self.root.minsize(700, 760)
+        # 设置窗口最小尺寸（与 __init__ 的 DPI 缩放值保持一致：CX-05）
+        self.root.minsize(getattr(self, '_min_w', 700), getattr(self, '_min_h', 760))
         
         # 创建主容器 - 使用Canvas支持滚动
         main_container = ttk.Frame(self.root)
@@ -1245,6 +1368,7 @@ class AutoClicker:
         
         # 创建Canvas和滚动条
         canvas = tk.Canvas(main_container, highlightthickness=0)
+        self.main_canvas = canvas
         scrollbar = ttk.Scrollbar(main_container, orient="vertical", command=canvas.yview)
         
         # 创建可滚动框架
@@ -1665,13 +1789,13 @@ class AutoClicker:
         prof_row.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(prof_row, text="配置方案", font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
         self.profile_var = tk.StringVar()
-        self.profile_combo = ttk.Combobox(prof_row, textvariable=self.profile_var, width=14, state='readonly')
+        self.profile_combo = ttk.Combobox(prof_row, textvariable=self.profile_var, width=11, state='readonly')
         self.profile_combo.pack(side=tk.LEFT, padx=(5, 5))
         self._refresh_profile_combo()
-        ttk.Button(prof_row, text="保存当前", command=self.profile_save).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(prof_row, text="切换", command=self.profile_switch).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(prof_row, text="删除", command=self.profile_delete).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(prof_row, text="导出", command=self.profile_export).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(prof_row, text="保存当前", command=self.profile_save).pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Button(prof_row, text="切换", command=self.profile_switch).pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Button(prof_row, text="删除", command=self.profile_delete).pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Button(prof_row, text="导出", command=self.profile_export).pack(side=tk.LEFT, padx=(0, 2))
         ttk.Button(prof_row, text="导入", command=self.profile_import).pack(side=tk.LEFT)
 
         sys_row = ttk.Frame(p1b_card)
