@@ -2428,7 +2428,13 @@ class AutoClicker:
             pass
 
         if self.click_thread:
-            self.click_thread.join(timeout=2)
+            try:
+                # 自动停止（点击上限/failsafe）会在点击线程内回调本方法，
+                # 此时 join 自身会抛 RuntimeError 并中断后续状态复位（CX-02）。
+                if threading.current_thread() is not self.click_thread:
+                    self.click_thread.join(timeout=2)
+            except RuntimeError:
+                pass
 
         self.allow_system_sleep()
 
