@@ -1954,9 +1954,9 @@ class AutoClicker:
             print(f"恢复系统休眠设置失败: {e}")
 
     # ==================== 线程安全的 UI 更新辅助方法 ====================
-    def _ui(self, fn, *args):
+    def _ui(self, fn, *args, **kwargs):
         try:
-            self.root.after(0, lambda: fn(*args))
+            self.root.after(0, lambda: fn(*args, **kwargs))
         except Exception:
             pass
 
@@ -1966,6 +1966,12 @@ class AutoClicker:
             self.status_label.config(text=text, foreground=color)
             if getattr(self, 'sb_status_label', None) is not None:
                 self.sb_status_label.config(text="● " + text, foreground=color)
+            # REQ-005：窗口标题随运行状态联动（停止时恢复基础标题）
+            base_title = WINDOW_TITLE
+            if text and text != "已停止":
+                self.root.title(base_title + " - " + text)
+            else:
+                self.root.title(base_title)
         except Exception:
             pass
 
@@ -2178,6 +2184,9 @@ class AutoClicker:
         if value < 1:
             messagebox.showerror("错误", "点击间隔必须 >= 1")
             return None
+        if value > 3600:
+            messagebox.showerror("错误", "点击间隔必须 <= 3600")
+            return None
         return value
 
     def _read_countdown(self):
@@ -2331,9 +2340,8 @@ class AutoClicker:
             self.click_thread = threading.Thread(target=self.run_clicking, daemon=True)
             self.click_thread.start()
 
-            # 更新状态指示器
-            self.status_indicator.itemconfig(self.status_circle, fill='green')
-            self.status_label.config(text="运行中", foreground='green')
+            # 更新状态指示器（含底部状态条与窗口标题联动）
+            self._do_set_status("运行中", 'green')
 
             # 更新按钮状态（倒计时期间停止按钮即作为取消键）
             self.start_btn.config(state=tk.DISABLED)
@@ -2402,9 +2410,8 @@ class AutoClicker:
 
         self.allow_system_sleep()
 
-        # 更新状态指示器
-        self.status_indicator.itemconfig(self.status_circle, fill='red')
-        self.status_label.config(text="已停止", foreground=self._color('danger'))
+        # 更新状态指示器（含底部状态条与窗口标题联动）
+        self._do_set_status("已停止", self._color('danger'))
         self.next_click_label.config(text="--")
 
         # P2 状态条复位（UI-03）
