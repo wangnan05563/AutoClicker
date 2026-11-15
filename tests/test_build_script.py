@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """构建脚本配置驱动逻辑的单元测试。"""
+import json
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -76,6 +79,31 @@ class CommandTests(unittest.TestCase):
         hidden = build_exe._collect_hidden_imports(pyi)
         self.assertIn('pyautogui', hidden)
         self.assertNotIn('not_a_real_module_xyz', hidden)
+
+
+class BuildVersionTests(unittest.TestCase):
+    """打包入口必须先分配唯一版本号并写回根 package.json。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='ac-buildver-')
+        self._old_root = build_exe.ROOT_DIR
+        build_exe.ROOT_DIR = self.tmp
+
+    def tearDown(self):
+        build_exe.ROOT_DIR = self._old_root
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_apply_build_version_creates_package_json(self):
+        version = build_exe.apply_build_version()
+        self.assertRegex(version or '', r'^\d{8}-\d{3}$')
+        with open(os.path.join(self.tmp, 'package.json'), encoding='utf-8') as f:
+            pkg = json.load(f)
+        self.assertEqual(pkg['version'], version)
+
+    def test_apply_build_version_fails_on_invalid_package_json(self):
+        with open(os.path.join(self.tmp, 'package.json'), 'w', encoding='utf-8') as f:
+            f.write('{ broken json ')
+        self.assertIsNone(build_exe.apply_build_version())
 
 
 if __name__ == '__main__':

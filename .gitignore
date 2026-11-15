@@ -16,6 +16,9 @@ __pycache__/
 venv/
 env/
 
+# 构建版本号状态（每次构建递增，机器本地状态，不入库）
+/scripts/.build-version-state.json
+
 # 构建产物（release 下保留 dist 供分发，其余全部忽略）
 release/
 

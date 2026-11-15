@@ -13,6 +13,8 @@ import importlib.util
 import subprocess
 import shutil
 
+import patch_version
+
 # 脚本位于 scripts/ 下，项目根目录为其父目录，所有相对路径都以此为基准
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -138,6 +140,20 @@ def _build_command(pyi, build, project, icon_path, hidden):
     return cmd
 
 
+def apply_build_version():
+    """每次构建分配唯一版本号（YYYYMMDD-序号）并写回根 package.json。
+
+    失败即中止构建：宁可不出包，也不产出无法追溯的构建产物。
+    """
+    try:
+        info = patch_version.allocate_version(ROOT_DIR)
+    except Exception as exc:
+        print(f"[ERROR] 生成构建版本号失败: {exc}")
+        return None
+    print(f"[PATCH] 构建版本号: {info['version']}（{'新建' if info['created'] else '已写入'} package.json）")
+    return info['version']
+
+
 def build_exe():
     cfg = load_build_config()
     project = cfg['project']
@@ -151,6 +167,10 @@ def build_exe():
     print("=" * 60)
     print(f"开始打包 {project['name']}...")
     print("=" * 60)
+
+    # 打包前先分配本次构建的唯一版本号（写回根 package.json）
+    if apply_build_version() is None:
+        return False
 
     clean_build(cfg)
 

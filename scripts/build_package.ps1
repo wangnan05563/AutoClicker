@@ -1,7 +1,7 @@
 ﻿# -*- coding: utf-8 -*-
 # 项目构建与打包脚本（Windows，完全配置驱动）
 # 由 构建打包.bat 委派执行。所有中文输出在此（UTF-8 BOM）。
-# 逻辑：解析 Python -> 释放文件锁 -> 确保 PyInstaller -> 调用构建脚本 -> 校验产物 -> 启动冒烟测试。
+# 逻辑：解析 Python -> 释放文件锁 -> 确保 PyInstaller -> 调用构建脚本（先分配唯一构建版本号）-> 校验产物 -> 启动冒烟测试。
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $ErrorActionPreference = 'Stop'

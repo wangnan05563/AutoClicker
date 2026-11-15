@@ -47,6 +47,8 @@ python auto_clicker_py3.py
 python scripts/build_exe.py
 ```
 
+每次打包前会先生成当天唯一的构建版本号（`YYYYMMDD-序号`，如 `20261115-001`）并写回根 `package.json` 的 `version` 字段；双击 `scripts/构建打包.bat` 与直接运行 `build_exe.py` 走同一套逻辑，保证每次构建的版本号不重复。
+
 产物输出至 `release/dist/AutoClicker.exe`（单文件，无需其他依赖）。
 
 ## 使用说明
