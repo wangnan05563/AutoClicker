@@ -11,6 +11,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 import subprocess
 import threading
+import queue
 import time
 import secrets
 import json
@@ -425,6 +426,10 @@ class AutoClicker:
         self._log_buffer = []  # [(text, level)] 全量日志缓冲（UI-04 过滤用）
         self._log_filter = ''
         self._log_collapsed = False
+        # Tk 只能在主线程访问：后台线程通过该队列把 UI 回调交回主线程执行。
+        # 原实现 _ui() 直接 root.after(...)，主线程 join 点击线程时会互相等待，
+        # 导致急停后点击线程卡死（T05212/T05215/T05229 实测）。
+        self._ui_queue = queue.Queue()
         # REQ-004 运行统计：最近一次会话快照（供导出）
         self.last_run_stats = {
             'timestamp': '', 'click_count': 0, 'success_count': 0,
@@ -437,6 +442,7 @@ class AutoClicker:
         self._init_theme()
         self._init_ui_fonts()
         self.setup_ui()
+        self.root.after(30, self._poll_ui_queue)
         # 补记 DPI 诊断（此时日志/UI 设施已就绪）
         self.log_message("DPI 适配：系统缩放 %.2f，UI 字体基准 %dpt（不做二次放大）" % (
             getattr(self, '_dpi_scale', 1.0), getattr(self, 'ui_font_size', 9)))
@@ -448,7 +454,10 @@ class AutoClicker:
             except Exception:
                 pass
             self.log_message("Wayland 降级：启动已禁用（会话=%s）" % self.input_session)
+        # 热键回调运行在 keyboard 监听线程，不能直接碰 Tk；用队列交给主线程执行
+        self._hotkey_queue = queue.Queue()
         self.setup_hotkeys()
+        self.root.after(50, self._poll_hotkey_queue)
         self.setup_tray_icon()
         if self.theme_mode == 'system':
             self._poll_system_theme()
@@ -1878,9 +1887,16 @@ class AutoClicker:
         self._register_hotkeys()
 
     def _register_hotkeys(self):
-        """CX-08：按配置注册热键，支持自定义与冲突规避（Esc 始终为紧急停止）"""
+        """CX-08：按配置注册热键，支持自定义与冲突规避（Esc 始终为紧急停止）
+
+        keyboard 的全局钩子回调在独立监听线程执行；Tk 控件（interval_var 等）
+        只能在主线程访问，否则会抛「main thread is not in main loop」，
+        表现为物理 F6/F8/Esc 按了没反应。这里统一投递到主线程队列。
+        """
         if not keyboard:
             return
+        if not hasattr(self, '_hotkey_queue'):
+            self._hotkey_queue = queue.Queue()
         # 清除旧热键，避免重复注册
         for k in getattr(self, '_hk_keys', []):
             try:
@@ -1891,13 +1907,31 @@ class AutoClicker:
         try:
             start_k = self.config.get('hotkey_start', 'f6')
             emer_k = self.config.get('hotkey_emergency', 'f8')
-            keyboard.add_hotkey(start_k, self.toggle_clicking)
-            keyboard.add_hotkey(emer_k, self.emergency_stop, suppress=False)
-            keyboard.add_hotkey('esc', self.emergency_stop, suppress=False)
+            keyboard.add_hotkey(start_k, lambda: self._hotkey_queue.put('toggle'))
+            keyboard.add_hotkey(emer_k, lambda: self._hotkey_queue.put('emergency'))
+            keyboard.add_hotkey('esc', lambda: self._hotkey_queue.put('emergency'))
             self._hk_keys = [start_k, emer_k, 'esc']
             print("快捷键已注册：启动=" + start_k + "，紧急停止=" + emer_k + "，Esc")
         except Exception as e:
             print("注册快捷键失败: " + str(e))
+
+    def _poll_hotkey_queue(self):
+        """主线程消费热键队列，确保 Tk 只在主线程被访问（CX-08 修复）。"""
+        try:
+            while True:
+                action = self._hotkey_queue.get_nowait()
+                if action == 'toggle':
+                    self.toggle_clicking()
+                elif action == 'emergency':
+                    self.emergency_stop()
+        except queue.Empty:
+            pass
+        except Exception as e:
+            print("处理热键动作失败: " + str(e))
+        try:
+            self.root.after(50, self._poll_hotkey_queue)
+        except Exception:
+            pass
                     
     def set_click_area(self):
         try:
@@ -1936,7 +1970,7 @@ class AutoClicker:
             self.root.deiconify()
             
     def get_click_position(self):
-        mode = self.mode_var.get()
+        mode = getattr(self, 'click_mode_cache', None) or self.mode_var.get()
         area = self.config['click_area']
         if mode == 'center':
             x = area['x'] + area['width'] // 2
@@ -2103,8 +2137,29 @@ class AutoClicker:
 
     # ==================== 线程安全的 UI 更新辅助方法 ====================
     def _ui(self, fn, *args, **kwargs):
+        """后台线程安全地请求主线程执行 UI 回调（T05212/T05215/T05229）。"""
         try:
-            self.root.after(0, lambda: fn(*args, **kwargs))
+            if not hasattr(self, '_ui_queue'):
+                self._ui_queue = queue.Queue()
+            self._ui_queue.put((fn, args, kwargs))
+        except Exception:
+            pass
+
+    def _poll_ui_queue(self):
+        """主线程消费 UI 回调队列，避免后台线程直接调用 Tk 造成死锁。"""
+        try:
+            while True:
+                fn, args, kwargs = self._ui_queue.get_nowait()
+                try:
+                    fn(*args, **kwargs)
+                except Exception:
+                    pass
+        except queue.Empty:
+            pass
+        except Exception:
+            pass
+        try:
+            self.root.after(30, self._poll_ui_queue)
         except Exception:
             pass
 
@@ -2187,17 +2242,19 @@ class AutoClicker:
         self._ui(self.countdown_bar.config, value=100)
         self._set_status("运行中", 'green')
         self._set_next("--")
-        self._start_runtime_tick()
+        self._ui(self._start_runtime_tick)
         self.click_loop()
-        self._stop_runtime_tick()
+        self._ui(self._stop_runtime_tick)
         self._ui(self.countdown_bar.config, value=0)
 
     def _effective_interval_seconds(self):
-        """按间隔单位换算为秒（CX-07）：秒模式直接取，毫秒模式除以 1000"""
-        try:
-            val = float(self.interval_var.get())
-        except ValueError:
-            val = 1.0
+        """按间隔单位换算为秒（CX-07）：优先用启动时缓存，避免后台线程读 Tk 变量"""
+        val = getattr(self, 'interval_seconds_cache', None)
+        if val is None:
+            try:
+                val = float(self.interval_var.get())
+            except ValueError:
+                val = 1.0
         if val < 0:
             val = 0.0
         if self.interval_unit == 'ms':
@@ -2246,10 +2303,10 @@ class AutoClicker:
 
     def _move_before_click(self, x, y):
         """鼠标跟随开启时平滑移动到目标点。"""
-        if not self.mouse_follow_var.get():
+        if not getattr(self, 'mouse_follow_cache', True):
             return
         try:
-            speed = float(self.mouse_speed_var.get())
+            speed = getattr(self, 'mouse_speed_cache', 0.1)
             duration = max(0.1, 1.0 - speed)
             self.smooth_move_to(x, y, duration=duration)
             time.sleep(0.1)
@@ -2258,7 +2315,7 @@ class AutoClicker:
 
     def _click_once_at(self, x, y):
         """执行一次点击（或仅移动），并刷新计数显示。"""
-        if self.mouse_move_only_var.get():
+        if getattr(self, 'mouse_move_only_cache', False):
             self.log_message(f"仅移动到位置 ({x}, {y})，未执行点击")
             return
         # FN-01/FN-02：支持按键类型与按住时长
@@ -2270,7 +2327,7 @@ class AutoClicker:
             self.log_message(f"使用pyautogui在位置 ({x}, {y}) 执行点击")
         self.click_count += 1
         self.success_count = self.click_count
-        self.click_count_label.config(text=str(self.click_count))
+        self._ui(self.click_count_label.config, text=str(self.click_count))
         self._ui(self._set_sb_counts)
 
     def _limit_reached(self):
@@ -2292,7 +2349,7 @@ class AutoClicker:
         while self.is_running:
             try:
                 base = self._effective_interval_seconds()
-                if self.prevent_sleep_var.get():
+                if getattr(self, 'prevent_sleep_cache', False):
                     self.prevent_system_sleep()
 
                 # 安全：鼠标位移 failsafe 基线（CX-01）
@@ -2457,6 +2514,13 @@ class AutoClicker:
             self.click_button = self.click_button_var.get()
             self.hold_ms = hold_ms
             self.use_multi_points = self.use_multi_points_var.get()
+            # 后台点击线程只读以下缓存，禁止在非主线程调用 Tk Var.get()
+            self.interval_seconds_cache = interval
+            self.prevent_sleep_cache = self.prevent_sleep_var.get()
+            self.mouse_follow_cache = self.mouse_follow_var.get()
+            self.mouse_speed_cache = float(self.mouse_speed_var.get())
+            self.mouse_move_only_cache = self.mouse_move_only_var.get()
+            self.click_mode_cache = self.mode_var.get()
             self.config['autostart'] = self.autostart_var.get()
             self.multi_points = self.config.get('multi_points', [])
 
@@ -2568,6 +2632,18 @@ class AutoClicker:
 
         self.allow_system_sleep()
 
+        if threading.current_thread() is threading.main_thread():
+            self._apply_stopped_ui()
+        else:
+            self._ui(self._apply_stopped_ui)
+
+        if reason:
+            self.log_message("自动点击已停止（原因：" + str(reason) + "）")
+        else:
+            self.log_message("自动点击已停止")
+
+    def _apply_stopped_ui(self):
+        """停止后的主线程 UI 复位（后台线程自动停止时经 _ui 队列调用）。"""
         # 更新状态指示器（含底部状态条与窗口标题联动）
         self._do_set_status("已停止", self._color('danger'))
         self.next_click_label.config(text="--")
@@ -2590,11 +2666,6 @@ class AutoClicker:
 
         # CX-12：托盘状态区分（已停止）
         self._update_tray_status(False)
-
-        if reason:
-            self.log_message("自动点击已停止（原因：" + str(reason) + "）")
-        else:
-            self.log_message("自动点击已停止")
 
     def emergency_stop(self):
         """P0 独立急停（CX-01）：仅作为停止入口，统一走 stop_clicking(reason)"""
@@ -2711,6 +2782,20 @@ class AutoClicker:
         except Exception:
             pass
 
+    def _append_log_ui(self, log_entry, level):
+        """主线程写入日志控件；后台线程统一通过 _ui() 投递到主线程。"""
+        try:
+            if self._log_filter:
+                self._render_log()
+            else:
+                self.log_text.config(state=tk.NORMAL)
+                tag = self._log_tag(level)
+                self.log_text.insert(tk.END, log_entry, tag)
+                self.log_text.see(tk.END)
+                self.log_text.config(state=tk.DISABLED)
+        except Exception:
+            pass
+
     def log_message(self, message):
         try:
             timestamp = datetime.now().strftime("%H:%M:%S")
@@ -2728,17 +2813,10 @@ class AutoClicker:
             self._log_buffer.append((log_entry, level))
             if len(self._log_buffer) > 2000:
                 self._log_buffer = self._log_buffer[-2000:]
-            if self._log_filter:
-                self._render_log()
+            if threading.current_thread() is threading.main_thread():
+                self._append_log_ui(log_entry, level)
             else:
-                try:
-                    self.log_text.config(state=tk.NORMAL)
-                    tag = self._log_tag(level)
-                    self.log_text.insert(tk.END, log_entry, tag)
-                    self.log_text.see(tk.END)
-                    self.log_text.config(state=tk.DISABLED)
-                except Exception:
-                    pass
+                self._ui(self._append_log_ui, log_entry, level)
         except Exception as e:
             print(f"日志写入失败: {e}")
     
