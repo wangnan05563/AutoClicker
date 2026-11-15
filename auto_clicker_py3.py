@@ -889,6 +889,8 @@ class AutoClicker:
             # 语义化重着色已知 tk/ttk 控件（TH-02）
             self._recolor_action_buttons(pal)
             self._recolor_semantic_labels(pal)
+            # 托盘图标跟随浅/深主题刷新（T05257）
+            self._refresh_tray_icon()
             if getattr(self, 'log_text', None):
                 try:
                     self.log_text.configure(bg=pal['surface'], fg=pal['fg'])
@@ -2514,13 +2516,16 @@ class AutoClicker:
                     tip = "AutoClicker - 运行中" if running else "AutoClicker - 已停止"
                     new_nid = self.tray_nid[:5] + (tip,)
                     win32gui.Shell_NotifyIcon(win32gui.NIM_MODIFY, new_nid)
+                    self.tray_nid = new_nid
                 except Exception:
                     pass
             # 托盘右键菜单顶部插入动态“停止/启动”项，区分当前状态
             menu = getattr(self, 'tray_menu', None)
             if menu is not None:
                 try:
-                    menu.delete(0)
+                    # 先删掉上一次的动态项及其分隔符，避免每次启停多一条分隔线
+                    if getattr(self, '_tray_dynamic_present', False):
+                        menu.delete(0, 1)
                 except Exception:
                     pass
                 if running:
@@ -2528,6 +2533,7 @@ class AutoClicker:
                 else:
                     menu.insert_command(0, label="启动点击", command=self.start_clicking)
                 menu.insert_separator(1)
+                self._tray_dynamic_present = True
         except Exception:
             pass
 
@@ -2740,6 +2746,7 @@ class AutoClicker:
         """设置系统托盘图标和菜单（跨平台）"""
         try:
             # 创建原生托盘菜单（使用tkinter Menu）
+            self._tray_dynamic_present = False
             self.tray_menu = tk.Menu(self.root, tearoff=0,
                                      bg=self._color('surface'), fg=self._color('fg'))
             self.tray_menu.add_command(label="显示窗口", command=self.show_from_tray)
@@ -2748,10 +2755,13 @@ class AutoClicker:
             
             self.tray_enabled = True
             self.tray_icon = None
+            self.tray_icon_created = False
             
             # Windows 系统托盘
             if IS_WINDOWS and HAS_WIN32GUI:
                 self._create_windows_tray_icon()
+                if getattr(self, 'tray_icon_created', False):
+                    self._update_tray_status(False)
             # Linux 系统托盘
             elif IS_LINUX and HAS_PYSTRAY and HAS_PIL:
                 self._create_linux_tray_icon()
@@ -2820,9 +2830,11 @@ class AutoClicker:
         """创建Windows系统托盘图标"""
         try:
             # 创建一个隐藏的消息窗口来接收托盘消息
+            # 类名带进程号：多个 AutoClicker 实例并存时，固定类名会触发
+            # RegisterClass「类已存在」，导致后启动的实例没有托盘图标（T05257）。
             wc = win32gui.WNDCLASS()
             wc.lpfnWndProc = self._tray_window_proc
-            wc.lpszClassName = "AutoClickerTrayMessageWindow"
+            wc.lpszClassName = "AutoClickerTrayMessageWindow_%d" % os.getpid()
             wc.hInstance = win32api.GetModuleHandle(None)
             
             class_atom = win32gui.RegisterClass(wc)
@@ -2835,17 +2847,16 @@ class AutoClicker:
                 0, 0, wc.hInstance, None
             )
             
-            # 加载自定义图标
+            # 加载自定义图标（浅/深两套 16/32px，由 _get_icon_path 按主题选择）
             hicon = None
             icon_path = self._get_icon_path()
             if icon_path and os.path.exists(icon_path):
                 try:
-                    # 尝试加载自定义图标
                     hicon = win32gui.LoadImage(
                         None,
                         icon_path,
                         win32con.IMAGE_ICON,
-                        32, 32,  # 托盘图标推荐尺寸
+                        32, 32,
                         win32con.LR_LOADFROMFILE | win32con.LR_DEFAULTSIZE
                     )
                 except Exception as e:
@@ -2866,22 +2877,23 @@ class AutoClicker:
                    hicon,           # hIcon
                    "自动点击工具")  # szTip
             
-            # 添加托盘图标
-            result = win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, nid)
-            
-            if result:
+            # 添加托盘图标（pywin32 的 Shell_NotifyIcon 成功时返回 None，
+            # 不能按布尔值判断，否则每次都会误报「创建失败」并跳过后续状态同步）
+            try:
+                win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, nid)
                 self.tray_nid = nid
                 self.tray_icon_created = True
                 print("系统托盘图标创建成功")
-            else:
-                print("系统托盘图标创建失败")
+            except Exception as e:
+                print(f"系统托盘图标创建失败: {e}")
+                self.tray_icon_created = False
                 
         except Exception as e:
             print(f"创建Windows托盘图标失败: {e}")
             self.tray_icon_created = False
     
     def _get_icon_path(self):
-        """获取图标文件路径"""
+        """获取图标文件路径：按当前主题选浅色/深色托盘图标。"""
         try:
             # 获取程序所在目录
             if getattr(sys, 'frozen', False):
@@ -2891,19 +2903,36 @@ class AutoClicker:
                 # 开发环境
                 base_path = os.path.dirname(__file__)
             
-            # 查找图标文件
-            icon_path = os.path.join(base_path, 'icons', 'tray.ico')
-            if os.path.exists(icon_path):
-                return icon_path
-            
-            # 备用路径
-            icon_path = os.path.join(base_path, 'icons', 'autoclicker.ico')
-            if os.path.exists(icon_path):
-                return icon_path
+            # 查找当前主题对应的双套图标（16/32px 已打包进 ICO）
+            dark = getattr(self, '_current_palette', {}).get('bg') == self.THEMES['dark']['bg']
+            preferred = 'tray_dark.ico' if dark else 'tray_light.ico'
+            for name in (preferred, 'tray.ico', 'autoclicker.ico'):
+                icon_path = os.path.join(base_path, 'icons', name)
+                if os.path.exists(icon_path):
+                    return icon_path
                 
         except Exception:
             pass
         return None
+
+    def _refresh_tray_icon(self):
+        """主题切换后刷新托盘图标，避免深色任务栏仍显示浅色图标（T05257）。"""
+        if not (IS_WINDOWS and HAS_WIN32GUI and getattr(self, 'tray_icon_created', False)):
+            return
+        try:
+            icon_path = self._get_icon_path()
+            if not icon_path or not os.path.exists(icon_path):
+                return
+            hicon = win32gui.LoadImage(
+                None, icon_path, win32con.IMAGE_ICON, 32, 32,
+                win32con.LR_LOADFROMFILE | win32con.LR_DEFAULTSIZE)
+            if not hicon:
+                return
+            new_nid = self.tray_nid[:4] + (hicon, self.tray_nid[5])
+            win32gui.Shell_NotifyIcon(win32gui.NIM_MODIFY, new_nid)
+            self.tray_nid = new_nid
+        except Exception as e:
+            print(f"刷新托盘图标失败: {e}")
     
     def _tray_window_proc(self, hwnd, msg, wparam, lparam):
         """托盘消息窗口处理函数"""
