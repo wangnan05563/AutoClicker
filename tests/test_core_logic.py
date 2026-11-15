@@ -162,6 +162,12 @@ class ValidationTests(unittest.TestCase):
         show_error.assert_called_once()
 
     @mock.patch('auto_clicker_py3.messagebox.showerror')
+    def test_read_interval_too_large(self, show_error):
+        self.obj.interval_var = FakeVar('3601')
+        self.assertIsNone(self.obj._read_interval())
+        show_error.assert_called_once()
+
+    @mock.patch('auto_clicker_py3.messagebox.showerror')
     def test_read_interval_not_integer(self, show_error):
         self.obj.interval_var = FakeVar('x')
         self.assertIsNone(self.obj._read_interval())
@@ -227,6 +233,18 @@ class ConfigTests(unittest.TestCase):
         self.obj.load_config()
         self.assertEqual(self.obj.config['interval_seconds'], 5)
         self.assertEqual(self.obj.config['click_mode'], 'random')
+
+    def test_v1_config_is_backed_up_before_migration(self):
+        content = '{"interval_seconds": 5, "click_mode": "center"}'
+        with open(self.path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        self.obj.load_config()
+        backup = getattr(self.obj, '_migration_backup_path', None)
+        self.assertTrue(backup and os.path.exists(backup))
+        with open(backup, encoding='utf-8') as f:
+            self.assertEqual(f.read(), content)
+        self.assertEqual(self.obj.config['config_version'], 2)
+        self.assertIsInstance(self.obj.config['profiles'], dict)
 
     def test_invalid_json_falls_back_to_defaults(self):
         with open(self.path, 'w', encoding='utf-8') as f:

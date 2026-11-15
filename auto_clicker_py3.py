@@ -482,6 +482,21 @@ class AutoClicker:
             self._file_logger = None
             print("初始化日志失败: " + str(e))
 
+    def _backup_config_before_migration(self):
+        """CX-09：迁移/降级前备份原配置，避免旧配置丢失（PRD FR-G02）。"""
+        try:
+            if not os.path.exists(self.config_file):
+                return None
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup = self.config_file + ".v1-backup-" + stamp
+            shutil.copy2(self.config_file, backup)
+            self._migration_backup_path = backup
+            print("配置迁移前已备份: " + backup)
+            return backup
+        except Exception as e:
+            print("配置迁移备份失败: " + str(e))
+            return None
+
     def load_config(self):
         default_config = {
             'interval_seconds': 10,
@@ -515,13 +530,20 @@ class AutoClicker:
             if os.path.exists(self.config_file):
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     self.config = json.load(f)
-                    for key in default_config:
-                        if key not in self.config:
-                            self.config[key] = default_config[key]
+                try:
+                    raw_version = int(self.config.get('config_version', 0) or 0)
+                except (TypeError, ValueError, AttributeError):
+                    raw_version = 0
+                if raw_version < 2:
+                    self._backup_config_before_migration()
+                for key in default_config:
+                    if key not in self.config:
+                        self.config[key] = default_config[key]
             else:
                 self.config = default_config
         except Exception as e:
             print("加载配置失败: " + str(e))
+            self._backup_config_before_migration()
             self.config = default_config
             
         # 配置迁移（CX-09）：补齐 schema 版本与配置方案容器
