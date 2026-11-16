@@ -669,12 +669,13 @@ class NoticeBar:
         self.color_getter = color_getter
         self.frame = tk.Frame(parent, bg=color_getter('warning'))
         self.label = tk.Label(
-            self.frame, text='', bg=color_getter('warning'), fg='white',
+            self.frame, text='', bg=color_getter('warning'), fg=color_getter('on_warning'),
             font=('微软雅黑', 10, 'bold'), wraplength=520, justify=tk.LEFT, anchor=tk.W)
         self.label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 6), pady=7)
         self.close_btn = tk.Button(
-            self.frame, text='×', command=self.hide, bg=color_getter('warning'), fg='white',
-            activebackground=color_getter('warning'), activeforeground='white',
+            self.frame, text='×', command=self.hide, bg=color_getter('warning'),
+            fg=color_getter('on_warning'),
+            activebackground=color_getter('warning'), activeforeground=color_getter('on_warning'),
             relief=tk.FLAT, bd=0, font=('微软雅黑', 11, 'bold'), cursor='hand2')
         self.close_btn.pack(side=tk.RIGHT, padx=(0, 8))
         self._after_id = None
@@ -682,9 +683,11 @@ class NoticeBar:
 
     def show(self, message, level='operation', timeout=0, before=None):
         color = self.color_getter('danger' if level == 'fatal' else 'warning')
+        on_color = self.color_getter('on_danger' if level == 'fatal' else 'on_warning')
         self.frame.configure(bg=color)
-        self.label.configure(text=message, bg=color)
-        self.close_btn.configure(bg=color, activebackground=color)
+        self.label.configure(text=message, bg=color, fg=on_color)
+        self.close_btn.configure(bg=color, activebackground=color,
+                                 fg=on_color, activeforeground=on_color)
         if not self.frame.winfo_manager():
             pack_kw = {'fill': tk.X, 'pady': (0, 10)}
             if before is not None:
@@ -1116,13 +1119,17 @@ class AutoClicker:
         self.THEMES = {
             'light': {
                 'bg': '#ffffff', 'fg': '#212529', 'muted': '#6c757d',
-                'primary': '#007bff', 'success': '#28a745', 'danger': '#dc3545',
-                'warning': '#fd7e14', 'surface': '#f8f9fa', 'border': '#ced4da',
+                'primary': '#0056b3', 'success': '#1e7e34', 'danger': '#b02a37',
+                'warning': '#8a4b00', 'surface': '#f8f9fa', 'border': '#868e96',
+                'on_primary': '#ffffff', 'on_success': '#ffffff',
+                'on_danger': '#ffffff', 'on_warning': '#ffffff', 'on_muted': '#ffffff',
             },
             'dark': {
                 'bg': '#212529', 'fg': '#e9ecef', 'muted': '#adb5bd',
-                'primary': '#4a90d9', 'success': '#2ecc71', 'danger': '#e74c3c',
-                'warning': '#e67e22', 'surface': '#2b3035', 'border': '#495057',
+                'primary': '#4a90d9', 'success': '#2ecc71', 'danger': '#f16c6c',
+                'warning': '#e67e22', 'surface': '#2b3035', 'border': '#6c757d',
+                'on_primary': '#0b0f14', 'on_success': '#0b0f14',
+                'on_danger': '#0b0f14', 'on_warning': '#0b0f14', 'on_muted': '#0b0f14',
             },
         }
         self.theme_mode = self.config.get('theme_mode', 'light')
@@ -1137,6 +1144,10 @@ class AutoClicker:
 
     def _color(self, key):
         return self._current_palette.get(key, '#000000')
+
+    def _on_color(self, key):
+        """语义色背景上的文字色：浅色主题白字、深色主题深字，保证 ≥4.5:1。"""
+        return self._current_palette.get('on_' + key, '#ffffff')
 
     def _shade(self, hex_color, factor=0.85):
         """按比例调暗十六进制色，用于 activebackground（TH-02）"""
@@ -1191,8 +1202,22 @@ class AutoClicker:
         for attr, key in button_colors:
             btn = getattr(self, attr, None)
             if btn:
+                on_key = pal.get('on_' + key, '#ffffff')
                 btn.configure(bg=pal[key], activebackground=self._shade(pal[key]),
-                              fg='white', activeforeground='white')
+                              fg=on_key, activeforeground=on_key)
+        icon_specs = (
+            ('start_btn', '_icon_play', 'play', 18, 'success'),
+            ('stop_btn', '_icon_stop', 'stop', 18, 'danger'),
+            ('test_btn', '_icon_target', 'target', 16, 'primary'),
+        )
+        for btn_attr, icon_attr, kind, size, key in icon_specs:
+            btn = getattr(self, btn_attr, None)
+            if not btn:
+                continue
+            icon = self.make_icon(kind, size, pal.get('on_' + key, '#ffffff'))
+            if icon:
+                setattr(self, icon_attr, icon)
+                btn.configure(image=icon, compound=tk.LEFT)
 
     def _apply_ttk_theme_styles(self, pal):
         """TH-01/TH-02：把语义调色板落到 ttk 全局样式，深色主题不能只改变量。
@@ -1924,18 +1949,20 @@ class AutoClicker:
             warn_bar.pack(fill=tk.X, pady=(0, 10))
             tk.Label(warn_bar,
                      text="注意：Wayland 会话不支持模拟输入，启动已禁用",
-                     bg=self._color('warning'), fg='white',
+                     bg=self._color('warning'), fg=self._color('on_warning'),
                      font=('微软雅黑', 10, 'bold'), wraplength=500,
                      justify=tk.LEFT, anchor=tk.W).pack(
                          side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 6), pady=7)
             tk.Button(warn_bar, text="详情", command=self.show_input_diag,
-                      relief=tk.FLAT, bd=0, bg=self._color('warning'), fg='white',
+                      relief=tk.FLAT, bd=0, bg=self._color('warning'), fg=self._color('on_warning'),
                       activebackground=self._shade(self._color('warning')),
+                      activeforeground=self._color('on_warning'),
                       font=('微软雅黑', 9, 'underline'), cursor='hand2').pack(
                           side=tk.RIGHT, padx=(0, 6))
             tk.Button(warn_bar, text="×", command=warn_bar.destroy,
-                      relief=tk.FLAT, bd=0, bg=self._color('warning'), fg='white',
+                      relief=tk.FLAT, bd=0, bg=self._color('warning'), fg=self._color('on_warning'),
                       activebackground=self._shade(self._color('warning')),
+                      activeforeground=self._color('on_warning'),
                       font=('微软雅黑', 11, 'bold'), cursor='hand2').pack(
                           side=tk.RIGHT, padx=(0, 4))
             self._input_banner = warn_bar
@@ -1985,11 +2012,12 @@ class AutoClicker:
         self.start_btn = tk.Button(main_control_frame, text=" 启动自动点击",
                                   command=self.start_clicking,
                                   font=('微软雅黑', 12, 'bold'),
-                                  bg=self._color('success'), fg='white',
-                                  activebackground=self._shade(self._color('success')), activeforeground='white',
+                                  bg=self._color('success'), fg=self._color('on_success'),
+                                  activebackground=self._shade(self._color('success')),
+                                  activeforeground=self._color('on_success'),
                                   padx=12, pady=8, cursor='hand2',
                                   relief=tk.FLAT, bd=0)
-        self._icon_play = self.make_icon('play', 18, 'white')
+        self._icon_play = self.make_icon('play', 18, self._on_color('success'))
         if self._icon_play:
             self.start_btn.configure(image=self._icon_play, compound=tk.LEFT)
         self.start_btn.pack(side=tk.LEFT, padx=(0, 10), fill=tk.X, expand=True)
@@ -1997,11 +2025,12 @@ class AutoClicker:
         self.stop_btn = tk.Button(main_control_frame, text=" 停止",
                                  command=self.stop_clicking,
                                  font=('微软雅黑', 12, 'bold'),
-                                 bg=self._color('danger'), fg='white',
-                                 activebackground=self._shade(self._color('danger')), activeforeground='white',
+                                 bg=self._color('danger'), fg=self._color('on_danger'),
+                                 activebackground=self._shade(self._color('danger')),
+                                 activeforeground=self._color('on_danger'),
                                  padx=12, pady=8, cursor='hand2',
                                  relief=tk.FLAT, bd=0, state=tk.DISABLED)
-        self._icon_stop = self.make_icon('stop', 18, 'white')
+        self._icon_stop = self.make_icon('stop', 18, self._on_color('danger'))
         if self._icon_stop:
             self.stop_btn.configure(image=self._icon_stop, compound=tk.LEFT)
         self.stop_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -2010,11 +2039,12 @@ class AutoClicker:
         self.test_btn = tk.Button(control_card, text=" 测试点击位置",
                                  command=self.test_click,
                                  font=('微软雅黑', 10),
-                                 bg=self._color('primary'), fg='white',
-                                 activebackground=self._shade(self._color('primary')), activeforeground='white',
+                                 bg=self._color('primary'), fg=self._color('on_primary'),
+                                 activebackground=self._shade(self._color('primary')),
+                                 activeforeground=self._color('on_primary'),
                                  pady=6, cursor='hand2',
                                  relief=tk.FLAT, bd=0)
-        self._icon_target = self.make_icon('target', 16, 'white')
+        self._icon_target = self.make_icon('target', 16, self._on_color('primary'))
         if self._icon_target:
             self.test_btn.configure(image=self._icon_target, compound=tk.LEFT)
         self.test_btn.pack(fill=tk.X, pady=(5, 0))
@@ -2096,8 +2126,9 @@ class AutoClicker:
         self.set_area_btn = tk.Button(area_input_frame, text="设置区域", 
                                      command=self.set_click_area,
                                      font=('微软雅黑', 9),
-                                     bg=self._color('muted'), fg='white',
+                                     bg=self._color('muted'), fg=self._color('on_muted'),
                                      activebackground=self._shade(self._color('muted')),
+                                     activeforeground=self._color('on_muted'),
                                      cursor='hand2', relief=tk.FLAT, bd=0)
         self.set_area_btn.pack(side=tk.LEFT)
 
