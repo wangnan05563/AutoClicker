@@ -98,6 +98,37 @@ class ThemeTests(unittest.TestCase):
         self.assertEqual(AutoClicker._log_tag(''), '')
 
 
+class RegionTests(unittest.TestCase):
+    def test_normalize_drag_reversed(self):
+        region = app_module.normalize_region(300, 200, 100, 50)
+        self.assertEqual(region, {'x': 100, 'y': 50, 'width': 201, 'height': 151})
+
+    def test_normalize_click_point(self):
+        region = app_module.normalize_region(50, 60, 50, 60)
+        self.assertTrue(region['point'])
+        self.assertEqual((region['x'], region['y'], region['width'], region['height']),
+                         (50, 60, 1, 1))
+
+    def test_random_click_position_in_closed_bounds(self):
+        obj = make_clicker()
+        obj.config = {'click_area': {'x': 10, 'y': 20, 'width': 5, 'height': 4}}
+        obj.click_mode_cache = 'random'
+        obj.mode_var = FakeVar('random')
+        for _ in range(1000):
+            x, y = obj.get_click_position()
+            self.assertGreaterEqual(x, 10)
+            self.assertLessEqual(x, 14)
+            self.assertGreaterEqual(y, 20)
+            self.assertLessEqual(y, 23)
+
+    def test_center_click_position(self):
+        obj = make_clicker()
+        obj.config = {'click_area': {'x': 10, 'y': 20, 'width': 5, 'height': 4}}
+        obj.click_mode_cache = 'center'
+        obj.mode_var = FakeVar('center')
+        self.assertEqual(obj.get_click_position(), (12, 22))
+
+
 class ClickPointTests(unittest.TestCase):
     def test_multi_points_cycle(self):
         obj = make_clicker()
@@ -155,63 +186,63 @@ class ValidationTests(unittest.TestCase):
         self.obj.interval_var = FakeVar('10')
         self.assertEqual(self.obj._read_interval(), 10)
 
-    @mock.patch('auto_clicker_py3.messagebox.showerror')
-    def test_read_interval_too_small(self, show_error):
+    def test_read_interval_too_small(self):
         self.obj.interval_var = FakeVar('0')
+        self.obj.show_field_error = mock.Mock()
         self.assertIsNone(self.obj._read_interval())
-        show_error.assert_called_once()
+        self.obj.show_field_error.assert_called_once()
 
-    @mock.patch('auto_clicker_py3.messagebox.showerror')
-    def test_read_interval_too_large(self, show_error):
+    def test_read_interval_too_large(self):
         self.obj.interval_var = FakeVar('3601')
+        self.obj.show_field_error = mock.Mock()
         self.assertIsNone(self.obj._read_interval())
-        show_error.assert_called_once()
+        self.obj.show_field_error.assert_called_once()
 
-    @mock.patch('auto_clicker_py3.messagebox.showerror')
-    def test_read_interval_not_integer(self, show_error):
+    def test_read_interval_not_integer(self):
         self.obj.interval_var = FakeVar('x')
+        self.obj.show_field_error = mock.Mock()
         self.assertIsNone(self.obj._read_interval())
-        show_error.assert_called_once()
+        self.obj.show_field_error.assert_called_once()
 
-    @mock.patch('auto_clicker_py3.messagebox.showerror')
-    def test_read_countdown_out_of_range(self, show_error):
+    def test_read_countdown_out_of_range(self):
         self.obj.countdown_var = FakeVar('6')
+        self.obj.show_field_error = mock.Mock()
         self.assertIsNone(self.obj._read_countdown())
-        show_error.assert_called_once()
+        self.obj.show_field_error.assert_called_once()
 
     @mock.patch('auto_clicker_py3.messagebox.showerror')
     def test_read_countdown_valid(self, _):
         self.obj.countdown_var = FakeVar('3')
         self.assertEqual(self.obj._read_countdown(), 3)
 
-    @mock.patch('auto_clicker_py3.messagebox.showerror')
-    def test_read_click_limit_negative(self, show_error):
+    def test_read_click_limit_negative(self):
         self.obj.click_limit_var = FakeVar('-1')
+        self.obj.show_field_error = mock.Mock()
         self.assertIsNone(self.obj._read_click_limit())
-        show_error.assert_called_once()
+        self.obj.show_field_error.assert_called_once()
 
-    @mock.patch('auto_clicker_py3.messagebox.showerror')
-    def test_read_duration_limit_negative(self, show_error):
+    def test_read_duration_limit_negative(self):
         self.obj.duration_limit_var = FakeVar('-2')
+        self.obj.show_field_error = mock.Mock()
         self.assertIsNone(self.obj._read_duration_limit())
-        show_error.assert_called_once()
+        self.obj.show_field_error.assert_called_once()
 
-    @mock.patch('auto_clicker_py3.messagebox.showerror')
-    def test_read_jitter_out_of_range(self, show_error):
+    def test_read_jitter_out_of_range(self):
         self.obj.jitter_var = FakeVar('101')
+        self.obj.show_field_error = mock.Mock()
         self.assertIsNone(self.obj._read_jitter())
-        show_error.assert_called_once()
+        self.obj.show_field_error.assert_called_once()
 
     @mock.patch('auto_clicker_py3.messagebox.showerror')
     def test_read_hold_ms_valid(self, _):
         self.obj.hold_ms_var = FakeVar('10')
         self.assertEqual(self.obj._read_hold_ms(), 10)
 
-    @mock.patch('auto_clicker_py3.messagebox.showerror')
-    def test_read_hold_ms_negative(self, show_error):
+    def test_read_hold_ms_negative(self):
         self.obj.hold_ms_var = FakeVar('-3')
+        self.obj.show_field_error = mock.Mock()
         self.assertIsNone(self.obj._read_hold_ms())
-        show_error.assert_called_once()
+        self.obj.show_field_error.assert_called_once()
 
 
 class ConfigTests(unittest.TestCase):

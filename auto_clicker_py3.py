@@ -299,6 +299,274 @@ def click_mouse(x, y, button='left', hold_ms=0):
     else:
         return _pyautogui_click(x, y, button)
 
+
+def normalize_region(x1, y1, x2, y2):
+    """把拖拽起止点归一化为闭区间区域；单击（几乎无位移）按 1×1 点处理。"""
+    left = min(int(x1), int(x2))
+    top = min(int(y1), int(y2))
+    width = abs(int(x2) - int(x1))
+    height = abs(int(y2) - int(y1))
+    if width < 2 and height < 2:
+        return {'x': left, 'y': top, 'width': 1, 'height': 1, 'point': True}
+    return {'x': left, 'y': top, 'width': max(1, width + 1), 'height': max(1, height + 1)}
+
+
+class RegionSelector:
+    """FR-C01/8.1：全屏半透明遮罩 + 十字线 + 拖拽框选 + 实时尺寸标签。
+
+    交互：
+      - 按下左键并拖拽：实时绘制选框，标签显示 `W×H (x,y)`；
+      - 松开左键：选框保留 1 秒后关闭并回调；几乎无位移时按单击取 1×1 点；
+      - 右键：撤销当前选框；
+      - Esc：立即取消，原配置不变；Enter：确认当前选框。
+    """
+
+    def __init__(self, parent, on_done):
+        self.parent = parent
+        self.on_done = on_done
+        self.start_xy = None
+        self.start_abs = None
+        self.rect_id = None
+        self.last_region = None
+        self._finished = False
+        self._finish_after = None
+
+        self.top = tk.Toplevel(parent)
+        self.top.overrideredirect(True)
+        self.top.configure(bg='#000000')
+        try:
+            self.top.attributes('-topmost', True)
+            self.top.attributes('-alpha', 0.45)
+        except Exception:
+            pass
+
+        # 虚拟屏幕范围：Windows 用系统指标，其他平台用 Tk 虚拟根窗口
+        ox, oy, sw, sh = 0, 0, parent.winfo_screenwidth(), parent.winfo_screenheight()
+        if IS_WINDOWS:
+            try:
+                import ctypes
+                u = ctypes.windll.user32
+                ox = int(u.GetSystemMetrics(76))   # SM_XVIRTUALSCREEN
+                oy = int(u.GetSystemMetrics(77))   # SM_YVIRTUALSCREEN
+                sw = int(u.GetSystemMetrics(78))   # SM_CXVIRTUALSCREEN
+                sh = int(u.GetSystemMetrics(79))   # SM_CYVIRTUALSCREEN
+            except Exception:
+                pass
+        self.origin_x, self.origin_y = ox, oy
+        try:
+            self.top.geometry("%dx%d%+d%+d" % (sw, sh, ox, oy))
+        except Exception:
+            self.top.geometry("%dx%d+0+0" % (sw, sh))
+
+        self.canvas = tk.Canvas(self.top, bg='#000000', highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.canvas.configure(cursor='crosshair')
+        self.hline = self.canvas.create_line(0, 0, sw, 0, fill='#60A5FA', width=1)
+        self.vline = self.canvas.create_line(0, 0, 0, sh, fill='#60A5FA', width=1)
+        self.prompt = tk.Label(
+            self.top, text="拖拽框选区域 · 单击取点 · Esc 取消 · 右键撤销 · Enter 确认",
+            bg='#1F2229', fg='#E8EAED', font=('微软雅黑', 10, 'bold'),
+            padx=14, pady=7)
+        # 提示条放在主屏可见区域中央，虚拟屏扩展到多屏时不会跑到副屏外
+        primary_w = sw
+        if IS_WINDOWS:
+            try:
+                import ctypes
+                primary_w = int(ctypes.windll.user32.GetSystemMetrics(0)) or sw
+            except Exception:
+                pass
+        self.prompt.place(x=max(0, primary_w // 2), y=18, anchor='n')
+        self.size_label = tk.Label(
+            self.top, text='', bg='#2563EB', fg='white',
+            font=('Consolas', 10, 'bold'), padx=8, pady=4)
+        self.size_label.place(x=20, y=20)
+
+        for widget in (self.top, self.canvas):
+            widget.bind('<Motion>', self._on_motion)
+            widget.bind('<ButtonPress-1>', self._on_press)
+            widget.bind('<B1-Motion>', self._on_drag)
+            widget.bind('<ButtonRelease-1>', self._on_release)
+            widget.bind('<ButtonPress-3>', self._on_right)
+        self.top.bind('<Escape>', self._on_cancel)
+        self.top.bind('<Return>', self._on_confirm)
+        self.top.bind('<KP_Enter>', self._on_confirm)
+
+        self.top.update_idletasks()
+        # Windows 上负坐标虚拟屏由 SetWindowPos 兜底，避免 Tk 把 -x 解释成右边缘偏移
+        if IS_WINDOWS:
+            try:
+                import ctypes
+                hwnd = self.top.winfo_id()
+                u = ctypes.windll.user32
+                # Tk 的顶层窗口外面还有一层 wrapper，必须对根 HWND 设置 TOPMOST
+                root_hwnd = u.GetAncestor(hwnd, 2) or hwnd
+                u.SetWindowPos(
+                    root_hwnd, -1, ox, oy, sw, sh, 0x0040)  # HWND_TOPMOST, SWP_SHOWWINDOW
+            except Exception:
+                pass
+        try:
+            self.top.attributes('-topmost', True)
+            self.top.lift()
+        except Exception:
+            pass
+        try:
+            # 全局 grab：遮罩必须优先拿到鼠标事件，避免被主窗口/其他窗口抢走
+            self.top.grab_set_global()
+        except Exception:
+            try:
+                self.top.grab_set()
+            except Exception:
+                pass
+        try:
+            self.top.focus_force()
+        except Exception:
+            pass
+
+    def _abs_xy(self, event):
+        return int(event.x_root), int(event.y_root)
+
+    def _draw_size(self, region, px, py):
+        text = "%d×%d (%d,%d)" % (region['width'], region['height'], region['x'], region['y'])
+        self.size_label.config(text=text)
+        # 标签放在光标右下方，贴近当前框选操作
+        self.size_label.place(x=max(0, px + 14), y=max(0, py + 14))
+
+    def _on_motion(self, event):
+        if self._finished:
+            return
+        self.canvas.coords(self.hline, 0, event.y, self.canvas.winfo_width(), event.y)
+        self.canvas.coords(self.vline, event.x, 0, event.x, self.canvas.winfo_height())
+
+    def _on_press(self, event):
+        if self._finished:
+            return
+        self.start_xy = (event.x, event.y)
+        self.start_abs = self._abs_xy(event)
+        self.last_region = None
+        if self.rect_id:
+            self.canvas.delete(self.rect_id)
+        self.rect_id = self.canvas.create_rectangle(
+            event.x, event.y, event.x, event.y,
+            outline='#60A5FA', width=2, fill='')
+        self.size_label.config(text='0×0')
+        self.size_label.place(x=max(0, event.x + 14), y=max(0, event.y + 14))
+
+    def _on_drag(self, event):
+        if self._finished or not self.start_xy or not self.rect_id:
+            return
+        self.canvas.coords(self.rect_id, self.start_xy[0], self.start_xy[1], event.x, event.y)
+        x1, y1 = self._abs_xy(event)
+        sx, sy = self.start_abs if self.start_abs else (
+            self.origin_x + self.start_xy[0], self.origin_y + self.start_xy[1])
+        self.last_region = normalize_region(sx, sy, x1, y1)
+        self._draw_size(self.last_region, event.x, event.y)
+
+    def _on_release(self, event):
+        if self._finished or not self.start_xy:
+            return
+        x1, y1 = self._abs_xy(event)
+        sx, sy = self.start_abs if self.start_abs else (
+            self.origin_x + self.start_xy[0], self.origin_y + self.start_xy[1])
+        self.last_region = normalize_region(sx, sy, x1, y1)
+        self._draw_size(self.last_region, event.x, event.y)
+        # 选框保留 1 秒，随后回填并关闭
+        self._finish_after = self.top.after(1000, self._finish_with_last)
+
+    def _on_right(self, event):
+        if self._finished:
+            return
+        if self.rect_id:
+            self.canvas.delete(self.rect_id)
+            self.rect_id = None
+        self.start_xy = None
+        self.start_abs = None
+        self.last_region = None
+        self.size_label.config(text='已撤销当前选框')
+
+    def _on_confirm(self, event=None):
+        if self.last_region:
+            self._finish_with_last()
+
+    def _on_cancel(self, event=None):
+        if self._finished:
+            return
+        self._finish(None, cancelled=True)
+
+    def _finish_with_last(self):
+        if self._finished:
+            return
+        if self.last_region:
+            self._finish(self.last_region)
+        else:
+            self._finish(None, cancelled=True)
+
+    def _finish(self, region, cancelled=False):
+        if self._finished:
+            return
+        self._finished = True
+        try:
+            if self._finish_after:
+                self.top.after_cancel(self._finish_after)
+        except Exception:
+            pass
+        try:
+            self.top.grab_release()
+        except Exception:
+            pass
+        try:
+            self.top.destroy()
+        except Exception:
+            pass
+        try:
+            self.on_done(None if cancelled else region)
+        except Exception:
+            pass
+
+
+class NoticeBar:
+    """8.3 错误提示分级：顶部可关闭横幅（operation 级）。"""
+
+    def __init__(self, parent, color_getter):
+        self.color_getter = color_getter
+        self.frame = tk.Frame(parent, bg=color_getter('warning'))
+        self.label = tk.Label(
+            self.frame, text='', bg=color_getter('warning'), fg='white',
+            font=('微软雅黑', 10, 'bold'), wraplength=520, justify=tk.LEFT, anchor=tk.W)
+        self.label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 6), pady=7)
+        self.close_btn = tk.Button(
+            self.frame, text='×', command=self.hide, bg=color_getter('warning'), fg='white',
+            activebackground=color_getter('warning'), activeforeground='white',
+            relief=tk.FLAT, bd=0, font=('微软雅黑', 11, 'bold'), cursor='hand2')
+        self.close_btn.pack(side=tk.RIGHT, padx=(0, 8))
+        self._after_id = None
+        self._parent = parent
+
+    def show(self, message, level='operation', timeout=0, before=None):
+        color = self.color_getter('danger' if level == 'fatal' else 'warning')
+        self.frame.configure(bg=color)
+        self.label.configure(text=message, bg=color)
+        self.close_btn.configure(bg=color, activebackground=color)
+        if not self.frame.winfo_manager():
+            pack_kw = {'fill': tk.X, 'pady': (0, 10)}
+            if before is not None:
+                pack_kw['before'] = before
+            self.frame.pack(**pack_kw)
+        if self._after_id:
+            try:
+                self.frame.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+        if timeout:
+            self._after_id = self.frame.after(timeout, self.hide)
+
+    def hide(self):
+        try:
+            self.frame.pack_forget()
+        except Exception:
+            pass
+
+
 # ERROR_ALREADY_EXISTS常量（在pywin32中可能未定义）
 ERROR_ALREADY_EXISTS = 183
 
@@ -397,6 +665,8 @@ class AutoClicker:
         
         self.is_running = False
         self.click_thread = None
+        self._region_selector = None
+        self._region_starting = False
         self.config_file = os.path.expanduser("~/.auto_clicker_config_py3.json")
         # 首启检测（6.9.1 引导与预设配置）：配置不存在即视为首次运行
         self.first_run = not os.path.exists(self.config_file)
@@ -1250,6 +1520,60 @@ class AutoClicker:
             "会话类型：%s\n\n%s\n\n启动按钮、启动热键与测试点击均已禁用。"
             % (self.input_session, self.input_reason))
 
+    # ==================== 8.3 错误提示分级组件 ====================
+    def clear_field_error(self):
+        """清除字段级行内红字。"""
+        try:
+            self.field_error_label.config(text='')
+        except Exception:
+            pass
+
+    def show_field_error(self, message):
+        """字段级：行内红字，不弹窗。"""
+        try:
+            self.field_error_label.config(text=message)
+        except Exception:
+            pass
+
+    def show_operation_message(self, message, level='operation', timeout=0):
+        """操作级：顶部可关闭横幅；fatal 级额外记录日志并弹模态框。"""
+        if threading.current_thread() is not threading.main_thread():
+            try:
+                self._ui(self.show_operation_message, message, level, timeout)
+            except Exception:
+                pass
+            return
+        if level == 'fatal':
+            try:
+                self.log_message("致命错误：" + message)
+            except Exception:
+                pass
+            messagebox.showerror("错误", message)
+            return
+        try:
+            self._notice_bar.show(message, level='operation', timeout=timeout,
+                                  before=getattr(self, 'header_frame', None))
+        except Exception:
+            pass
+        try:
+            self.log_message("操作提示：" + message)
+        except Exception:
+            pass
+
+    def show_fatal_error(self, message, title="错误"):
+        """致命级：模态对话框 + 日志（供启动/配置类不可恢复错误复用）。"""
+        if threading.current_thread() is not threading.main_thread():
+            try:
+                self._ui(self.show_fatal_error, message, title)
+            except Exception:
+                pass
+            return
+        try:
+            self.log_message("致命错误：" + message)
+        except Exception:
+            pass
+        messagebox.showerror(title, message)
+
     def _refresh_profile_combo(self):
         try:
             names = list(self.config.get('profiles', {}).keys())
@@ -1410,6 +1734,9 @@ class AutoClicker:
         # ==================== 头部区域 ====================
         header_frame = ttk.Frame(self.main_frame)
         header_frame.pack(fill=tk.X, pady=(0, 15))
+        self.header_frame = header_frame
+        # 8.3 操作级提示：顶部可关闭横幅（按需 pack，位于 header 之前）
+        self._notice_bar = NoticeBar(self.main_frame, self._color)
         
         # 标题和状态指示器
         title_container = ttk.Frame(header_frame)
@@ -1623,6 +1950,13 @@ class AutoClicker:
                                      activebackground=self._shade(self._color('muted')),
                                      cursor='hand2', relief=tk.FLAT, bd=0)
         self.set_area_btn.pack(side=tk.LEFT)
+
+        # 8.3 字段级提示：行内红字，不弹窗
+        self.field_error_label = tk.Label(
+            left_card, text='', anchor=tk.W, justify=tk.LEFT,
+            fg=self._color('danger'), bg=self._color('bg'),
+            font=('微软雅黑', 9))
+        self.field_error_label.pack(fill=tk.X, pady=(4, 0))
         
         # 右列 - 高级选项和状态
         right_card = ttk.LabelFrame(config_container, text="状态监控", padding="15")
@@ -1938,40 +2272,64 @@ class AutoClicker:
             pass
                     
     def set_click_area(self):
+        """FR-C01/8.1：全屏遮罩 + 十字线 + 拖拽框选，实时显示尺寸并回填区域。
+
+        遮罩构建放到 event loop 的下一次空闲回调，避免按钮点击路径同步阻塞主线程。
+        """
         try:
-            messagebox.showinfo("设置点击区域", 
-                               "请在5秒内将鼠标移动到点击区域的左上角\n程序将自动记录位置")
-            
-            self.root.iconify()
-            time.sleep(5)
-            
-            x, y = get_cursor_pos()
-            
-            messagebox.showinfo("设置点击区域", 
-                               f"已记录左上角位置: ({x}, {y})\n请在5秒内将鼠标移动到点击区域的右下角")
-            
-            time.sleep(5)
-            
-            x2, y2 = get_cursor_pos()
-            
-            self.config['click_area'] = {
-                'x': min(x, x2),
-                'y': min(y, y2),
-                'width': abs(x2 - x),
-                'height': abs(y2 - y)
-            }
-            
-            self.area_label.config(text=f"{self.config['click_area']['width']}x{self.config['click_area']['height']}")
-            self.save_config()
-            
-            self.log_message(f"点击区域已设置: {self.config['click_area']}")
-            
+            if getattr(self, '_region_selector', None) is not None:
+                return
+            if getattr(self, '_region_starting', False):
+                return
+            self._region_starting = True
+            self.log_message("取区域：拖拽框选 · 单击取点 · Esc 取消")
+            self.root.after(0, self._open_region_selector)
         except Exception as e:
-            error_msg = f"设置点击区域失败: {e}"
+            self._region_starting = False
+            self._region_selector = None
+            error_msg = f"打开取区域遮罩失败: {e}"
             self.log_message(error_msg)
-            messagebox.showerror("错误", error_msg)
-        finally:
-            self.root.deiconify()
+            self.show_operation_message(error_msg, level='fatal')
+
+    def _open_region_selector(self):
+        self._region_starting = False
+        try:
+            self._region_selector = RegionSelector(self.root, self._on_region_selected)
+        except Exception as e:
+            self._region_selector = None
+            error_msg = f"打开取区域遮罩失败: {e}"
+            self.log_message(error_msg)
+            self.show_operation_message(error_msg, level='fatal')
+
+    def _on_region_selected(self, region):
+        """区域选择回调：None=取消（原配置不变）；否则回填并持久化。"""
+        self._region_selector = None
+        if region is None:
+            self.log_message("取区域：已取消，原区域保持不变")
+            return
+        try:
+            if region.get('point'):
+                self.config['click_area'] = {
+                    'x': int(region['x']), 'y': int(region['y']),
+                    'width': 1, 'height': 1,
+                }
+                self.log_message("已取点：(%d, %d)" % (region['x'], region['y']))
+            else:
+                self.config['click_area'] = {
+                    'x': int(region['x']), 'y': int(region['y']),
+                    'width': int(region['width']), 'height': int(region['height']),
+                }
+                self.log_message("点击区域已设置: %s" % self.config['click_area'])
+            self.area_label.config(
+                text="%dx%d (%d,%d)" % (
+                    self.config['click_area']['width'],
+                    self.config['click_area']['height'],
+                    self.config['click_area']['x'],
+                    self.config['click_area']['y']))
+            self.save_config()
+        except Exception as e:
+            self.log_message("回填点击区域失败: " + str(e))
+            self.show_operation_message("回填点击区域失败: " + str(e), level='fatal')
             
     def get_click_position(self):
         mode = getattr(self, 'click_mode_cache', None) or self.mode_var.get()
@@ -1980,8 +2338,9 @@ class AutoClicker:
             x = area['x'] + area['width'] // 2
             y = area['y'] + area['height'] // 2
         else:
-            x = _RANDOM.randint(area['x'], area['x'] + area['width'])
-            y = _RANDOM.randint(area['y'], area['y'] + area['height'])
+            # FR-C02：闭区间 [x, x+w-1] / [y, y+h-1]，不得越过区域右下边界
+            x = _RANDOM.randint(area['x'], area['x'] + max(0, area['width'] - 1))
+            y = _RANDOM.randint(area['y'], area['y'] + max(0, area['height'] - 1))
         return x, y
     
     def smooth_move_to(self, x, y, duration=0.5):
@@ -2425,18 +2784,19 @@ class AutoClicker:
                 time.sleep(1)
                 
     def _read_interval(self):
-        """读取并校验点击间隔，非法时弹窗并返回 None。"""
+        """读取并校验点击间隔，非法时行内红字提示并返回 None。"""
         try:
             value = int(self.interval_var.get())
         except ValueError:
-            messagebox.showerror("错误", "点击间隔必须为整数")
+            self.show_field_error("点击间隔必须为整数")
             return None
         if value < 1:
-            messagebox.showerror("错误", "点击间隔必须 >= 1")
+            self.show_field_error("点击间隔必须 >= 1")
             return None
         if value > 3600:
-            messagebox.showerror("错误", "点击间隔必须 <= 3600")
+            self.show_field_error("点击间隔必须 <= 3600")
             return None
+        self.clear_field_error()
         return value
 
     def _read_countdown(self):
@@ -2444,11 +2804,12 @@ class AutoClicker:
         try:
             value = int(self.countdown_var.get())
         except ValueError:
-            messagebox.showerror("错误", "启动倒计时必须为整数")
+            self.show_field_error("启动倒计时必须为整数")
             return None
         if value < 0 or value > 5:
-            messagebox.showerror("错误", "启动倒计时必须在 0-5 秒之间")
+            self.show_field_error("启动倒计时必须在 0-5 秒之间")
             return None
+        self.clear_field_error()
         return value
 
     def _read_click_limit(self):
@@ -2456,11 +2817,12 @@ class AutoClicker:
         try:
             value = int(self.click_limit_var.get())
         except ValueError:
-            messagebox.showerror("错误", "点击次数上限必须为整数")
+            self.show_field_error("点击次数上限必须为整数")
             return None
         if value < 0:
-            messagebox.showerror("错误", "点击次数上限不能为负数")
+            self.show_field_error("点击次数上限不能为负数")
             return None
+        self.clear_field_error()
         return value
 
     def _read_duration_limit(self):
@@ -2468,11 +2830,12 @@ class AutoClicker:
         try:
             value = int(self.duration_limit_var.get())
         except ValueError:
-            messagebox.showerror("错误", "运行时长上限必须为整数")
+            self.show_field_error("运行时长上限必须为整数")
             return None
         if value < 0:
-            messagebox.showerror("错误", "运行时长上限不能为负数")
+            self.show_field_error("运行时长上限不能为负数")
             return None
+        self.clear_field_error()
         return value
 
     def _read_jitter(self):
@@ -2480,11 +2843,12 @@ class AutoClicker:
         try:
             value = int(self.jitter_var.get())
         except ValueError:
-            messagebox.showerror("错误", "随机抖动必须为整数")
+            self.show_field_error("随机抖动必须为整数")
             return None
         if value < 0 or value > 100:
-            messagebox.showerror("错误", "随机抖动必须在 0-100 之间")
+            self.show_field_error("随机抖动必须在 0-100 之间")
             return None
+        self.clear_field_error()
         return value
 
     def _read_hold_ms(self):
@@ -2492,11 +2856,12 @@ class AutoClicker:
         try:
             value = int(self.hold_ms_var.get())
         except ValueError:
-            messagebox.showerror("错误", "按住时长必须为整数")
+            self.show_field_error("按住时长必须为整数")
             return None
         if value < 0:
-            messagebox.showerror("错误", "按住时长不能为负数")
+            self.show_field_error("按住时长不能为负数")
             return None
+        self.clear_field_error()
         return value
 
     def _startup_summary(self, interval, countdown, click_limit, duration_limit, jitter, hold_ms):
