@@ -7,6 +7,8 @@
 
 import sys
 import os
+import atexit
+import signal
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 import subprocess
@@ -28,6 +30,112 @@ PLATFORM = sys.platform
 IS_WINDOWS = PLATFORM == 'win32'
 IS_LINUX = PLATFORM.startswith('linux')
 IS_MACOS = PLATFORM == 'darwin'
+
+
+def target_window_matches(keyword, title, process_name=''):
+    """FR-E03：目标窗口关键字匹配（标题或进程名，大小写不敏感）。空关键字=不校验。"""
+    key = (keyword or '').strip().lower()
+    if not key:
+        return True
+    return key in (title or '').lower() or key in (process_name or '').lower()
+
+
+def get_foreground_window_info():
+    """返回当前前台窗口 (title, process_name)；不支持的平台返回 ('','')。"""
+    if IS_WINDOWS:
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u = ctypes.windll.user32
+            hwnd = u.GetForegroundWindow()
+            if not hwnd:
+                return '', ''
+            buf = ctypes.create_unicode_buffer(512)
+            u.GetWindowTextW(hwnd, buf, 512)
+            pid = wintypes.DWORD()
+            u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            proc = ''
+            try:
+                k32 = ctypes.windll.kernel32
+                handle = k32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+                if handle:
+                    path_buf = ctypes.create_unicode_buffer(1024)
+                    size = wintypes.DWORD(1024)
+                    if k32.QueryFullProcessImageNameW(handle, 0, path_buf, ctypes.byref(size)):
+                        proc = os.path.basename(path_buf.value)
+                    k32.CloseHandle(handle)
+            except Exception:
+                pass
+            return buf.value or '', proc or ''
+        except Exception:
+            return '', ''
+    if IS_LINUX:
+        try:
+            import subprocess
+            out = subprocess.run(['xdotool', 'getactivewindow', 'getwindowname'],
+                                 capture_output=True, text=True, timeout=2)
+            title = (out.stdout or '').strip()
+            return title, ''
+        except Exception:
+            return '', ''
+    if IS_MACOS:
+        try:
+            import subprocess
+            out = subprocess.run(
+                ['osascript', '-e',
+                 'tell application "System Events" to get name of first application process whose frontmost is true'],
+                capture_output=True, text=True, timeout=2)
+            return '', (out.stdout or '').strip()
+        except Exception:
+            return '', ''
+    return '', ''
+
+
+def restore_system_settings():
+    """FR/E 6.6.2：恢复进程/系统级防休眠设置；atexit 与信号处理共用。"""
+    try:
+        if IS_WINDOWS:
+            import ctypes
+            ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)  # ES_CONTINUOUS
+            print("已恢复Windows休眠设置")
+        elif IS_LINUX:
+            try:
+                import subprocess
+                subprocess.Popen(['xset', 's', 'on'], stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE)
+                subprocess.Popen(['xset', 'dpms'], stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE)
+                print("已恢复Linux休眠设置")
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"恢复系统休眠设置失败: {e}")
+
+
+_SETTING_GUARDS_INSTALLED = False
+
+
+def install_setting_restore_guards():
+    """注册崩溃/正常退出/信号路径的系统设置复原钩子（幂等）。"""
+    global _SETTING_GUARDS_INSTALLED
+    if _SETTING_GUARDS_INSTALLED:
+        return
+    _SETTING_GUARDS_INSTALLED = True
+    atexit.register(restore_system_settings)
+
+    def _signal_handler(signum, _frame):
+        restore_system_settings()
+        raise SystemExit(0)
+
+    for name in ('SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK'):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _signal_handler)
+        except Exception:
+            pass
+    print("已注册系统设置复原守卫（atexit/信号）")
 
 
 def detect_input_backend():
@@ -679,6 +787,8 @@ class AutoClicker:
         self.click_limit = 0
         self.duration_limit = 0
         self.failsafe_enabled = False
+        self.target_window_cache = ''
+        self._window_mismatch_active = False
         self.start_time = time.time()
 
         # P1 功能扩展状态默认值（FN-01 / FN-02 / CX-07 / FN-03）
@@ -800,6 +910,7 @@ class AutoClicker:
             'click_limit': 0,  # 点击次数上限（0 表示无限）
             'duration_limit': 0,  # 运行时长上限（分钟，0 表示无限）
             'failsafe_enabled': False,  # 鼠标位移即停
+            'target_window_keyword': '',  # FR-E03 前台目标窗口关键字（空=不校验）
             'close_to_tray': True,  # 关闭窗口最小化到托盘（否则直接退出）
             # P1 功能扩展（FN-01 / FN-02 / CX-07 / CX-08 / CX-11 / FN-03）
             'click_button': 'left',  # 鼠标按键：left/right/middle/double
@@ -1235,6 +1346,7 @@ class AutoClicker:
                 self.config['click_limit'] = int(self.click_limit_var.get() or 0)
                 self.config['duration_limit'] = int(self.duration_limit_var.get() or 0)
                 self.config['failsafe_enabled'] = self.failsafe_var.get()
+                self.config['target_window_keyword'] = self.target_window_var.get().strip()
                 self.config['close_to_tray'] = self.close_to_tray_var.get()
             self.save_config()
         except Exception as e:
@@ -1596,7 +1708,8 @@ class AutoClicker:
         name = name.strip()
         keys = ['interval_seconds', 'click_mode', 'prevent_sleep', 'mouse_follow_enabled',
                 'mouse_move_speed', 'mouse_move_only', 'startup_countdown', 'click_limit',
-                'duration_limit', 'failsafe_enabled', 'click_button', 'hold_ms',
+                'duration_limit', 'failsafe_enabled', 'target_window_keyword',
+                'click_button', 'hold_ms',
                 'interval_unit', 'jitter_pct', 'use_multi_points', 'multi_points', 'click_area',
                 'hotkey_start', 'hotkey_emergency', 'autostart', 'close_to_tray']
         snap = {k: self.config.get(k) for k in keys}
@@ -1671,6 +1784,7 @@ class AutoClicker:
             self.click_limit_var.set(str(self.config.get('click_limit', 0)))
             self.duration_limit_var.set(str(self.config.get('duration_limit', 0)))
             self.failsafe_var.set(self.config.get('failsafe_enabled', False))
+            self.target_window_var.set(str(self.config.get('target_window_keyword', '')))
             self.close_to_tray_var.set(self.config.get('close_to_tray', True))
             self.click_button_var.set(self.config.get('click_button', 'left'))
             self.hold_ms_var.set(str(self.config.get('hold_ms', 10)))
@@ -2042,6 +2156,15 @@ class AutoClicker:
         self.countdown_var = tk.StringVar(value=str(self.config.get('startup_countdown', 3)))
         ttk.Entry(countdown_container, textvariable=self.countdown_var,
                  font=('微软雅黑', 11), width=8, justify='center').pack(side=tk.LEFT, padx=(5, 0))
+
+        # FR-E03：前台目标窗口校验（标题/进程名关键字，留空不校验）
+        target_container = ttk.Frame(safety_card)
+        target_container.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(target_container, text="目标窗口关键字(留空=不校验)",
+                 font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
+        self.target_window_var = tk.StringVar(value=str(self.config.get('target_window_keyword', '')))
+        ttk.Entry(target_container, textvariable=self.target_window_var,
+                 font=('微软雅黑', 11), width=24).pack(side=tk.LEFT, padx=(5, 0))
 
         # 点击次数上限（CX-02）
         limit_container = ttk.Frame(safety_card)
@@ -2477,26 +2600,7 @@ class AutoClicker:
         """
         if getattr(self, 'keepalive_running', None) and self.keepalive_running.is_set():
             return
-        try:
-            if IS_WINDOWS:
-                import ctypes
-                ES_CONTINUOUS = 0x80000000
-                ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
-                print("已恢复Windows休眠设置")
-            elif IS_LINUX:
-                try:
-                    import subprocess
-                    subprocess.Popen(['xset', 's', 'on'],
-                                   stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE)
-                    subprocess.Popen(['xset', 'dpms'],
-                                   stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE)
-                except Exception:
-                    pass
-                print("已恢复Linux休眠设置")
-        except Exception as e:
-            print(f"恢复系统休眠设置失败: {e}")
+        restore_system_settings()
 
     # ==================== 线程安全的 UI 更新辅助方法 ====================
     def _ui(self, fn, *args, **kwargs):
@@ -2746,6 +2850,30 @@ class AutoClicker:
                 return True
         return False
 
+    def _target_window_ok(self):
+        if not getattr(self, 'target_window_cache', ''):
+            return True
+        title, proc = get_foreground_window_info()
+        return target_window_matches(self.target_window_cache, title, proc)
+
+    def _pause_for_target_window(self):
+        """FR-E03：前台窗口不匹配时暂停点击，切回目标窗口后自动恢复。"""
+        if not getattr(self, 'target_window_cache', ''):
+            return self.is_running
+        while self.is_running:
+            if self._target_window_ok():
+                if getattr(self, '_window_mismatch_active', False):
+                    self._window_mismatch_active = False
+                    self.log_message("目标窗口已恢复，自动继续点击")
+                return True
+            if not getattr(self, '_window_mismatch_active', False):
+                self._window_mismatch_active = True
+                self.log_message("前台窗口不匹配，已暂停点击（切回目标窗口后恢复）")
+                self.show_operation_message(
+                    "前台窗口不匹配，已暂停点击；切回目标窗口后自动恢复", level='operation')
+            time.sleep(0.2)
+        return False
+
     def click_loop(self):
         # 多点位序列模式（FN-03）
         points = self.multi_points if self.use_multi_points else None
@@ -2766,6 +2894,10 @@ class AutoClicker:
                 # 安全：运行中若开启 failsafe 且鼠标被移动 >20px，立即急停（CX-01）
                 if self.failsafe_enabled and self.is_running and self._failsafe_triggered(failsafe_base):
                     self.stop_clicking(reason="鼠标位移触发安全停止 (failsafe)")
+                    return
+
+                # FR-E03：前台窗口校验，不匹配则循环等待（不点击），切回后继续
+                if not self._pause_for_target_window():
                     return
 
                 # 计算本次点击坐标并执行（含鼠标跟随/仅移动模式）
@@ -2928,6 +3060,8 @@ class AutoClicker:
             # 后台点击线程只读以下缓存，禁止在非主线程调用 Tk Var.get()
             self.interval_seconds_cache = interval
             self.prevent_sleep_cache = self.prevent_sleep_var.get()
+            self.target_window_cache = self.target_window_var.get().strip()
+            self._window_mismatch_active = False
             self.mouse_follow_cache = self.mouse_follow_var.get()
             self.mouse_speed_cache = float(self.mouse_speed_var.get())
             self.mouse_move_only_cache = self.mouse_move_only_var.get()
@@ -3645,6 +3779,7 @@ def main():
         return
     
     setup_dpi_awareness()  # 必须在 tk.Tk() 之前，保证 DPI 感知对根窗口生效
+    install_setting_restore_guards()
     root = tk.Tk()
 
     app = AutoClicker(root)

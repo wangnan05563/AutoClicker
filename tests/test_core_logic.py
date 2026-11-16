@@ -98,6 +98,19 @@ class ThemeTests(unittest.TestCase):
         self.assertEqual(AutoClicker._log_tag(''), '')
 
 
+class TargetWindowTests(unittest.TestCase):
+    def test_empty_keyword_always_matches(self):
+        self.assertTrue(app_module.target_window_matches('', '任意窗口', 'notepad.exe'))
+
+    def test_title_keyword_case_insensitive(self):
+        self.assertTrue(app_module.target_window_matches('记事本', '无标题 - 记事本', 'notepad.exe'))
+        self.assertFalse(app_module.target_window_matches('记事本', 'Chrome', 'chrome.exe'))
+
+    def test_process_keyword(self):
+        self.assertTrue(app_module.target_window_matches('NOTEPAD', '', 'notepad.exe'))
+        self.assertFalse(app_module.target_window_matches('notepad', 'Chrome', 'chrome.exe'))
+
+
 class RegionTests(unittest.TestCase):
     def test_normalize_drag_reversed(self):
         region = app_module.normalize_region(300, 200, 100, 50)
