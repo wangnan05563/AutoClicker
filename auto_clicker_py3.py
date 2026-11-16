@@ -3328,6 +3328,7 @@ class AutoClicker:
                     continue
                 tag = self._log_tag(level)
                 self.log_text.insert(tk.END, entry, tag)
+            self._trim_log_widget()
             self.log_text.see(tk.END)
             self.log_text.config(state=tk.DISABLED)
         except Exception:
@@ -3367,6 +3368,15 @@ class AutoClicker:
         except Exception:
             pass
 
+    def _trim_log_widget(self):
+        """FR-H01：界面只保留最近 500 行，避免 8 小时运行后 Text 控件无限增长。"""
+        try:
+            end_line = int(self.log_text.index('end-1c').split('.')[0])
+            if end_line > 500:
+                self.log_text.delete('1.0', f'{end_line - 500}.0')
+        except Exception:
+            pass
+
     def _append_log_ui(self, log_entry, level):
         """主线程写入日志控件；后台线程统一通过 _ui() 投递到主线程。"""
         try:
@@ -3376,6 +3386,7 @@ class AutoClicker:
                 self.log_text.config(state=tk.NORMAL)
                 tag = self._log_tag(level)
                 self.log_text.insert(tk.END, log_entry, tag)
+                self._trim_log_widget()
                 self.log_text.see(tk.END)
                 self.log_text.config(state=tk.DISABLED)
         except Exception:
