@@ -158,12 +158,66 @@ def detect_input_backend():
             "当前为 Wayland 会话，且未检测到 ydotool，无法模拟鼠标输入。\n"
             "请在登录界面切换到 X11 会话；或安装 ydotool 并启动 ydotoold（当前用户需加入 input 组）。"
             + doc)
-    # 有 ydotool 二进制也不代表可用：本版本尚未把 ydotool 接入点击后端
-    return False, 'wayland', (
-        "当前为 Wayland 会话。虽已检测到 ydotool，但本版本尚未接入 ydotool 输入后端，"
-        "pyautogui 仍依赖 X11，点击可能落空。\n"
-        "请切换到 X11 会话后使用。"
-        + doc)
+    # ydotool 已安装：由 _ydotool_* 后端执行移动/点击；ydotoold 未启动时命令会失败，
+    # 由调用方给出明确错误，不再静默禁用整个 Wayland 会话。
+    uid = getattr(os, 'getuid', lambda: 0)()
+    if not (os.environ.get('YDOTOOL_SOCKET') or os.path.exists('/tmp/.ydotool_socket')
+            or os.path.exists('/run/user/%d/.ydotool_socket' % uid)):
+        print("提示：未检测到 ydotoold socket，若点击失败请先启动 ydotoold")
+    return True, 'wayland', ''
+
+
+def _is_wayland_session():
+    """是否明确处于 Wayland 会话（与 detect_input_backend 判据一致）。"""
+    if not IS_LINUX:
+        return False
+    session = (os.environ.get('XDG_SESSION_TYPE') or '').strip().lower()
+    has_wayland = bool(os.environ.get('WAYLAND_DISPLAY'))
+    has_x11 = bool(os.environ.get('DISPLAY'))
+    return (session == 'wayland') or (not session and has_wayland and not has_x11)
+
+
+def _ydotool_run(args, timeout=2):
+    """执行 ydotool 子命令；失败返回 False（不抛出到 UI 线程）。"""
+    import subprocess
+    try:
+        out = subprocess.run(['ydotool'] + list(args), capture_output=True,
+                             text=True, timeout=timeout)
+        if out.returncode != 0:
+            print("ydotool 失败(%s)：%s" % (out.returncode,
+                                           (out.stderr or out.stdout or '').strip()[:200]))
+            return False
+        return True
+    except Exception as e:
+        print("ydotool 执行异常：%s" % e)
+        return False
+
+
+_YDOTOOL_BUTTONS = {'left': '0xC0', 'right': '0xC1', 'middle': '0xC2'}
+
+
+def _ydotool_move(x, y):
+    # ydotool 新旧版本参数兼容：优先 --absolute，再退回 -a
+    for flag in ('--absolute', '-a'):
+        if _ydotool_run(['mousemove', flag, '-x', str(int(x)), '-y', str(int(y))]):
+            return True
+    return False
+
+
+def _ydotool_click(x, y, button='left', hold_ms=0):
+    if not _ydotool_move(x, y):
+        return False
+    code = _YDOTOOL_BUTTONS.get(button, _YDOTOOL_BUTTONS['left'])
+    if button == 'double':
+        return (_ydotool_run(['click', code]) and
+                (time.sleep(0.03) or True) and
+                _ydotool_run(['click', code]))
+    if hold_ms > 0:
+        if not _ydotool_run(['mousedown', code]):
+            return False
+        time.sleep(hold_ms / 1000.0)
+        return _ydotool_run(['mouseup', code])
+    return _ydotool_run(['click', code])
 
 
 # ==================== 核心依赖 ====================
@@ -314,7 +368,13 @@ def _windows_click_button(x, y, button, hold_ms):
         return False
 
 def linux_move_mouse(x, y):
-    """使用 X11 API 移动鼠标（银河麒麟兼容）"""
+    """使用 X11 API 或 ydotool（Wayland）移动鼠标（银河麒麟兼容）"""
+    import shutil
+    if _is_wayland_session() and shutil.which('ydotool'):
+        if _ydotool_move(x, y):
+            return True
+        print("Wayland 移动鼠标失败：ydotool 不可用，请确认 ydotoold 已启动")
+        return False
     if HAS_X11:
         try:
             d = display.Display()
@@ -335,7 +395,13 @@ def linux_move_mouse(x, y):
         return False
 
 def linux_click(x, y, button='left', hold_ms=0):
-    """使用 X11 API 执行鼠标点击（银河麒麟兼容，支持左/右/中键、双击与按住时长）"""
+    """使用 X11 API 或 ydotool（Wayland）执行点击（支持左/右/中键、双击与按住时长）"""
+    import shutil
+    if _is_wayland_session() and shutil.which('ydotool'):
+        if _ydotool_click(x, y, button, hold_ms):
+            return True
+        print("Wayland 点击失败：ydotool 不可用，请确认 ydotoold 已启动")
+        return False
     if not HAS_X11:
         return _pyautogui_click(x, y, button)
     try:
