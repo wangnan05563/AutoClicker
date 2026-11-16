@@ -10,20 +10,16 @@ import os
 import atexit
 import signal
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, simpledialog
-import subprocess
+from tkinter import ttk, messagebox
 import threading
 import queue
 import time
-import secrets
+import random
 import json
-import logging
-import shutil
-from logging.handlers import RotatingFileHandler
 from datetime import datetime
 
 # 点击抖动使用系统安全随机源，避免可预测的伪随机序列
-_RANDOM = secrets.SystemRandom()
+_RANDOM = random.SystemRandom()
 
 # ==================== 平台检测 ====================
 PLATFORM = sys.platform
@@ -156,6 +152,7 @@ def detect_input_backend():
         return True, (session or ('x11' if has_x11 else 'unknown')), ''
 
     doc = "\n\n详见 docs/Wayland降级说明.md"
+    import shutil
     if not shutil.which('ydotool'):
         return False, 'wayland', (
             "当前为 Wayland 会话，且未检测到 ydotool，无法模拟鼠标输入。\n"
@@ -844,6 +841,8 @@ class AutoClicker:
         self.fail_count = 0
         self._runtime_after_id = None
         self._log_buffer = []  # [(text, level)] 全量日志缓冲（UI-04 过滤用）
+        self._pending_logs = []  # 磁盘日志尚未初始化时的待落盘消息
+        self._file_logger = None
         self._log_filter = ''
         self._log_collapsed = False
         # Tk 只能在主线程访问：后台线程通过该队列把 UI 回调交回主线程执行。
@@ -857,12 +856,14 @@ class AutoClicker:
             'interval_seconds': 0.0, 'mode': '', 'button': '',
         }
 
-        self.setup_logging()
         self.load_config()
         self._init_theme()
         self._init_ui_fonts()
         self.setup_ui()
         self.root.after(30, self._poll_ui_queue)
+        # 磁盘日志延后到窗口可见后：logging.handlers 会拉入 shutil/socket/pickle，
+        # 冷启动不必为首屏承担该导入成本；此前日志先入 _pending_logs，初始化后补写。
+        self.root.after(250, self.setup_logging)
         # 补记 DPI 诊断（此时日志/UI 设施已就绪）
         self.log_message("DPI 适配：系统缩放 %.2f，UI 字体基准 %dpt（不做二次放大）" % (
             getattr(self, '_dpi_scale', 1.0), getattr(self, 'ui_font_size', 9)))
@@ -877,9 +878,11 @@ class AutoClicker:
         # 热键/托盘初始化延迟到主窗口首次显示后：keyboard 全局钩子导入约 1.3 秒，
         # 不应阻塞 NFR-05 的启动时间；窗口先可见，再在空闲回调里注册。
         self._hotkey_queue = queue.Queue()
-        self.root.after(50, self.setup_hotkeys)
-        self.root.after(50, self._poll_hotkey_queue)
-        self.root.after(120, self.setup_tray_icon)
+        self.root.after(300, self.setup_hotkeys)
+        self.root.after(300, self._poll_hotkey_queue)
+        self.root.after(450, self.setup_tray_icon)
+        # 图标绘制约 0.5 秒（PIL 3 个图标）：窗口先可见，再在空闲回调补图标
+        self.root.after(250, self._load_action_icons)
         if self.theme_mode == 'system':
             self._poll_system_theme()
         
@@ -901,6 +904,8 @@ class AutoClicker:
     def setup_logging(self):
         """CX-10：初始化磁盘日志（RotatingFileHandler，单文件 5MB × 5 备份）"""
         try:
+            import logging
+            from logging.handlers import RotatingFileHandler
             self.log_dir = os.path.expanduser("~/.auto_clicker_logs")
             os.makedirs(self.log_dir, exist_ok=True)
             log_file = os.path.join(self.log_dir, "autoclicker.log")
@@ -915,6 +920,10 @@ class AutoClicker:
                 self._file_logger.addHandler(fh)
             # 兼容旧控制台提示
             self._file_logger.info("自动点击工具启动 (Python 3.14)")
+            pending = getattr(self, '_pending_logs', [])
+            for msg in pending:
+                self._file_logger.info(msg)
+            pending.clear()
         except Exception as e:
             # 日志初始化失败不应阻断程序启动
             self._file_logger = None
@@ -925,6 +934,7 @@ class AutoClicker:
         try:
             if not os.path.exists(self.config_file):
                 return None
+            import shutil
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             backup = self.config_file + ".v1-backup-" + stamp
             shutil.copy2(self.config_file, backup)
@@ -1210,6 +1220,8 @@ class AutoClicker:
             ('stop_btn', '_icon_stop', 'stop', 18, 'danger'),
             ('test_btn', '_icon_target', 'target', 16, 'primary'),
         )
+        if not getattr(self, '_icons_ready', False):
+            return
         for btn_attr, icon_attr, kind, size, key in icon_specs:
             btn = getattr(self, btn_attr, None)
             if not btn:
@@ -1218,6 +1230,13 @@ class AutoClicker:
             if icon:
                 setattr(self, icon_attr, icon)
                 btn.configure(image=icon, compound=tk.LEFT)
+
+    def _load_action_icons(self):
+        """窗口可见后补绘操作按钮图标，避免 PIL 绘制阻塞首屏。"""
+        if getattr(self, '_icons_ready', False):
+            return
+        self._icons_ready = True
+        self._recolor_action_buttons(self._current_palette)
 
     def _apply_ttk_theme_styles(self, pal):
         """TH-01/TH-02：把语义调色板落到 ttk 全局样式，深色主题不能只改变量。
@@ -1614,6 +1633,7 @@ class AutoClicker:
             if IS_WINDOWS:
                 os.startfile(d)
             elif IS_LINUX:
+                import subprocess
                 subprocess.Popen(['xdg-open', d])
             else:
                 messagebox.showinfo("日志目录", d)
@@ -1655,6 +1675,7 @@ class AutoClicker:
     def export_run_stats(self):
         """将最近一次运行统计导出为 JSON / CSV（REQ-004）"""
         try:
+            from tkinter import filedialog
             stats = getattr(self, 'last_run_stats', None)
             if not stats or stats.get('click_count', 0) == 0:
                 messagebox.showinfo("提示", "暂无可导出的运行统计（请先完成至少一次点击）")
@@ -1763,6 +1784,7 @@ class AutoClicker:
 
     def profile_save(self):
         """CX-09：将当前参数保存为命名方案"""
+        from tkinter import simpledialog
         name = simpledialog.askstring("保存方案", "请输入方案名称：")
         if not name:
             return
@@ -1806,6 +1828,7 @@ class AutoClicker:
 
     def profile_export(self):
         try:
+            from tkinter import filedialog
             path = filedialog.asksaveasfilename(defaultextension=".json",
                                                filetypes=[("JSON", JSON_FILE_PATTERN)],
                                                title="导出配置方案")
@@ -1819,6 +1842,7 @@ class AutoClicker:
 
     def profile_import(self):
         try:
+            from tkinter import filedialog
             path = filedialog.askopenfilename(filetypes=[("JSON", JSON_FILE_PATTERN)], title="导入配置方案")
             if not path:
                 return
@@ -1871,6 +1895,7 @@ class AutoClicker:
                 
     def setup_ui(self):
         """设置现代化UI界面 - 采用卡片式布局和响应式设计"""
+        self._icons_ready = False
         # 设置窗口最小尺寸（与 __init__ 的 DPI 缩放值保持一致：CX-05）
         self.root.minsize(getattr(self, '_min_w', 700), getattr(self, '_min_h', 760))
         
@@ -2017,9 +2042,6 @@ class AutoClicker:
                                   activeforeground=self._color('on_success'),
                                   padx=12, pady=8, cursor='hand2',
                                   relief=tk.FLAT, bd=0)
-        self._icon_play = self.make_icon('play', 18, self._on_color('success'))
-        if self._icon_play:
-            self.start_btn.configure(image=self._icon_play, compound=tk.LEFT)
         self.start_btn.pack(side=tk.LEFT, padx=(0, 10), fill=tk.X, expand=True)
         
         self.stop_btn = tk.Button(main_control_frame, text=" 停止",
@@ -2030,9 +2052,6 @@ class AutoClicker:
                                  activeforeground=self._color('on_danger'),
                                  padx=12, pady=8, cursor='hand2',
                                  relief=tk.FLAT, bd=0, state=tk.DISABLED)
-        self._icon_stop = self.make_icon('stop', 18, self._on_color('danger'))
-        if self._icon_stop:
-            self.stop_btn.configure(image=self._icon_stop, compound=tk.LEFT)
         self.stop_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
         
         # 测试按钮
@@ -2044,9 +2063,6 @@ class AutoClicker:
                                  activeforeground=self._color('on_primary'),
                                  pady=6, cursor='hand2',
                                  relief=tk.FLAT, bd=0)
-        self._icon_target = self.make_icon('target', 16, self._on_color('primary'))
-        if self._icon_target:
-            self.test_btn.configure(image=self._icon_target, compound=tk.LEFT)
         self.test_btn.pack(fill=tk.X, pady=(5, 0))
         
         # ==================== 配置区域 - 两列布局 ====================
@@ -2606,6 +2622,7 @@ class AutoClicker:
                         pass
                 print("已设置Linux防休眠")
             elif IS_MACOS:
+                import subprocess
                 subprocess.run(["caffeinate", "-u", "-t", "1"], check=False,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 print("已设置macOS防休眠")
@@ -3474,6 +3491,10 @@ class AutoClicker:
                     self._file_logger.info(message)
                 except Exception:
                     pass
+            else:
+                pending = getattr(self, '_pending_logs', None)
+                if pending is not None:
+                    pending.append(message)
             # UI-04：写入缓冲区并按过滤条件渲染
             level = self._log_level(message)
             self._log_buffer.append((log_entry, level))
