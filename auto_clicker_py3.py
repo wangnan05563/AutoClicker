@@ -16,7 +16,7 @@ import queue
 import time
 import random
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # 点击抖动使用系统安全随机源，避免可预测的伪随机序列
 _RANDOM = random.SystemRandom()
@@ -902,6 +902,10 @@ class AutoClicker:
         self.jitter_pct = 0
         self.use_multi_points = False
         self.multi_points = []
+        # FR-D01 定时计划状态：Tk after 每秒检查；休眠唤醒后按单调时钟间隔补算
+        self._schedule_last_occurrence = None
+        self._schedule_active_occurrence = None
+        self._schedule_last_tick = time.monotonic()
 
         # P2 状态可视化默认值（UI-03）
         self.success_count = 0
@@ -928,6 +932,8 @@ class AutoClicker:
         self._init_ui_fonts()
         self.setup_ui()
         self.root.after(30, self._poll_ui_queue)
+        # FR-D01 定时计划：Tk 主线程每秒检查一次（休眠期间 after 暂停，唤醒后补算）
+        self.root.after(1000, self._schedule_tick)
         # 磁盘日志延后到窗口可见后：logging.handlers 会拉入 shutil/socket/pickle，
         # 冷启动不必为首屏承担该导入成本；此前日志先入 _pending_logs，初始化后补写。
         self.root.after(250, self.setup_logging)
@@ -1039,6 +1045,9 @@ class AutoClicker:
             'use_multi_points': False,  # 使用多点位序列
             'multi_points': [],  # 多点位坐标列表 [{'x':, 'y':}, ...]
             'theme_mode': 'light',  # 主题：light / dark / system（TH-01/TH-03）
+            # FR-D01 定时计划：每日 HH:MM 启动、运行 N 分钟后停止、仅工作日；跨零点/休眠补算
+            'schedule': {'enabled': False, 'start_at': '09:00',
+                         'stop_after_min': 0, 'weekdays': [1, 2, 3, 4, 5]},
             'config_version': 2  # 配置 schema 版本（CX-09 迁移用）
         }
         
@@ -1070,6 +1079,15 @@ class AutoClicker:
                 self.config['profiles'] = {}
             if 'current_profile' not in self.config:
                 self.config['current_profile'] = None
+            # FR-D01：旧配置补齐 schedule 子字段，避免部分字段缺失导致定时线程误判
+            sched = self.config.get('schedule')
+            if not isinstance(sched, dict):
+                sched = {}
+            sched.setdefault('enabled', False)
+            sched.setdefault('start_at', '09:00')
+            sched.setdefault('stop_after_min', 0)
+            sched.setdefault('weekdays', [1, 2, 3, 4, 5])
+            self.config['schedule'] = sched
         except Exception:
             pass
 
@@ -1495,9 +1513,166 @@ class AutoClicker:
                 self.config['failsafe_enabled'] = self.failsafe_var.get()
                 self.config['target_window_keyword'] = self.target_window_var.get().strip()
                 self.config['close_to_tray'] = self.close_to_tray_var.get()
+            # FR-D01：定时计划输入一并持久化（非法值保留上一次有效配置）
+            if hasattr(self, 'schedule_start_var'):
+                sched = dict(self.config.get('schedule') or {})
+                sched['enabled'] = self.schedule_enabled_var.get()
+                sched['start_at'] = self.schedule_start_var.get().strip()
+                try:
+                    sched['stop_after_min'] = max(0, int(self.schedule_stop_var.get() or 0))
+                except ValueError:
+                    pass
+                sched['weekdays'] = self._label_to_weekdays(self.schedule_days_var.get())
+                self.config['schedule'] = sched
             self.save_config()
         except Exception as e:
             print(MSG_SAVE_CONFIG_FAILED + str(e))
+
+    # ==================== FR-D01 定时计划 ====================
+    @staticmethod
+    def _weekdays_to_label(weekdays):
+        try:
+            days = sorted(set(int(d) for d in weekdays))
+        except (TypeError, ValueError):
+            days = [1, 2, 3, 4, 5]
+        if days == [1, 2, 3, 4, 5, 6, 7]:
+            return '每天'
+        if days == [1, 2, 3, 4, 5]:
+            return '工作日'
+        if days == [6, 7]:
+            return '周末'
+        return '工作日'
+
+    @staticmethod
+    def _label_to_weekdays(label):
+        return {'每天': [1, 2, 3, 4, 5, 6, 7],
+                '工作日': [1, 2, 3, 4, 5],
+                '周末': [6, 7]}.get(label or '工作日', [1, 2, 3, 4, 5])
+
+    @staticmethod
+    def _parse_schedule_start(value):
+        parts = str(value or '').strip().replace('：', ':').split(':')
+        if len(parts) != 2:
+            raise ValueError('时间格式需为 HH:MM')
+        hour, minute = int(parts[0]), int(parts[1])
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError('时间需在 00:00–23:59')
+        return hour, minute
+
+    def _schedule_settings(self):
+        sched = self.config.get('schedule')
+        if not isinstance(sched, dict):
+            sched = {}
+        try:
+            start = self._parse_schedule_start(sched.get('start_at', '09:00'))
+        except (TypeError, ValueError):
+            start = (9, 0)
+        try:
+            stop_min = max(0, int(sched.get('stop_after_min', 0) or 0))
+        except (TypeError, ValueError):
+            stop_min = 0
+        days = sched.get('weekdays', [1, 2, 3, 4, 5])
+        try:
+            days = [int(d) for d in days if 1 <= int(d) <= 7]
+        except (TypeError, ValueError):
+            days = [1, 2, 3, 4, 5]
+        return bool(sched.get('enabled', False)), start, stop_min, days
+
+    def _schedule_occurrence(self, now, start, days):
+        """返回 <= now 的最近一次生效计划（含跨零点前一天）。"""
+        hh, mm = start
+        base = datetime.combine(now.date(), datetime.min.time()).replace(hour=hh, minute=mm)
+        candidates = []
+        for delta in (-1, 0):
+            occ = base + timedelta(days=delta)
+            if occ.isoweekday() in days and occ <= now:
+                candidates.append(occ)
+        return max(candidates) if candidates else None
+
+    def _schedule_next_text(self, now=None):
+        _, start, stop_min, days = self._schedule_settings()
+        now = now or datetime.now()
+        hh, mm = start
+        base = datetime.combine(now.date(), datetime.min.time()).replace(hour=hh, minute=mm)
+        for delta in range(0, 8):
+            occ = base + timedelta(days=delta)
+            if occ.isoweekday() in days and occ > now:
+                return occ.strftime('%m-%d %H:%M')
+        return '--'
+
+    def _schedule_check(self, now=None, running=None):
+        """执行一次定时判断。返回 started/stopped/noop，供探针断言。"""
+        enabled, start, stop_min, days = self._schedule_settings()
+        if not enabled:
+            self._schedule_active_occurrence = None
+            return 'noop'
+        now = now or datetime.now()
+        running = self.is_running if running is None else running
+        occ = self._schedule_occurrence(now, start, days)
+        result = 'noop'
+        if occ is not None:
+            key = occ.isoformat(timespec='minutes')
+            grace_end = occ + timedelta(minutes=stop_min if stop_min > 0 else 5)
+            if (not running and now <= grace_end and key != self._schedule_last_occurrence):
+                self._schedule_last_occurrence = key
+                self._schedule_active_occurrence = key
+                self.start_clicking()
+                if self.is_running:
+                    self.log_message("定时计划触发：%s 启动" % occ.strftime('%m-%d %H:%M'))
+                    result = 'started'
+                else:
+                    self._schedule_active_occurrence = None
+                    self.log_message("定时计划触发失败：启动参数校验未通过")
+            if running and stop_min > 0 and self._schedule_active_occurrence == key:
+                stop_at = occ + timedelta(minutes=stop_min)
+                if now >= stop_at:
+                    self._schedule_active_occurrence = None
+                    self.stop_clicking(reason="定时计划运行 %d 分钟结束" % stop_min)
+                    result = 'stopped'
+        return result
+
+    def _schedule_tick(self):
+        """每秒检查；Tk after 在系统休眠时暂停，唤醒后用单调时钟差值识别并补算。"""
+        try:
+            mono = time.monotonic()
+            gap = mono - self._schedule_last_tick
+            self._schedule_last_tick = mono
+            if gap > 90 and self.config.get('schedule', {}).get('enabled'):
+                self.log_message("检测到系统休眠/卡顿 %.0f 秒，补算定时计划" % gap)
+            self._schedule_check()
+        except Exception as e:
+            print("定时计划检查失败: " + str(e))
+        finally:
+            try:
+                self.root.after(1000, self._schedule_tick)
+            except Exception:
+                pass
+
+    def on_schedule_apply(self):
+        try:
+            start = self._parse_schedule_start(self.schedule_start_var.get())
+            stop_min = int(self.schedule_stop_var.get() or 0)
+            if stop_min < 0 or stop_min > 1440:
+                raise ValueError('运行时长需为 0–1440 分钟')
+            days = self._label_to_weekdays(self.schedule_days_var.get())
+            sched = {'enabled': bool(self.schedule_enabled_var.get()),
+                     'start_at': '%02d:%02d' % start,
+                     'stop_after_min': stop_min, 'weekdays': days}
+            self.config['schedule'] = sched
+            self._schedule_last_occurrence = None
+            self._schedule_active_occurrence = None
+            self.save_config()
+            if sched['enabled']:
+                text = "定时计划已启用：%s 启动，运行 %s 分钟，%s；下次 %s" % (
+                    sched['start_at'], stop_min if stop_min else '不限',
+                    self.schedule_days_var.get(), self._schedule_next_text())
+                self.schedule_hint_label.config(text=text)
+                self.log_message(text)
+            else:
+                self.schedule_hint_label.config(text="定时计划已关闭")
+                self.log_message("定时计划已关闭")
+        except Exception as e:
+            messagebox.showerror("定时计划", "参数无效: " + str(e))
     
     def on_prevent_sleep_changed(self):
         """防止系统锁屏选项改变时的回调（即时启停后台保活）"""
@@ -1946,6 +2121,11 @@ class AutoClicker:
             self.autostart_var.set(self.config.get('autostart', False))
             self.hotkey_start_var.set(self.config.get('hotkey_start', 'f6'))
             self.hotkey_emergency_var.set(self.config.get('hotkey_emergency', 'f8'))
+            sched = self.config.get('schedule') or {}
+            self.schedule_enabled_var.set(bool(sched.get('enabled', False)))
+            self.schedule_start_var.set(str(sched.get('start_at', '09:00')))
+            self.schedule_stop_var.set(str(sched.get('stop_after_min', 0)))
+            self.schedule_days_var.set(self._weekdays_to_label(sched.get('weekdays', [1, 2, 3, 4, 5])))
             self._refresh_multi_point_listbox()
         except Exception as e:
             print("回填 UI 失败: " + str(e))
@@ -2406,6 +2586,28 @@ class AutoClicker:
         self.hotkey_emergency_var = tk.StringVar(value=self.config.get('hotkey_emergency', 'f8'))
         ttk.Entry(hk_row, textvariable=self.hotkey_emergency_var, width=8).pack(side=tk.LEFT, padx=(5, 10))
         ttk.Button(hk_row, text="应用热键", command=self.on_hotkey_apply).pack(side=tk.LEFT)
+
+        # FR-D01 定时计划（每日 HH:MM 启动 / 运行 N 分钟后停止 / 工作日）
+        sched_cfg = self.config.get('schedule') or {}
+        sched_row = ttk.Frame(p1b_card)
+        sched_row.pack(fill=tk.X, pady=(0, 6))
+        self.schedule_enabled_var = tk.BooleanVar(value=bool(sched_cfg.get('enabled', False)))
+        ttk.Checkbutton(sched_row, text="定时计划", variable=self.schedule_enabled_var).pack(side=tk.LEFT)
+        ttk.Label(sched_row, text="启动 HH:MM").pack(side=tk.LEFT, padx=(6, 2))
+        self.schedule_start_var = tk.StringVar(value=str(sched_cfg.get('start_at', '09:00')))
+        ttk.Entry(sched_row, textvariable=self.schedule_start_var, width=7,
+                  justify='center').pack(side=tk.LEFT)
+        ttk.Label(sched_row, text="运行(分)").pack(side=tk.LEFT, padx=(8, 2))
+        self.schedule_stop_var = tk.StringVar(value=str(sched_cfg.get('stop_after_min', 0)))
+        ttk.Entry(sched_row, textvariable=self.schedule_stop_var, width=5,
+                  justify='center').pack(side=tk.LEFT)
+        self.schedule_days_var = tk.StringVar(
+            value=self._weekdays_to_label(sched_cfg.get('weekdays', [1, 2, 3, 4, 5])))
+        ttk.Combobox(sched_row, textvariable=self.schedule_days_var, width=7,
+                     values=['每天', '工作日', '周末'], state='readonly').pack(side=tk.LEFT, padx=(8, 2))
+        ttk.Button(sched_row, text="应用计划", command=self.on_schedule_apply).pack(side=tk.LEFT)
+        self.schedule_hint_label = ttk.Label(p1b_card, text="", font=('微软雅黑', 9))
+        self.schedule_hint_label.pack(anchor=tk.W)
 
         prof_row = ttk.Frame(p1b_card)
         prof_row.pack(fill=tk.X, pady=(0, 6))
