@@ -209,9 +209,10 @@ def _ydotool_click(x, y, button='left', hold_ms=0):
         return False
     code = _YDOTOOL_BUTTONS.get(button, _YDOTOOL_BUTTONS['left'])
     if button == 'double':
-        return (_ydotool_run(['click', code]) and
-                (time.sleep(0.03) or True) and
-                _ydotool_run(['click', code]))
+        first = _ydotool_run(['click', code])
+        time.sleep(0.03)
+        second = _ydotool_run(['click', code])
+        return first and second
     if hold_ms > 0:
         if not _ydotool_run(['mousedown', code]):
             return False
