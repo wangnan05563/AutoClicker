@@ -3980,7 +3980,30 @@ def setup_dpi_awareness():
             pass
 
 
+def get_app_version():
+    """读取构建版本号（package.json）；打包后从 PyInstaller 资源目录读取。"""
+    import json as _json
+    candidates = []
+    bundle = getattr(sys, '_MEIPASS', None)
+    if bundle:
+        candidates.append(os.path.join(bundle, 'package.json'))
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'package.json'))
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'package.json'))
+    for path in candidates:
+        try:
+            with open(path, 'r', encoding='utf-8-sig') as f:
+                version = (_json.load(f) or {}).get('version')
+            if version:
+                return str(version)
+        except (OSError, ValueError):
+            continue
+    return '20261115-001'
+
+
 def main():
+    if '--version' in sys.argv or '-V' in sys.argv:
+        print("AutoClicker %s" % get_app_version())
+        return
     if not IS_SINGLE_INSTANCE:
         activate_existing_window()
         show_single_instance_warning()
