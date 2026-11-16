@@ -18,6 +18,25 @@ import random
 import json
 from datetime import datetime, timedelta
 
+# NFR-09 引擎层（纯逻辑、无 tkinter）：本文件保留 UI/平台编排，纯计算下沉到 auto_clicker_layers.engine
+from auto_clicker_layers.engine import (
+    target_window_matches,
+    effective_interval_seconds as _engine_effective_interval_seconds,
+    jittered_wait as _engine_jittered_wait,
+    validate_interval as _engine_validate_interval,
+    validate_countdown as _engine_validate_countdown,
+    validate_click_limit as _engine_validate_click_limit,
+    validate_duration_limit as _engine_validate_duration_limit,
+    validate_jitter as _engine_validate_jitter,
+    validate_hold_ms as _engine_validate_hold_ms,
+    parse_schedule_start as _engine_parse_schedule_start,
+    weekdays_to_label as _engine_weekdays_to_label,
+    label_to_weekdays as _engine_label_to_weekdays,
+    schedule_occurrence as _engine_schedule_occurrence,
+    schedule_grace_end as _engine_schedule_grace_end,
+    schedule_next_text as _engine_schedule_next_text,
+)
+
 # 点击抖动使用系统安全随机源，避免可预测的伪随机序列
 _RANDOM = random.SystemRandom()
 
@@ -26,14 +45,6 @@ PLATFORM = sys.platform
 IS_WINDOWS = PLATFORM == 'win32'
 IS_LINUX = PLATFORM.startswith('linux')
 IS_MACOS = PLATFORM == 'darwin'
-
-
-def target_window_matches(keyword, title, process_name=''):
-    """FR-E03：目标窗口关键字匹配（标题或进程名，大小写不敏感）。空关键字=不校验。"""
-    key = (keyword or '').strip().lower()
-    if not key:
-        return True
-    return key in (title or '').lower() or key in (process_name or '').lower()
 
 
 def get_foreground_window_info():
@@ -1531,33 +1542,15 @@ class AutoClicker:
     # ==================== FR-D01 定时计划 ====================
     @staticmethod
     def _weekdays_to_label(weekdays):
-        try:
-            days = sorted(set(int(d) for d in weekdays))
-        except (TypeError, ValueError):
-            days = [1, 2, 3, 4, 5]
-        if days == [1, 2, 3, 4, 5, 6, 7]:
-            return '每天'
-        if days == [1, 2, 3, 4, 5]:
-            return '工作日'
-        if days == [6, 7]:
-            return '周末'
-        return '工作日'
+        return _engine_weekdays_to_label(weekdays)
 
     @staticmethod
     def _label_to_weekdays(label):
-        return {'每天': [1, 2, 3, 4, 5, 6, 7],
-                '工作日': [1, 2, 3, 4, 5],
-                '周末': [6, 7]}.get(label or '工作日', [1, 2, 3, 4, 5])
+        return _engine_label_to_weekdays(label)
 
     @staticmethod
     def _parse_schedule_start(value):
-        parts = str(value or '').strip().replace('：', ':').split(':')
-        if len(parts) != 2:
-            raise ValueError('时间格式需为 HH:MM')
-        hour, minute = int(parts[0]), int(parts[1])
-        if not (0 <= hour <= 23 and 0 <= minute <= 59):
-            raise ValueError('时间需在 00:00–23:59')
-        return hour, minute
+        return _engine_parse_schedule_start(value)
 
     def _schedule_settings(self):
         sched = self.config.get('schedule')
@@ -1580,25 +1573,11 @@ class AutoClicker:
 
     def _schedule_occurrence(self, now, start, days):
         """返回 <= now 的最近一次生效计划（含跨零点前一天）。"""
-        hh, mm = start
-        base = datetime.combine(now.date(), datetime.min.time()).replace(hour=hh, minute=mm)
-        candidates = []
-        for delta in (-1, 0):
-            occ = base + timedelta(days=delta)
-            if occ.isoweekday() in days and occ <= now:
-                candidates.append(occ)
-        return max(candidates) if candidates else None
+        return _engine_schedule_occurrence(now, start, days)
 
     def _schedule_next_text(self, now=None):
         _, start, stop_min, days = self._schedule_settings()
-        now = now or datetime.now()
-        hh, mm = start
-        base = datetime.combine(now.date(), datetime.min.time()).replace(hour=hh, minute=mm)
-        for delta in range(0, 8):
-            occ = base + timedelta(days=delta)
-            if occ.isoweekday() in days and occ > now:
-                return occ.strftime('%m-%d %H:%M')
-        return '--'
+        return _engine_schedule_next_text(now or datetime.now(), start, days)
 
     def _schedule_check(self, now=None, running=None):
         """执行一次定时判断。返回 started/stopped/noop，供探针断言。"""
@@ -1612,7 +1591,7 @@ class AutoClicker:
         result = 'noop'
         if occ is not None:
             key = occ.isoformat(timespec='minutes')
-            grace_end = occ + timedelta(minutes=stop_min if stop_min > 0 else 5)
+            grace_end = _engine_schedule_grace_end(occ, stop_min)
             if (not running and now <= grace_end and key != self._schedule_last_occurrence):
                 self._schedule_last_occurrence = key
                 self._schedule_active_occurrence = key
@@ -3080,14 +3059,10 @@ class AutoClicker:
         val = getattr(self, 'interval_seconds_cache', None)
         if val is None:
             try:
-                val = float(self.interval_var.get())
-            except ValueError:
+                val = self.interval_var.get()
+            except Exception:
                 val = 1.0
-        if val < 0:
-            val = 0.0
-        if self.interval_unit == 'ms':
-            return val / 1000.0
-        return val
+        return _engine_effective_interval_seconds(val, self.interval_unit)
 
     def _on_interval_hot_update(self, *args):
         """FR-A03：运行中修改间隔后防抖 120ms 生效，避免逐字符改缓存。"""
@@ -3120,13 +3095,7 @@ class AutoClicker:
 
     def _jittered_wait(self, base_seconds):
         """返回叠加 jitter 后的等待秒数。"""
-        if base_seconds <= 0:
-            return 0.0
-        jp = self.jitter_pct
-        if jp and jp > 0:
-            factor = 1.0 + _RANDOM.uniform(-jp / 100.0, jp / 100.0)
-            return max(0.0, base_seconds * factor)
-        return base_seconds
+        return _engine_jittered_wait(base_seconds, self.jitter_pct, _RANDOM)
 
     def _wait_interval(self, base_seconds):
         """按 jitter 随机化后分段等待，期间可响应停止、failsafe 与参数热更新"""
@@ -3312,81 +3281,54 @@ class AutoClicker:
                 
     def _read_interval(self):
         """读取并校验点击间隔，非法时行内红字提示并返回 None。"""
-        try:
-            value = int(self.interval_var.get())
-        except ValueError:
-            self.show_field_error("点击间隔必须为整数")
-            return None
-        if value < 1:
-            self.show_field_error("点击间隔必须 >= 1")
-            return None
-        if value > 3600:
-            self.show_field_error("点击间隔必须 <= 3600")
+        value, error = _engine_validate_interval(self.interval_var.get())
+        if error:
+            self.show_field_error(error)
             return None
         self.clear_field_error()
         return value
 
     def _read_countdown(self):
         """读取并校验启动倒计时（0-5 秒）。"""
-        try:
-            value = int(self.countdown_var.get())
-        except ValueError:
-            self.show_field_error("启动倒计时必须为整数")
-            return None
-        if value < 0 or value > 5:
-            self.show_field_error("启动倒计时必须在 0-5 秒之间")
+        value, error = _engine_validate_countdown(self.countdown_var.get())
+        if error:
+            self.show_field_error(error)
             return None
         self.clear_field_error()
         return value
 
     def _read_click_limit(self):
         """读取并校验点击次数上限（0 表示无限）。"""
-        try:
-            value = int(self.click_limit_var.get())
-        except ValueError:
-            self.show_field_error("点击次数上限必须为整数")
-            return None
-        if value < 0:
-            self.show_field_error("点击次数上限不能为负数")
+        value, error = _engine_validate_click_limit(self.click_limit_var.get())
+        if error:
+            self.show_field_error(error)
             return None
         self.clear_field_error()
         return value
 
     def _read_duration_limit(self):
         """读取并校验运行时长上限（分钟，0 表示无限）。"""
-        try:
-            value = int(self.duration_limit_var.get())
-        except ValueError:
-            self.show_field_error("运行时长上限必须为整数")
-            return None
-        if value < 0:
-            self.show_field_error("运行时长上限不能为负数")
+        value, error = _engine_validate_duration_limit(self.duration_limit_var.get())
+        if error:
+            self.show_field_error(error)
             return None
         self.clear_field_error()
         return value
 
     def _read_jitter(self):
         """读取并校验随机抖动百分比（0-100）。"""
-        try:
-            value = int(self.jitter_var.get())
-        except ValueError:
-            self.show_field_error("随机抖动必须为整数")
-            return None
-        if value < 0 or value > 100:
-            self.show_field_error("随机抖动必须在 0-100 之间")
+        value, error = _engine_validate_jitter(self.jitter_var.get())
+        if error:
+            self.show_field_error(error)
             return None
         self.clear_field_error()
         return value
 
     def _read_hold_ms(self):
         """读取并校验按住时长（毫秒）。"""
-        try:
-            value = int(self.hold_ms_var.get())
-        except ValueError:
-            self.show_field_error("按住时长必须为整数")
-            return None
-        if value < 0:
-            self.show_field_error("按住时长不能为负数")
+        value, error = _engine_validate_hold_ms(self.hold_ms_var.get())
+        if error:
+            self.show_field_error(error)
             return None
         self.clear_field_error()
         return value
