@@ -2502,6 +2502,13 @@ class AutoClicker:
         
     def prevent_system_sleep(self):
         """跨平台防止系统休眠"""
+        # 高频点击时每次循环都调用 SetThreadExecutionState 会引入额外开销，
+        # 把重复调用节流到 1 秒一次，既保持防休眠效果又不拖慢毫秒级间隔。
+        now = time.monotonic()
+        last = getattr(self, '_prevent_sleep_last_at', 0)
+        if now - last < 1.0:
+            return
+        self._prevent_sleep_last_at = now
         try:
             if IS_WINDOWS:
                 import ctypes
@@ -2874,10 +2881,30 @@ class AutoClicker:
             time.sleep(0.2)
         return False
 
+    def _wait_exact(self, seconds):
+        """高精度等待：短间隔用 sleep + 自旋补齐，避免 Windows 定时器粒度造成漂移。"""
+        if seconds <= 0:
+            return self.is_running
+        deadline = time.perf_counter() + seconds
+        while self.is_running:
+            if self._interval_change_event.is_set():
+                self._interval_change_event.clear()
+                return True
+            remain = deadline - time.perf_counter()
+            if remain <= 0:
+                break
+            if remain > 0.004:
+                time.sleep(min(max(0.0005, remain - 0.003), 0.05))
+            else:
+                time.sleep(0.0002)
+        return self.is_running
+
     def click_loop(self):
         # 多点位序列模式（FN-03）
         points = self.multi_points if self.use_multi_points else None
         point_idx = 0
+        last_click_at = None
+        lead_est = 0.001  # 等待结束到点击动作之间的预估开销，按实测自适应
         while self.is_running:
             try:
                 base = self._effective_interval_seconds()
@@ -2888,8 +2915,15 @@ class AutoClicker:
                 failsafe_base = get_cursor_pos() if self.failsafe_enabled else None
 
                 # 等待一个间隔（含随机抖动），期间可响应停止（CX-07）
-                if not self._wait_interval(base):
-                    break
+                # 短间隔按“上次点击时刻 + 间隔”排程，补偿点击/校验开销，避免累积漂移。
+                scheduled_target = None
+                if base <= 0.05 and last_click_at is not None:
+                    scheduled_target = last_click_at + self._jittered_wait(base) - lead_est
+                    if not self._wait_exact(scheduled_target - time.perf_counter()):
+                        break
+                else:
+                    if not self._wait_interval(base):
+                        break
 
                 # 安全：运行中若开启 failsafe 且鼠标被移动 >20px，立即急停（CX-01）
                 if self.failsafe_enabled and self.is_running and self._failsafe_triggered(failsafe_base):
@@ -2903,7 +2937,12 @@ class AutoClicker:
                 # 计算本次点击坐标并执行（含鼠标跟随/仅移动模式）
                 x, y, point_idx = self._next_click_point(points, point_idx)
                 self._move_before_click(x, y)
+                click_at = time.perf_counter()
                 self._click_once_at(x, y)
+                last_click_at = click_at
+                if scheduled_target is not None:
+                    excess = click_at - scheduled_target
+                    lead_est = 0.7 * lead_est + 0.3 * max(0.0, min(excess, base))
 
                 # 安全：点击次数 / 运行时长上限（CX-02）
                 if self._limit_reached():
