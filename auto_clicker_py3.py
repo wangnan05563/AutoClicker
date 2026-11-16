@@ -170,17 +170,40 @@ def detect_input_backend():
 
 
 # ==================== 核心依赖 ====================
-try:
-    import pyautogui
-except ImportError:
-    print("请安装依赖: pip install pyautogui")
-    sys.exit(1)
+# pyautogui 仅作为无原生输入后端时的降级路径。顶部 import 会串行加载
+# mouseinfo/pyscreeze/pygetwindow，实测拖慢冷启动 8 秒以上；改为首次使用时懒加载。
+_PYAUTOGUI = None
+_PYAUTOGUI_LOADED = False
 
-try:
-    import keyboard
-except ImportError:
-    keyboard = None
-    print("keyboard模块未安装，快捷键功能将不可用")
+
+def _get_pyautogui():
+    global _PYAUTOGUI, _PYAUTOGUI_LOADED
+    if not _PYAUTOGUI_LOADED:
+        _PYAUTOGUI_LOADED = True
+        try:
+            import pyautogui as _pg
+            _PYAUTOGUI = _pg
+        except ImportError:
+            _PYAUTOGUI = None
+            print("pyautogui 未安装，非原生输入后端将不可用")
+    return _PYAUTOGUI
+
+keyboard = None
+_KEYBOARD_LOADED = False
+
+
+def _get_keyboard():
+    """延迟导入 keyboard：冷启动时省掉约 1.3 秒全局钩子初始化，窗口显示后再注册。"""
+    global keyboard, _KEYBOARD_LOADED
+    if not _KEYBOARD_LOADED:
+        _KEYBOARD_LOADED = True
+        try:
+            import keyboard as _kb
+            keyboard = _kb
+        except ImportError:
+            keyboard = None
+            print("keyboard模块未安装，快捷键功能将不可用")
+    return keyboard
 
 # ==================== Windows 特定依赖 ====================
 HAS_WIN32GUI = False
@@ -305,18 +328,14 @@ def linux_move_mouse(x, y):
             return True
         except Exception as e:
             print(f"Linux移动鼠标失败：{e}")
-            # 降级使用 pyautogui
-            try:
-                pyautogui.moveTo(x, y)
-                return True
-            except Exception:
-                return False
-    else:
-        try:
-            pyautogui.moveTo(x, y)
-            return True
-        except Exception:
-            return False
+    pg = _get_pyautogui()
+    if pg is None:
+        return False
+    try:
+        pg.moveTo(x, y)
+        return True
+    except Exception:
+        return False
 
 def linux_click(x, y, button='left', hold_ms=0):
     """使用 X11 API 执行鼠标点击（银河麒麟兼容，支持左/右/中键、双击与按住时长）"""
@@ -356,10 +375,13 @@ def linux_click(x, y, button='left', hold_ms=0):
 
 def _pyautogui_click(x, y, button):
     """pyautogui 降级点击（无 X11 或异常时）"""
+    pg = _get_pyautogui()
+    if pg is None:
+        return False
     try:
-        pyautogui.click(x, y,
-                       button={'left': 'left', 'right': 'right', 'middle': 'middle'}.get(button, 'left'),
-                       clicks=2 if button == 'double' else 1)
+        pg.click(x, y,
+                  button={'left': 'left', 'right': 'right', 'middle': 'middle'}.get(button, 'left'),
+                  clicks=2 if button == 'double' else 1)
         return True
     except Exception:
         return False
@@ -377,7 +399,10 @@ def linux_get_cursor_pos():
             return x, y
         except Exception:
             pass
-    return pyautogui.position()
+    pg = _get_pyautogui()
+    if pg is None:
+        return (0, 0)
+    return pg.position()
 
 def get_cursor_pos():
     """跨平台获取鼠标位置"""
@@ -386,7 +411,10 @@ def get_cursor_pos():
     elif IS_LINUX:
         return linux_get_cursor_pos()
     else:
-        return pyautogui.position()
+        pg = _get_pyautogui()
+        if pg is None:
+            return (0, 0)
+        return pg.position()
 
 def move_mouse(x, y):
     """跨平台移动鼠标"""
@@ -395,7 +423,10 @@ def move_mouse(x, y):
     elif IS_LINUX:
         return linux_move_mouse(x, y)
     else:
-        pyautogui.moveTo(x, y)
+        pg = _get_pyautogui()
+        if pg is None:
+            return False
+        pg.moveTo(x, y)
         return True
 
 def click_mouse(x, y, button='left', hold_ms=0):
@@ -679,9 +710,13 @@ class NoticeBar:
 ERROR_ALREADY_EXISTS = 183
 
 # 单实例检查 - 使用互斥锁
-SINGLE_INSTANCE_MUTEX_NAME = "AutoClicker_SingleInstance_Mutex"
+# 允许通过环境变量覆盖互斥名/窗口标题，便于隔离测试与多版本并行启动；
+# 未设置时保持生产默认值不变。
+SINGLE_INSTANCE_MUTEX_NAME = os.environ.get(
+    "AUTOCLICKER_MUTEX_NAME", "AutoClicker_SingleInstance_Mutex")
 SINGLE_INSTANCE_LOCK_FILE = os.path.expanduser("~/.autoclicker.lock")
-WINDOW_TITLE = "桌面自动点击工具 v2.0.2 (Python 3.14)"
+WINDOW_TITLE = os.environ.get(
+    "AUTOCLICKER_WINDOW_TITLE", "桌面自动点击工具 v2.0.2 (Python 3.14)")
 IS_SINGLE_INSTANCE = True
 EXISTING_WINDOW_HWND = None
 SINGLE_INSTANCE_LOCK_FD = None
@@ -836,11 +871,12 @@ class AutoClicker:
             except Exception:
                 pass
             self.log_message("Wayland 降级：启动已禁用（会话=%s）" % self.input_session)
-        # 热键回调运行在 keyboard 监听线程，不能直接碰 Tk；用队列交给主线程执行
+        # 热键/托盘初始化延迟到主窗口首次显示后：keyboard 全局钩子导入约 1.3 秒，
+        # 不应阻塞 NFR-05 的启动时间；窗口先可见，再在空闲回调里注册。
         self._hotkey_queue = queue.Queue()
-        self.setup_hotkeys()
+        self.root.after(50, self.setup_hotkeys)
         self.root.after(50, self._poll_hotkey_queue)
-        self.setup_tray_icon()
+        self.root.after(120, self.setup_tray_icon)
         if self.theme_mode == 'system':
             self._poll_system_theme()
         
@@ -2354,23 +2390,24 @@ class AutoClicker:
         只能在主线程访问，否则会抛「main thread is not in main loop」，
         表现为物理 F6/F8/Esc 按了没反应。这里统一投递到主线程队列。
         """
-        if not keyboard:
+        kb = _get_keyboard()
+        if not kb:
             return
         if not hasattr(self, '_hotkey_queue'):
             self._hotkey_queue = queue.Queue()
         # 清除旧热键，避免重复注册
         for k in getattr(self, '_hk_keys', []):
             try:
-                keyboard.remove_hotkey(k)
+                kb.remove_hotkey(k)
             except Exception:
                 pass
         self._hk_keys = []
         try:
             start_k = self.config.get('hotkey_start', 'f6')
             emer_k = self.config.get('hotkey_emergency', 'f8')
-            keyboard.add_hotkey(start_k, lambda: self._hotkey_queue.put('toggle'))
-            keyboard.add_hotkey(emer_k, lambda: self._hotkey_queue.put('emergency'))
-            keyboard.add_hotkey('esc', lambda: self._hotkey_queue.put('emergency'))
+            kb.add_hotkey(start_k, lambda: self._hotkey_queue.put('toggle'))
+            kb.add_hotkey(emer_k, lambda: self._hotkey_queue.put('emergency'))
+            kb.add_hotkey('esc', lambda: self._hotkey_queue.put('emergency'))
             self._hk_keys = [start_k, emer_k, 'esc']
             print("快捷键已注册：启动=" + start_k + "，紧急停止=" + emer_k + "，Esc")
         except Exception as e:
@@ -2838,8 +2875,10 @@ class AutoClicker:
         if ok:
             self.log_message(f"在位置 ({x}, {y}) 执行点击[按键={self.click_button}]")
         else:
-            pyautogui.click(x, y)
-            self.log_message(f"使用pyautogui在位置 ({x}, {y}) 执行点击")
+            if _pyautogui_click(x, y, self.click_button):
+                self.log_message(f"使用pyautogui在位置 ({x}, {y}) 执行点击")
+            else:
+                self.log_message(f"点击失败且 pyautogui 不可用: ({x}, {y})")
         self.click_count += 1
         self.success_count = self.click_count
         self._ui(self.click_count_label.config, text=str(self.click_count))
