@@ -36,221 +36,70 @@ from auto_clicker_layers.engine import (
     schedule_grace_end as _engine_schedule_grace_end,
     schedule_next_text as _engine_schedule_next_text,
 )
+from auto_clicker_layers.theme import (
+    THEMES as _THEME_PALETTES,
+    shade_color as _theme_shade,
+    system_is_dark as _theme_system_is_dark,
+    resolve_palette as _theme_resolve_palette,
+)
+from auto_clicker_layers.config import (
+    clone_defaults as _config_clone_defaults,
+    read_config as _config_read,
+    normalize_config as _config_normalize,
+    config_version as _config_version,
+    backup_config as _config_backup,
+    write_config as _config_write,
+)
 
 # 点击抖动使用系统安全随机源，避免可预测的伪随机序列
 _RANDOM = random.SystemRandom()
 
-# ==================== 平台检测 ====================
-PLATFORM = sys.platform
-IS_WINDOWS = PLATFORM == 'win32'
-IS_LINUX = PLATFORM.startswith('linux')
-IS_MACOS = PLATFORM == 'darwin'
+# ==================== 平台层（auto_clicker_layers.platform_io）====================
+# NFR-09：平台探测、系统设置恢复、鼠标输入后端（Win32/X11/ydotool/pyautogui）已下沉到
+# auto_clicker_layers/platform_io.py；本文件只保留 UI 编排与热键注册。
+from auto_clicker_layers import platform_io as _platform
+from auto_clicker_layers.platform_io import (
+    PLATFORM, IS_WINDOWS, IS_LINUX, IS_MACOS,
+    HAS_WIN32GUI, HAS_WIN32API, HAS_X11, HAS_PYSTRAY, HAS_PIL,
+    get_foreground_window_info,
+    restore_system_settings,
+    install_setting_restore_guards,
+    detect_input_backend,
+    _is_wayland_session,
+    _ydotool_run,
+    _ydotool_move,
+    _ydotool_click,
+    _get_pyautogui,
+    windows_move_mouse,
+    windows_click,
+    linux_move_mouse,
+    linux_click,
+    linux_get_cursor_pos,
+    get_cursor_pos,
+    move_mouse,
+    click_mouse,
+)
 
+# 平台层内部已做可用性探测；UI 层托盘/单实例仍需直接引用这些模块名，这里按同一条件导入。
+import ctypes
+if HAS_WIN32GUI:
+    import win32gui
+    import win32con
+    import win32api
+    import win32event
+    import win32security
+    import pywintypes
 
-def get_foreground_window_info():
-    """返回当前前台窗口 (title, process_name)；不支持的平台返回 ('','')。"""
-    if IS_WINDOWS:
-        try:
-            import ctypes
-            from ctypes import wintypes
-            u = ctypes.windll.user32
-            hwnd = u.GetForegroundWindow()
-            if not hwnd:
-                return '', ''
-            buf = ctypes.create_unicode_buffer(512)
-            u.GetWindowTextW(hwnd, buf, 512)
-            pid = wintypes.DWORD()
-            u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            proc = ''
-            try:
-                k32 = ctypes.windll.kernel32
-                handle = k32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
-                if handle:
-                    path_buf = ctypes.create_unicode_buffer(1024)
-                    size = wintypes.DWORD(1024)
-                    if k32.QueryFullProcessImageNameW(handle, 0, path_buf, ctypes.byref(size)):
-                        proc = os.path.basename(path_buf.value)
-                    k32.CloseHandle(handle)
-            except Exception:
-                pass
-            return buf.value or '', proc or ''
-        except Exception:
-            return '', ''
-    if IS_LINUX:
-        try:
-            import subprocess
-            out = subprocess.run(['xdotool', 'getactivewindow', 'getwindowname'],
-                                 capture_output=True, text=True, timeout=2)
-            title = (out.stdout or '').strip()
-            return title, ''
-        except Exception:
-            return '', ''
-    if IS_MACOS:
-        try:
-            import subprocess
-            out = subprocess.run(
-                ['osascript', '-e',
-                 'tell application "System Events" to get name of first application process whose frontmost is true'],
-                capture_output=True, text=True, timeout=2)
-            return '', (out.stdout or '').strip()
-        except Exception:
-            return '', ''
-    return '', ''
+# ==================== 防锁屏保活参数 ====================
+# 后台保活线程每隔该秒数重新断言“系统/显示器保持唤醒”并做一次 1px 微抖动，
+# 远小于常见 1~3 分钟的系统空闲锁屏/屏保阈值，从而独立于“点击运行”持续保活。
+KEEPALIVE_INTERVAL = 30
 
+# 复用文案与文件类型（S1192：避免同一字面量重复定义）
+MSG_SAVE_CONFIG_FAILED = "保存配置失败: "
+JSON_FILE_PATTERN = "*.json"
 
-def restore_system_settings():
-    """FR/E 6.6.2：恢复进程/系统级防休眠设置；atexit 与信号处理共用。"""
-    try:
-        if IS_WINDOWS:
-            import ctypes
-            ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)  # ES_CONTINUOUS
-            print("已恢复Windows休眠设置")
-        elif IS_LINUX:
-            try:
-                import subprocess
-                subprocess.Popen(['xset', 's', 'on'], stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE)
-                subprocess.Popen(['xset', 'dpms'], stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE)
-                print("已恢复Linux休眠设置")
-            except Exception:
-                pass
-    except Exception as e:
-        print(f"恢复系统休眠设置失败: {e}")
-
-
-_SETTING_GUARDS_INSTALLED = False
-
-
-def install_setting_restore_guards():
-    """注册崩溃/正常退出/信号路径的系统设置复原钩子（幂等）。"""
-    global _SETTING_GUARDS_INSTALLED
-    if _SETTING_GUARDS_INSTALLED:
-        return
-    _SETTING_GUARDS_INSTALLED = True
-    atexit.register(restore_system_settings)
-
-    def _signal_handler(signum, _frame):
-        restore_system_settings()
-        raise SystemExit(0)
-
-    for name in ('SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK'):
-        sig = getattr(signal, name, None)
-        if sig is None:
-            continue
-        try:
-            signal.signal(sig, _signal_handler)
-        except Exception:
-            pass
-    print("已注册系统设置复原守卫（atexit/信号）")
-
-
-def detect_input_backend():
-    """FR-L01 / 6.12.1：启动时探测当前会话是否支持模拟输入。
-
-    返回 (ok, session, reason)。ok=False 时必须明确提示并禁用启动，不静默失败。
-    判据保持保守：只有明确是 Wayland 且没有 X11 可用时才拦截，避免误伤
-    XWayland / X11 会话（银河麒麟等国产桌面常同时设置多个环境变量）。
-    """
-    if not IS_LINUX:
-        return True, ('windows' if IS_WINDOWS else PLATFORM), ''
-
-    session = (os.environ.get('XDG_SESSION_TYPE') or '').strip().lower()
-    has_wayland = bool(os.environ.get('WAYLAND_DISPLAY'))
-    has_x11 = bool(os.environ.get('DISPLAY'))
-    is_wayland = (session == 'wayland') or (not session and has_wayland and not has_x11)
-    if not is_wayland:
-        return True, (session or ('x11' if has_x11 else 'unknown')), ''
-
-    doc = "\n\n详见 docs/Wayland降级说明.md"
-    import shutil
-    if not shutil.which('ydotool'):
-        return False, 'wayland', (
-            "当前为 Wayland 会话，且未检测到 ydotool，无法模拟鼠标输入。\n"
-            "请在登录界面切换到 X11 会话；或安装 ydotool 并启动 ydotoold（当前用户需加入 input 组）。"
-            + doc)
-    # ydotool 已安装：由 _ydotool_* 后端执行移动/点击；ydotoold 未启动时命令会失败，
-    # 由调用方给出明确错误，不再静默禁用整个 Wayland 会话。
-    uid = getattr(os, 'getuid', lambda: 0)()
-    if not (os.environ.get('YDOTOOL_SOCKET') or os.path.exists('/tmp/.ydotool_socket')
-            or os.path.exists('/run/user/%d/.ydotool_socket' % uid)):
-        print("提示：未检测到 ydotoold socket，若点击失败请先启动 ydotoold")
-    return True, 'wayland', ''
-
-
-def _is_wayland_session():
-    """是否明确处于 Wayland 会话（与 detect_input_backend 判据一致）。"""
-    if not IS_LINUX:
-        return False
-    session = (os.environ.get('XDG_SESSION_TYPE') or '').strip().lower()
-    has_wayland = bool(os.environ.get('WAYLAND_DISPLAY'))
-    has_x11 = bool(os.environ.get('DISPLAY'))
-    return (session == 'wayland') or (not session and has_wayland and not has_x11)
-
-
-def _ydotool_run(args, timeout=2):
-    """执行 ydotool 子命令；失败返回 False（不抛出到 UI 线程）。"""
-    import subprocess
-    try:
-        out = subprocess.run(['ydotool'] + list(args), capture_output=True,
-                             text=True, timeout=timeout)
-        if out.returncode != 0:
-            print("ydotool 失败(%s)：%s" % (out.returncode,
-                                           (out.stderr or out.stdout or '').strip()[:200]))
-            return False
-        return True
-    except Exception as e:
-        print("ydotool 执行异常：%s" % e)
-        return False
-
-
-_YDOTOOL_BUTTONS = {'left': '0xC0', 'right': '0xC1', 'middle': '0xC2'}
-
-
-def _ydotool_move(x, y):
-    # ydotool 新旧版本参数兼容：优先 --absolute，再退回 -a
-    for flag in ('--absolute', '-a'):
-        if _ydotool_run(['mousemove', flag, '-x', str(int(x)), '-y', str(int(y))]):
-            return True
-    return False
-
-
-def _ydotool_click(x, y, button='left', hold_ms=0):
-    if not _ydotool_move(x, y):
-        return False
-    code = _YDOTOOL_BUTTONS.get(button, _YDOTOOL_BUTTONS['left'])
-    if button == 'double':
-        first = _ydotool_run(['click', code])
-        time.sleep(0.03)
-        second = _ydotool_run(['click', code])
-        return first and second
-    if hold_ms > 0:
-        if not _ydotool_run(['mousedown', code]):
-            return False
-        time.sleep(hold_ms / 1000.0)
-        return _ydotool_run(['mouseup', code])
-    return _ydotool_run(['click', code])
-
-
-# ==================== 核心依赖 ====================
-# pyautogui 仅作为无原生输入后端时的降级路径。顶部 import 会串行加载
-# mouseinfo/pyscreeze/pygetwindow，实测拖慢冷启动 8 秒以上；改为首次使用时懒加载。
-_PYAUTOGUI = None
-_PYAUTOGUI_LOADED = False
-
-
-def _get_pyautogui():
-    global _PYAUTOGUI, _PYAUTOGUI_LOADED
-    if not _PYAUTOGUI_LOADED:
-        _PYAUTOGUI_LOADED = True
-        try:
-            import pyautogui as _pg
-            _PYAUTOGUI = _pg
-        except ImportError:
-            _PYAUTOGUI = None
-            print("pyautogui 未安装，非原生输入后端将不可用")
-    return _PYAUTOGUI
-
+# ==================== 热键（keyboard，延迟导入）====================
 keyboard = None
 _KEYBOARD_LOADED = False
 
@@ -268,251 +117,6 @@ def _get_keyboard():
             print("keyboard模块未安装，快捷键功能将不可用")
     return keyboard
 
-# ==================== Windows 特定依赖 ====================
-HAS_WIN32GUI = False
-HAS_WIN32API = False
-if IS_WINDOWS:
-    try:
-        import win32gui
-        import win32con
-        import win32api
-        import ctypes
-        HAS_WIN32GUI = True
-        HAS_WIN32API = True
-    except ImportError:
-        HAS_WIN32GUI = False
-        HAS_WIN32API = False
-        print("win32gui模块未安装，Windows系统托盘功能将不可用")
-
-# ==================== Linux 特定依赖 ====================
-HAS_X11 = False
-HAS_PYSTRAY = False
-HAS_PIL = False
-if IS_LINUX:
-    # X11 鼠标控制
-    try:
-        from Xlib import X, display
-        from Xlib.ext.xtest import fake_input
-        HAS_X11 = True
-    except ImportError:
-        print("python-xlib模块未安装，Linux原生鼠标控制功能将使用pyautogui")
-    
-    # 系统托盘支持
-    try:
-        import pystray
-        HAS_PYSTRAY = True
-    except ImportError:
-        print("pystray模块未安装，Linux系统托盘功能将不可用")
-    
-    # 图像处理（用于托盘图标）
-    try:
-        from PIL import Image
-        HAS_PIL = True
-    except ImportError:
-        print("PIL模块未安装，Linux托盘图标功能将不可用")
-
-# ==================== Windows API 常量 ====================
-MOUSEEVENTF_MOVE = 0x0001
-MOUSEEVENTF_LEFTDOWN = 0x0002
-MOUSEEVENTF_LEFTUP = 0x0004
-MOUSEEVENTF_RIGHTDOWN = 0x0008
-MOUSEEVENTF_RIGHTUP = 0x0010
-MOUSEEVENTF_MIDDLEDOWN = 0x0020
-MOUSEEVENTF_MIDDLEUP = 0x0040
-MOUSEEVENTF_ABSOLUTE = 0x8000
-
-# ==================== 防锁屏保活参数 ====================
-# 后台保活线程每隔该秒数重新断言“系统/显示器保持唤醒”并做一次 1px 微抖动，
-# 远小于常见 1~5 分钟的系统空闲锁屏/屏保阈值，从而独立于“点击运行”持续保活。
-KEEPALIVE_INTERVAL = 30
-
-# 复用文案与文件类型（S1192：避免同一字面量重复定义）
-MSG_SAVE_CONFIG_FAILED = "保存配置失败: "
-JSON_FILE_PATTERN = "*.json"
-
-# ==================== 平台通用函数 ====================
-def windows_move_mouse(x, y):
-    """使用 Windows API 移动鼠标（ctypes 直连，不依赖 pywin32 是否可用）"""
-    try:
-        ok = ctypes.windll.user32.SetCursorPos(int(x), int(y))
-        if not ok:
-            print(f"移动鼠标失败：SetCursorPos 返回 {ok}")
-            return False
-        return True
-    except Exception as e:
-        print(f"移动鼠标失败：{e}")
-        return False
-
-def windows_click(x, y, button='left', hold_ms=0):
-    """使用 Windows API 执行鼠标点击（支持左/右/中键、双击与按住时长）"""
-    if not HAS_WIN32API:
-        return False
-    try:
-        if button == 'double':
-            _windows_click_button(x, y, 'left', hold_ms)
-            time.sleep(0.03)
-            _windows_click_button(x, y, 'left', hold_ms)
-            return True
-        return _windows_click_button(x, y, button, hold_ms)
-    except Exception as e:
-        print(f"点击失败：{e}")
-        return False
-
-
-def _windows_click_button(x, y, button, hold_ms):
-    """Windows 单键按下/抬起（含按住时长）"""
-    flags = {
-        'left': (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
-        'right': (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
-        'middle': (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
-    }.get(button, (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP))
-    try:
-        ctypes.windll.user32.SetCursorPos(int(x), int(y))
-        time.sleep(0.005)
-        ctypes.windll.user32.mouse_event(flags[0], 0, 0, 0, 0)
-        if hold_ms > 0:
-            time.sleep(hold_ms / 1000.0)
-        time.sleep(0.005)
-        ctypes.windll.user32.mouse_event(flags[1], 0, 0, 0, 0)
-        return True
-    except Exception as e:
-        print(f"点击失败：{e}")
-        return False
-
-def linux_move_mouse(x, y):
-    """使用 X11 API 或 ydotool（Wayland）移动鼠标（银河麒麟兼容）"""
-    import shutil
-    if _is_wayland_session() and shutil.which('ydotool'):
-        if _ydotool_move(x, y):
-            return True
-        print("Wayland 移动鼠标失败：ydotool 不可用，请确认 ydotoold 已启动")
-        return False
-    if HAS_X11:
-        try:
-            d = display.Display()
-            root = d.screen().root
-            root.warp_pointer(int(x), int(y))
-            d.sync()
-            d.close()
-            return True
-        except Exception as e:
-            print(f"Linux移动鼠标失败：{e}")
-    pg = _get_pyautogui()
-    if pg is None:
-        return False
-    try:
-        pg.moveTo(x, y)
-        return True
-    except Exception:
-        return False
-
-def linux_click(x, y, button='left', hold_ms=0):
-    """使用 X11 API 或 ydotool（Wayland）执行点击（支持左/右/中键、双击与按住时长）"""
-    import shutil
-    if _is_wayland_session() and shutil.which('ydotool'):
-        if _ydotool_click(x, y, button, hold_ms):
-            return True
-        print("Wayland 点击失败：ydotool 不可用，请确认 ydotoold 已启动")
-        return False
-    if not HAS_X11:
-        return _pyautogui_click(x, y, button)
-    try:
-        d = display.Display()
-        linux_move_mouse(x, y)
-        btn = {'left': 1, 'right': 3, 'middle': 2}.get(button, 1)
-
-        def press():
-            fake_input(d, X.ButtonPress, btn)
-            d.sync()
-
-        def release():
-            fake_input(d, X.ButtonRelease, btn)
-            d.sync()
-
-        press()
-        if hold_ms > 0:
-            time.sleep(hold_ms / 1000.0)
-        if button == 'double':
-            release()
-            d.sync()
-            time.sleep(0.03)
-            press()
-            if hold_ms > 0:
-                time.sleep(hold_ms / 1000.0)
-        release()
-        d.sync()
-        d.close()
-        return True
-    except Exception as e:
-        print(f"Linux点击失败：{e}")
-        return _pyautogui_click(x, y, button)
-
-
-def _pyautogui_click(x, y, button):
-    """pyautogui 降级点击（无 X11 或异常时）"""
-    pg = _get_pyautogui()
-    if pg is None:
-        return False
-    try:
-        pg.click(x, y,
-                  button={'left': 'left', 'right': 'right', 'middle': 'middle'}.get(button, 'left'),
-                  clicks=2 if button == 'double' else 1)
-        return True
-    except Exception:
-        return False
-
-def linux_get_cursor_pos():
-    """获取 Linux 鼠标位置"""
-    if HAS_X11:
-        try:
-            d = display.Display()
-            root = d.screen().root
-            data = root.query_pointer()._data
-            x = data["root_x"]
-            y = data["root_y"]
-            d.close()
-            return x, y
-        except Exception:
-            pass
-    pg = _get_pyautogui()
-    if pg is None:
-        return (0, 0)
-    return pg.position()
-
-def get_cursor_pos():
-    """跨平台获取鼠标位置"""
-    if IS_WINDOWS and HAS_WIN32API:
-        return win32api.GetCursorPos()
-    elif IS_LINUX:
-        return linux_get_cursor_pos()
-    else:
-        pg = _get_pyautogui()
-        if pg is None:
-            return (0, 0)
-        return pg.position()
-
-def move_mouse(x, y):
-    """跨平台移动鼠标"""
-    if IS_WINDOWS:
-        return windows_move_mouse(x, y)
-    elif IS_LINUX:
-        return linux_move_mouse(x, y)
-    else:
-        pg = _get_pyautogui()
-        if pg is None:
-            return False
-        pg.moveTo(x, y)
-        return True
-
-def click_mouse(x, y, button='left', hold_ms=0):
-    """跨平台点击鼠标（支持按键类型与按住时长）"""
-    if IS_WINDOWS:
-        return windows_click(x, y, button, hold_ms)
-    elif IS_LINUX:
-        return linux_click(x, y, button, hold_ms)
-    else:
-        return _pyautogui_click(x, y, button)
-
 
 def normalize_region(x1, y1, x2, y2):
     """把拖拽起止点归一化为闭区间区域；单击（几乎无位移）按 1×1 点处理。"""
@@ -525,264 +129,10 @@ def normalize_region(x1, y1, x2, y2):
     return {'x': left, 'y': top, 'width': max(1, width + 1), 'height': max(1, height + 1)}
 
 
-class RegionSelector:
-    """FR-C01/8.1：全屏半透明遮罩 + 十字线 + 拖拽框选 + 实时尺寸标签。
-
-    交互：
-      - 按下左键并拖拽：实时绘制选框，标签显示 `W×H (x,y)`；
-      - 松开左键：选框保留 1 秒后关闭并回调；几乎无位移时按单击取 1×1 点；
-      - 右键：撤销当前选框；
-      - Esc：立即取消，原配置不变；Enter：确认当前选框。
-    """
-
-    def __init__(self, parent, on_done):
-        self.parent = parent
-        self.on_done = on_done
-        self.start_xy = None
-        self.start_abs = None
-        self.rect_id = None
-        self.last_region = None
-        self._finished = False
-        self._finish_after = None
-
-        self.top = tk.Toplevel(parent)
-        self.top.overrideredirect(True)
-        self.top.configure(bg='#000000')
-        try:
-            self.top.attributes('-topmost', True)
-            self.top.attributes('-alpha', 0.45)
-        except Exception:
-            pass
-
-        # 虚拟屏幕范围：Windows 用系统指标，其他平台用 Tk 虚拟根窗口
-        ox, oy, sw, sh = 0, 0, parent.winfo_screenwidth(), parent.winfo_screenheight()
-        if IS_WINDOWS:
-            try:
-                import ctypes
-                u = ctypes.windll.user32
-                ox = int(u.GetSystemMetrics(76))   # SM_XVIRTUALSCREEN
-                oy = int(u.GetSystemMetrics(77))   # SM_YVIRTUALSCREEN
-                sw = int(u.GetSystemMetrics(78))   # SM_CXVIRTUALSCREEN
-                sh = int(u.GetSystemMetrics(79))   # SM_CYVIRTUALSCREEN
-            except Exception:
-                pass
-        self.origin_x, self.origin_y = ox, oy
-        try:
-            self.top.geometry("%dx%d%+d%+d" % (sw, sh, ox, oy))
-        except Exception:
-            self.top.geometry("%dx%d+0+0" % (sw, sh))
-
-        self.canvas = tk.Canvas(self.top, bg='#000000', highlightthickness=0)
-        self.canvas.pack(fill=tk.BOTH, expand=True)
-        self.canvas.configure(cursor='crosshair')
-        self.hline = self.canvas.create_line(0, 0, sw, 0, fill='#60A5FA', width=1)
-        self.vline = self.canvas.create_line(0, 0, 0, sh, fill='#60A5FA', width=1)
-        self.prompt = tk.Label(
-            self.top, text="拖拽框选区域 · 单击取点 · Esc 取消 · 右键撤销 · Enter 确认",
-            bg='#1F2229', fg='#E8EAED', font=('微软雅黑', 10, 'bold'),
-            padx=14, pady=7)
-        # 提示条放在主屏可见区域中央，虚拟屏扩展到多屏时不会跑到副屏外
-        primary_w = sw
-        if IS_WINDOWS:
-            try:
-                import ctypes
-                primary_w = int(ctypes.windll.user32.GetSystemMetrics(0)) or sw
-            except Exception:
-                pass
-        self.prompt.place(x=max(0, primary_w // 2), y=18, anchor='n')
-        self.size_label = tk.Label(
-            self.top, text='', bg='#2563EB', fg='white',
-            font=('Consolas', 10, 'bold'), padx=8, pady=4)
-        self.size_label.place(x=20, y=20)
-
-        for widget in (self.top, self.canvas):
-            widget.bind('<Motion>', self._on_motion)
-            widget.bind('<ButtonPress-1>', self._on_press)
-            widget.bind('<B1-Motion>', self._on_drag)
-            widget.bind('<ButtonRelease-1>', self._on_release)
-            widget.bind('<ButtonPress-3>', self._on_right)
-        self.top.bind('<Escape>', self._on_cancel)
-        self.top.bind('<Return>', self._on_confirm)
-        self.top.bind('<KP_Enter>', self._on_confirm)
-
-        self.top.update_idletasks()
-        # Windows 上负坐标虚拟屏由 SetWindowPos 兜底，避免 Tk 把 -x 解释成右边缘偏移
-        if IS_WINDOWS:
-            try:
-                import ctypes
-                hwnd = self.top.winfo_id()
-                u = ctypes.windll.user32
-                # Tk 的顶层窗口外面还有一层 wrapper，必须对根 HWND 设置 TOPMOST
-                root_hwnd = u.GetAncestor(hwnd, 2) or hwnd
-                u.SetWindowPos(
-                    root_hwnd, -1, ox, oy, sw, sh, 0x0040)  # HWND_TOPMOST, SWP_SHOWWINDOW
-            except Exception:
-                pass
-        try:
-            self.top.attributes('-topmost', True)
-            self.top.lift()
-        except Exception:
-            pass
-        try:
-            # 全局 grab：遮罩必须优先拿到鼠标事件，避免被主窗口/其他窗口抢走
-            self.top.grab_set_global()
-        except Exception:
-            try:
-                self.top.grab_set()
-            except Exception:
-                pass
-        try:
-            self.top.focus_force()
-        except Exception:
-            pass
-
-    def _abs_xy(self, event):
-        return int(event.x_root), int(event.y_root)
-
-    def _draw_size(self, region, px, py):
-        text = "%d×%d (%d,%d)" % (region['width'], region['height'], region['x'], region['y'])
-        self.size_label.config(text=text)
-        # 标签放在光标右下方，贴近当前框选操作
-        self.size_label.place(x=max(0, px + 14), y=max(0, py + 14))
-
-    def _on_motion(self, event):
-        if self._finished:
-            return
-        self.canvas.coords(self.hline, 0, event.y, self.canvas.winfo_width(), event.y)
-        self.canvas.coords(self.vline, event.x, 0, event.x, self.canvas.winfo_height())
-
-    def _on_press(self, event):
-        if self._finished:
-            return
-        self.start_xy = (event.x, event.y)
-        self.start_abs = self._abs_xy(event)
-        self.last_region = None
-        if self.rect_id:
-            self.canvas.delete(self.rect_id)
-        self.rect_id = self.canvas.create_rectangle(
-            event.x, event.y, event.x, event.y,
-            outline='#60A5FA', width=2, fill='')
-        self.size_label.config(text='0×0')
-        self.size_label.place(x=max(0, event.x + 14), y=max(0, event.y + 14))
-
-    def _on_drag(self, event):
-        if self._finished or not self.start_xy or not self.rect_id:
-            return
-        self.canvas.coords(self.rect_id, self.start_xy[0], self.start_xy[1], event.x, event.y)
-        x1, y1 = self._abs_xy(event)
-        sx, sy = self.start_abs if self.start_abs else (
-            self.origin_x + self.start_xy[0], self.origin_y + self.start_xy[1])
-        self.last_region = normalize_region(sx, sy, x1, y1)
-        self._draw_size(self.last_region, event.x, event.y)
-
-    def _on_release(self, event):
-        if self._finished or not self.start_xy:
-            return
-        x1, y1 = self._abs_xy(event)
-        sx, sy = self.start_abs if self.start_abs else (
-            self.origin_x + self.start_xy[0], self.origin_y + self.start_xy[1])
-        self.last_region = normalize_region(sx, sy, x1, y1)
-        self._draw_size(self.last_region, event.x, event.y)
-        # 选框保留 1 秒，随后回填并关闭
-        self._finish_after = self.top.after(1000, self._finish_with_last)
-
-    def _on_right(self, event):
-        if self._finished:
-            return
-        if self.rect_id:
-            self.canvas.delete(self.rect_id)
-            self.rect_id = None
-        self.start_xy = None
-        self.start_abs = None
-        self.last_region = None
-        self.size_label.config(text='已撤销当前选框')
-
-    def _on_confirm(self, event=None):
-        if self.last_region:
-            self._finish_with_last()
-
-    def _on_cancel(self, event=None):
-        if self._finished:
-            return
-        self._finish(None, cancelled=True)
-
-    def _finish_with_last(self):
-        if self._finished:
-            return
-        if self.last_region:
-            self._finish(self.last_region)
-        else:
-            self._finish(None, cancelled=True)
-
-    def _finish(self, region, cancelled=False):
-        if self._finished:
-            return
-        self._finished = True
-        try:
-            if self._finish_after:
-                self.top.after_cancel(self._finish_after)
-        except Exception:
-            pass
-        try:
-            self.top.grab_release()
-        except Exception:
-            pass
-        try:
-            self.top.destroy()
-        except Exception:
-            pass
-        try:
-            self.on_done(None if cancelled else region)
-        except Exception:
-            pass
-
-
-class NoticeBar:
-    """8.3 错误提示分级：顶部可关闭横幅（operation 级）。"""
-
-    def __init__(self, parent, color_getter):
-        self.color_getter = color_getter
-        self.frame = tk.Frame(parent, bg=color_getter('warning'))
-        self.label = tk.Label(
-            self.frame, text='', bg=color_getter('warning'), fg=color_getter('on_warning'),
-            font=('微软雅黑', 10, 'bold'), wraplength=520, justify=tk.LEFT, anchor=tk.W)
-        self.label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 6), pady=7)
-        self.close_btn = tk.Button(
-            self.frame, text='×', command=self.hide, bg=color_getter('warning'),
-            fg=color_getter('on_warning'),
-            activebackground=color_getter('warning'), activeforeground=color_getter('on_warning'),
-            relief=tk.FLAT, bd=0, font=('微软雅黑', 11, 'bold'), cursor='hand2')
-        self.close_btn.pack(side=tk.RIGHT, padx=(0, 8))
-        self._after_id = None
-        self._parent = parent
-
-    def show(self, message, level='operation', timeout=0, before=None):
-        color = self.color_getter('danger' if level == 'fatal' else 'warning')
-        on_color = self.color_getter('on_danger' if level == 'fatal' else 'on_warning')
-        self.frame.configure(bg=color)
-        self.label.configure(text=message, bg=color, fg=on_color)
-        self.close_btn.configure(bg=color, activebackground=color,
-                                 fg=on_color, activeforeground=on_color)
-        if not self.frame.winfo_manager():
-            pack_kw = {'fill': tk.X, 'pady': (0, 10)}
-            if before is not None:
-                pack_kw['before'] = before
-            self.frame.pack(**pack_kw)
-        if self._after_id:
-            try:
-                self.frame.after_cancel(self._after_id)
-            except Exception:
-                pass
-            self._after_id = None
-        if timeout:
-            self._after_id = self.frame.after(timeout, self.hide)
-
-    def hide(self):
-        try:
-            self.frame.pack_forget()
-        except Exception:
-            pass
-
+# ==================== UI 组件层（auto_clicker_layers.ui）====================
+# NFR-09：全屏区域选择遮罩与顶部错误横幅已下沉到 auto_clicker_layers/ui.py，
+# 主文件保留主窗口（AutoClicker）作为组合根。
+from auto_clicker_layers.ui import RegionSelector, NoticeBar
 
 # ERROR_ALREADY_EXISTS常量（在pywin32中可能未定义）
 ERROR_ALREADY_EXISTS = 183
@@ -1015,90 +365,29 @@ class AutoClicker:
 
     def _backup_config_before_migration(self):
         """CX-09：迁移/降级前备份原配置，避免旧配置丢失（PRD FR-G02）。"""
-        try:
-            if not os.path.exists(self.config_file):
-                return None
-            import shutil
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            backup = self.config_file + ".v1-backup-" + stamp
-            shutil.copy2(self.config_file, backup)
+        backup = _config_backup(self.config_file)
+        if backup:
             self._migration_backup_path = backup
             print("配置迁移前已备份: " + backup)
-            return backup
-        except Exception as e:
-            print("配置迁移备份失败: " + str(e))
-            return None
+        return backup
 
     def load_config(self):
-        default_config = {
-            'interval_seconds': 10,
-            'click_mode': 'random',
-            'click_area': {'x': 0, 'y': 0, 'width': 1920, 'height': 1080},
-            'prevent_sleep': True,
-            'mouse_follow_enabled': True,  # 鼠标跟随功能
-            'mouse_move_speed': 0.1,  # 鼠标移动速度 (0.0-1.0)
-            'mouse_move_only': False,  # 只移动不点击
-            # P0 安全与体验止血（CX-02 / CX-04 / CX-06）
-            'startup_countdown': 3,  # 启动倒计时（秒，0-5）
-            'click_limit': 0,  # 点击次数上限（0 表示无限）
-            'duration_limit': 0,  # 运行时长上限（分钟，0 表示无限）
-            'failsafe_enabled': False,  # 鼠标位移即停
-            'target_window_keyword': '',  # FR-E03 前台目标窗口关键字（空=不校验）
-            'close_to_tray': True,  # 关闭窗口最小化到托盘（否则直接退出）
-            # P1 功能扩展（FN-01 / FN-02 / CX-07 / CX-08 / CX-11 / FN-03）
-            'click_button': 'left',  # 鼠标按键：left/right/middle/double
-            'hold_ms': 10,  # 按住时长（毫秒）
-            'interval_unit': 's',  # 间隔单位：s 表示秒，ms 表示毫秒
-            'jitter_pct': 0,  # 随机抖动百分比（0 表示关闭）
-            'hotkey_start': 'f6',  # 启动/停止热键（可自定义）
-            'hotkey_emergency': 'f8',  # 紧急停止热键（可自定义）
-            'autostart': False,  # 开机自启
-            'use_multi_points': False,  # 使用多点位序列
-            'multi_points': [],  # 多点位坐标列表 [{'x':, 'y':}, ...]
-            'theme_mode': 'light',  # 主题：light / dark / system（TH-01/TH-03）
-            # FR-D01 定时计划：每日 HH:MM 启动、运行 N 分钟后停止、仅工作日；跨零点/休眠补算
-            'schedule': {'enabled': False, 'start_at': '09:00',
-                         'stop_after_min': 0, 'weekdays': [1, 2, 3, 4, 5]},
-            'config_version': 2  # 配置 schema 版本（CX-09 迁移用）
-        }
-        
+        default_config = _config_clone_defaults()
         try:
-            if os.path.exists(self.config_file):
-                with open(self.config_file, 'r', encoding='utf-8') as f:
-                    self.config = json.load(f)
-                try:
-                    raw_version = int(self.config.get('config_version', 0) or 0)
-                except (TypeError, ValueError, AttributeError):
-                    raw_version = 0
-                if raw_version < 2:
-                    self._backup_config_before_migration()
-                for key in default_config:
-                    if key not in self.config:
-                        self.config[key] = default_config[key]
-            else:
+            loaded = _config_read(self.config_file)
+            if loaded is None:
                 self.config = default_config
+            else:
+                self.config = loaded
+                if _config_version(self.config) < 2:
+                    self._backup_config_before_migration()
         except Exception as e:
             print("加载配置失败: " + str(e))
             self._backup_config_before_migration()
             self.config = default_config
-            
-        # 配置迁移（CX-09）：补齐 schema 版本与配置方案容器
+        # 配置迁移（CX-09）：补齐 schema 版本、配置方案容器与 schedule 子字段
         try:
-            if 'config_version' not in self.config:
-                self.config['config_version'] = 2
-            if 'profiles' not in self.config or not isinstance(self.config['profiles'], dict):
-                self.config['profiles'] = {}
-            if 'current_profile' not in self.config:
-                self.config['current_profile'] = None
-            # FR-D01：旧配置补齐 schedule 子字段，避免部分字段缺失导致定时线程误判
-            sched = self.config.get('schedule')
-            if not isinstance(sched, dict):
-                sched = {}
-            sched.setdefault('enabled', False)
-            sched.setdefault('start_at', '09:00')
-            sched.setdefault('stop_after_min', 0)
-            sched.setdefault('weekdays', [1, 2, 3, 4, 5])
-            self.config['schedule'] = sched
+            _config_normalize(self.config)
         except Exception:
             pass
 
@@ -1221,23 +510,8 @@ class AutoClicker:
     # ==================== P2 主题系统（TH-01 / TH-02 / TH-03） ====================
     def _init_theme(self):
         """初始化主题：语义化调色板 + 可选接入 ttkbootstrap + 读取持久化主题"""
-        # TH-02：主色/成功/危险/警告等语义化变量，集中定义，避免散落十六进制
-        self.THEMES = {
-            'light': {
-                'bg': '#ffffff', 'fg': '#212529', 'muted': '#6c757d',
-                'primary': '#0056b3', 'success': '#1e7e34', 'danger': '#b02a37',
-                'warning': '#8a4b00', 'surface': '#f8f9fa', 'border': '#868e96',
-                'on_primary': '#ffffff', 'on_success': '#ffffff',
-                'on_danger': '#ffffff', 'on_warning': '#ffffff', 'on_muted': '#ffffff',
-            },
-            'dark': {
-                'bg': '#212529', 'fg': '#e9ecef', 'muted': '#adb5bd',
-                'primary': '#4a90d9', 'success': '#2ecc71', 'danger': '#f16c6c',
-                'warning': '#e67e22', 'surface': '#2b3035', 'border': '#6c757d',
-                'on_primary': '#0b0f14', 'on_success': '#0b0f14',
-                'on_danger': '#0b0f14', 'on_warning': '#0b0f14', 'on_muted': '#0b0f14',
-            },
-        }
+        # TH-02：语义化变量集中在 theme 层，避免散落十六进制
+        self.THEMES = _THEME_PALETTES
         self.theme_mode = self.config.get('theme_mode', 'light')
         self._ttkb_style = None
         # TH-01：可选接入 ttkbootstrap（缺失则降级为纯 ttk + 手动语义配色）
@@ -1257,32 +531,15 @@ class AutoClicker:
 
     def _shade(self, hex_color, factor=0.85):
         """按比例调暗十六进制色，用于 activebackground（TH-02）"""
-        try:
-            h = hex_color.lstrip('#')
-            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-            r = max(0, int(r * factor)); g = max(0, int(g * factor)); b = max(0, int(b * factor))
-            return '#%02x%02x%02x' % (r, g, b)
-        except Exception:
-            return hex_color
+        return _theme_shade(hex_color, factor)
 
     def _system_is_dark(self):
         """检测系统是否深色模式（Windows 注册表；其他平台默认浅色）"""
-        try:
-            if IS_WINDOWS:
-                import winreg
-                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                    r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
-                val = winreg.QueryValueEx(key, "AppsUseLightTheme")[0]
-                return val == 0
-        except Exception:
-            pass
-        return False
+        return _theme_system_is_dark()
 
     def _resolve_palette(self):
-        mode = self.theme_mode
-        if mode == 'system':
-            mode = 'dark' if self._system_is_dark() else 'light'
-        return self.THEMES.get(mode, self.THEMES['light'])
+        return _theme_resolve_palette(getattr(self, 'theme_mode', 'light'), self.THEMES,
+                                      self._system_is_dark)
 
     def _apply_ttkbootstrap_theme(self):
         """切换 ttkbootstrap 主题（TH-01）；未安装或切换失败时静默降级。"""
@@ -1445,6 +702,42 @@ class AutoClicker:
         except Exception:
             pass
 
+    def _on_main_mousewheel(self, event):
+        """主内容区滚轮滚动（720p/高 DPI 下底部控件依赖滚动到达）。
+
+        边界：指针不在主画布内、或事件来自日志框时不接管，避免抢走日志/输入框自身滚动。
+        """
+        try:
+            c = getattr(self, 'main_canvas', None)
+            if c is None or not c.winfo_ismapped():
+                return
+            widget = getattr(event, 'widget', None)
+            log = getattr(self, 'log_text', None)
+            if log is not None and widget is not None and str(widget).startswith(str(log)):
+                return
+            px, py = self.root.winfo_pointerxy()
+            cx, cy = c.winfo_rootx(), c.winfo_rooty()
+            cw, ch = c.winfo_width(), c.winfo_height()
+            if not (cx <= px <= cx + cw and cy <= py <= cy + ch):
+                return
+            num = getattr(event, 'num', None)
+            if num == 4:
+                direction = -1
+            elif num == 5:
+                direction = 1
+            else:
+                direction = -1 if getattr(event, 'delta', 0) > 0 else 1
+            c.yview_scroll(direction * 3, 'units')
+        except Exception:
+            pass
+
+    def _bind_main_mousewheel(self):
+        for seq in ('<MouseWheel>', '<Button-4>', '<Button-5>'):
+            try:
+                self.root.bind_all(seq, self._on_main_mousewheel, add='+')
+            except Exception:
+                pass
+
     def _apply_theme(self):
         """运行时应用主题：切换 ttk 主题 + 重着色语义化控件（TH-01/TH-02）"""
         try:
@@ -1503,8 +796,7 @@ class AutoClicker:
 
     def save_config(self):
         try:
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(self.config, f, indent=2, ensure_ascii=False)
+            _config_write(self.config_file, self.config)
         except Exception as e:
             print(MSG_SAVE_CONFIG_FAILED + str(e))
     
@@ -2143,6 +1435,7 @@ class AutoClicker:
         # 布局
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._bind_main_mousewheel()
         
         # 将主框架添加到Canvas
         canvas_window = canvas.create_window((0, 0), window=self.main_frame, anchor="nw", width=680)
