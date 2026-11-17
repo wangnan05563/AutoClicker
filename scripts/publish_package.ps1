@@ -18,6 +18,24 @@ function Write-Banner($msg) {
     Write-Host ("=" * 60) -ForegroundColor DarkGray
 }
 
+# git 在 Stop 模式下会把 stderr（CRLF 警告、push 进度）提升为终止错误。
+# 统一经此函数执行：临时降级 EAP，仅按退出码判定，避免“警告当失败”。
+function Invoke-GitCommand {
+    param(
+        [Parameter(Mandatory = $true)][string]$GitDir,
+        [Parameter(Mandatory = $true)][string[]]$Arguments
+    )
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $allArgs = @('-C', $GitDir) + $Arguments
+        $output = & git @allArgs 2>&1
+        return @{ ExitCode = $LASTEXITCODE; Output = @($output) }
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+}
+
 # ---------- 发布前置检查（对齐 AirMirror 一键发布的 fast-fail 思路） ----------
 function Get-MissingPythonImports($PythonPath, $Imports) {
     # native 子进程写 stderr 在 $ErrorActionPreference='Stop' 下会抛 RemoteException，
@@ -267,6 +285,56 @@ try {
     }
     Write-Host "[OK] 发布包总大小: $('{0:F2}' -f $zipSizeMB) MB" -ForegroundColor Green
 
+    # 步骤 4.5：生成带版本号的 exe 安装包（NSIS，配置驱动）
+    Write-Banner "步骤 4.5/5: 生成 exe 安装包"
+    $installerPath = $null
+    $installerCfg = $config.release.installer
+    if ($installerCfg -and [bool]$installerCfg.enabled) {
+        $nsi = Join-Path $PROJECT_ROOT $installerCfg.template
+        if (-not (Test-Path $nsi)) { throw "未找到 NSIS 模板: $nsi" }
+        $makensis = $null
+        foreach ($c in @($installerCfg.tool_candidates)) {
+            $p = [System.Environment]::ExpandEnvironmentVariables([string]$c)
+            if ($p -and (Test-Path $p)) { $makensis = $p; break }
+            $cmd = Get-Command ([string]$c) -ErrorAction SilentlyContinue
+            if ($cmd) { $makensis = $cmd.Source; break }
+        }
+        if (-not $makensis) { throw "未找到 makensis（NSIS）：请安装 NSIS 3.x 或配置 release.installer.tool_candidates。" }
+
+        # 构建版本号（package.json 的 version，由 patch_version.py 在构建前更新）
+        $buildVersion = 'unknown'
+        $pkgJson = Join-Path $PROJECT_ROOT 'package.json'
+        if (Test-Path $pkgJson) {
+            try { $buildVersion = (Get-Content $pkgJson -Raw -Encoding UTF8 | ConvertFrom-Json).version } catch { }
+        }
+        $instName = $installerCfg.name -replace "\{version\}", $config.release.version -replace "\{build\}", $buildVersion -replace "\{arch\}", $config.release.arch
+        $installerPath = Join-Path $outDir ($instName + $installerCfg.extension)
+        $defs = @(
+            "/DAPP_VERSION=$($config.release.version)",
+            "/DAPP_BUILD=$buildVersion",
+            "/DAPP_ARCH=$($config.release.arch)",
+            "/DSRC_EXE=$($exePath)",
+            "/DOUT_FILE=$installerPath"
+        )
+        $icon = Join-Path $PROJECT_ROOT 'icons/autoclicker.ico'
+        if (Test-Path $icon) { $defs += "/DAPP_ICON=$icon" }
+        $readme = Join-Path $PROJECT_ROOT 'README.md'
+        if (Test-Path $readme) { $defs += "/DDOC_README=$readme" }
+        $license = Join-Path $PROJECT_ROOT 'LICENSE'
+        if (Test-Path $license) { $defs += "/DDOC_LICENSE=$license" }
+
+        Write-Host "==> 调用 NSIS 生成安装包（$buildVersion）..." -ForegroundColor Cyan
+        & $makensis /INPUTCHARSET UTF8 @defs $nsi
+        if ($LASTEXITCODE -ne 0) { throw "NSIS 打包失败（退出码 $LASTEXITCODE）。" }
+        if (-not (Test-Path $installerPath)) { throw "安装包未生成: $installerPath" }
+        $instBytes = (Get-Item $installerPath).Length
+        $instMin = [double]$installerCfg.min_size_mb * 1MB
+        if ($instBytes -lt $instMin) { throw "安装包体积异常（$instBytes 字节），打包可能不完整。" }
+        Write-Host "[OK] 安装包: $installerPath ($('{0:F2}' -f ($instBytes / 1MB)) MB，版本 $($config.release.version) / 构建 $buildVersion)" -ForegroundColor Green
+    } else {
+        Write-Host "[提示] release.installer.enabled=false，跳过 exe 安装包生成。" -ForegroundColor Yellow
+    }
+
     # ===================================================================
     # 步骤 5/5：发布到 GitHub（真正的'发布'——把源码推送到远程仓库）
 # 说明：release/publish 下的 zip 是本地构建产物（已被 .gitignore 忽略），
@@ -297,34 +365,37 @@ try {
     if ($toAdd.Count -eq 0) { throw "没有可发布的源码文件，已中止以免空提交。" }
 
     Write-Host "==> 暂存源码（白名单）..." -ForegroundColor Cyan
-    & git -C $gitDir add -- $toAdd 2>$null
-    if ($LASTEXITCODE -ne 0) { throw "git add 失败（退出码 $LASTEXITCODE）。" }
+    $addRes = Invoke-GitCommand -GitDir $gitDir -Arguments (@('add', '--') + $toAdd)
+    if ($addRes.ExitCode -ne 0) { throw "git add 失败（退出码 $($addRes.ExitCode)）：$($addRes.Output -join ' ')" }
     # 安全兜底：任何情况下都确保代理目录不会被提交
-    & git -C $gitDir reset -q -- .workbuddy-ai .workbuddy 2>$null
+    [void](Invoke-GitCommand -GitDir $gitDir -Arguments @('reset', '-q', '--', '.workbuddy-ai', '.workbuddy'))
 
     # 5.2 仅在有变更时提交
-    $pending = @(& git -C $gitDir diff --cached --name-only) | Where-Object { $_ -ne '' }
+    $pendingRes = Invoke-GitCommand -GitDir $gitDir -Arguments @('diff', '--cached', '--name-only')
+    $pending = @($pendingRes.Output) | Where-Object { $_ -ne '' }
     if ($pending.Count -gt 0) {
         $commitMsg = "chore(release): AutoClicker $($config.release.version) 源码同步（一键发布）`n" +
                      "`n由 scripts/publish_package.ps1 自动提交并推送至 GitHub。`n" +
                      "构建产物已本地打包于 release/publish/，未纳入版本库（见 .gitignore）。"
-        & git -C $gitDir commit -m $commitMsg 2>$null
-        if ($LASTEXITCODE -ne 0) { throw "git commit 失败（退出码 $LASTEXITCODE）。" }
+        $commitRes = Invoke-GitCommand -GitDir $gitDir -Arguments @('commit', '-m', $commitMsg)
+        if ($commitRes.ExitCode -ne 0) { throw "git commit 失败（退出码 $($commitRes.ExitCode)）：$($commitRes.Output -join ' ')" }
         Write-Host "[OK] 已提交 $($pending.Count) 个文件。" -ForegroundColor Green
     } else {
         Write-Host "工作区无源码变更，跳过提交。" -ForegroundColor Gray
     }
 
     # 5.3 推送（必要时设置上游；网络抖动自动重试）
-    $branch = (& git -C $gitDir rev-parse --abbrev-ref HEAD 2>$null).Trim()
-    $upstream = (& git -C $gitDir rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>$null).Trim()
+    $branchRes = Invoke-GitCommand -GitDir $gitDir -Arguments @('rev-parse', '--abbrev-ref', 'HEAD')
+    $branch = ($branchRes.Output | Where-Object { $_ -and $_.ToString().Trim() -ne '' } | Select-Object -Last 1).ToString().Trim()
+    $upRes = Invoke-GitCommand -GitDir $gitDir -Arguments @('rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}')
+    $upstream = if ($upRes.ExitCode -eq 0) { ($upRes.Output | Select-Object -Last 1).ToString().Trim() } else { '' }
     $pushArgs = if (-not $upstream) { @('-u', 'origin', $branch) } else { @() }
     # 本地已与远程同步（无新提交）时跳过推送，避免无谓联网（弱网下推送连接可能直接崩溃）
     $skipPush = $false
     if ($upstream) {
-        $aheadRaw = & git -C $gitDir rev-list --count "$($upstream)..HEAD" 2>$null
+        $aheadRes = Invoke-GitCommand -GitDir $gitDir -Arguments @('rev-list', '--count', "$($upstream)..HEAD")
         $aheadCount = 0
-        if ($LASTEXITCODE -eq 0 -and [int]::TryParse($aheadRaw, [ref]$aheadCount) -and $aheadCount -le 0) {
+        if ($aheadRes.ExitCode -eq 0 -and [int]::TryParse(($aheadRes.Output | Select-Object -Last 1), [ref]$aheadCount) -and $aheadCount -le 0) {
             $skipPush = $true
         }
     }
@@ -334,13 +405,9 @@ try {
         $pushed = $false
         for ($attempt = 1; $attempt -le 5; $attempt++) {
             Write-Host "==> 推送至 origin/$branch（第 $attempt 次）..." -ForegroundColor Cyan
-            try {
-                & git -C $gitDir push @pushArgs 2>$null
-            } catch {
-                # git 在 Stop 偏好下会把 stderr 提升为错误，这里吞掉，交由 LASTEXITCODE 判断重试
-            }
-            if ($LASTEXITCODE -eq 0) { $pushed = $true; break }
-            Write-Warning "推送失败（退出码 $LASTEXITCODE），3 秒后重试..."
+            $pushRes = Invoke-GitCommand -GitDir $gitDir -Arguments (@('push') + $pushArgs)
+            if ($pushRes.ExitCode -eq 0) { $pushed = $true; break }
+            Write-Warning "推送失败（退出码 $($pushRes.ExitCode)），3 秒后重试..."
             Start-Sleep -Seconds 3
         }
         if (-not $pushed) { throw "git push 失败（已重试 5 次）。请检查网络/鉴权，或手动执行 git push。" }
@@ -398,8 +465,10 @@ try {
                 "- 加固：windows_move_mouse 改用 ctypes 直连、去除对 pywin32 的硬依赖；win32gui/win32api/win32con 显式加入 hidden_imports，确保冻结 exe 中鼠标移动与防锁屏始终可用。`n" +
                 "- 文档：README 同步说明'防止系统锁屏'现已为独立后台保活。`n" +
                 "- 版本：升 2.0.2（小版本迭代）。`n`n" +
+                "发布资产包含：版本化 zip 与 Windows 安装包（Setup.exe，文件名含产品版本 + 构建号）。`n" +
                 "由 scripts/publish_package.ps1 自动构建并发布，包含 AutoClicker.exe + 文档。"
-    $remoteUrl = (& git -C $gitDir remote get-url origin).Trim()
+    $remoteRes = Invoke-GitCommand -GitDir $gitDir -Arguments @('remote', 'get-url', 'origin')
+    $remoteUrl = ($remoteRes.Output | Select-Object -Last 1).ToString().Trim()
     $repoOk = $remoteUrl -match 'github\.com[:/]([^/]+)/(.+?)(?:\.git)?$'
 
     if ($env:GITHUB_TOKEN -and $repoOk) {
@@ -413,8 +482,8 @@ try {
             if ($existing -and $existing.id) {
                 Write-Host "    检测到已存在 Release($relTag)，先删除再重建..." -ForegroundColor Yellow
                 Invoke-RestMethod -Uri "$apiBase/$($existing.id)" -Method Delete -Headers $headers -ErrorAction Stop | Out-Null
-                & git -C $gitDir push origin ":refs/tags/$relTag" 2>$null
-                & git -C $gitDir tag -d $relTag 2>$null
+                [void](Invoke-GitCommand -GitDir $gitDir -Arguments @('push', 'origin', ":refs/tags/$relTag"))
+                [void](Invoke-GitCommand -GitDir $gitDir -Arguments @('tag', '-d', $relTag))
             }
         } catch {
             # 404 = 不存在，忽略（Release 尚不存在，可安全跳过）
@@ -426,9 +495,16 @@ try {
             $bodyJson = @{ tag_name = $relTag; name = $relName; body = $relNotes; draft = $false; prerelease = $false } | ConvertTo-Json -Compress
             $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($bodyJson)
             $rel = Invoke-RestMethod -Uri $apiBase -Method Post -Headers $headers -Body $bodyBytes -ContentType "application/json; charset=utf-8"
-            $uploadUrl = $rel.upload_url -replace '\{.*\}$', "?name=$(Split-Path $zipPath -Leaf)"
-            $assetBytes = [System.IO.File]::ReadAllBytes($zipPath)
-            Invoke-RestMethod -Uri $uploadUrl -Method Post -Headers $headers -Body $assetBytes -ContentType "application/zip" | Out-Null
+            $assets = @($zipPath)
+            if ($installerPath) { $assets += $installerPath }
+            foreach ($assetPath in $assets) {
+                $assetFile = Split-Path $assetPath -Leaf
+                $uploadUrl = $rel.upload_url -replace '\{.*\}$', ("?name=" + [uri]::EscapeDataString($assetFile))
+                $assetBytes = [System.IO.File]::ReadAllBytes($assetPath)
+                $ctype = if ([System.IO.Path]::GetExtension($assetPath).ToLower() -eq '.zip') { 'application/zip' } else { 'application/octet-stream' }
+                Invoke-RestMethod -Uri $uploadUrl -Method Post -Headers $headers -Body $assetBytes -ContentType $ctype | Out-Null
+                Write-Host "    已上传资产: $assetFile ($('{0:F2}' -f ((Get-Item $assetPath).Length / 1MB)) MB)" -ForegroundColor Green
+            }
             Write-Host "[OK] Release 已创建并上传资产: $relTag -> $($rel.html_url)" -ForegroundColor Green
         } catch {
             Write-Warning "GitHub API 创建 Release 失败：$_ 源码已推送，可稍后手动发布 Release。"
@@ -436,9 +512,11 @@ try {
     } elseif (($gh = Get-Command gh -ErrorAction SilentlyContinue) -and $repoOk) {
         Write-Host "==> 通过 gh 创建/更新 Release $relTag 并上传发布包..." -ForegroundColor Cyan
         & gh -C $gitDir release delete $relTag --yes 2>$null
-        & git -C $gitDir push origin ":refs/tags/$relTag" 2>$null
-        & git -C $gitDir tag -d $relTag 2>$null
-        & gh -C $gitDir release create $relTag $zipPath --title $relName --notes $relNotes --latest 2>$null
+        [void](Invoke-GitCommand -GitDir $gitDir -Arguments @('push', 'origin', ":refs/tags/$relTag"))
+        [void](Invoke-GitCommand -GitDir $gitDir -Arguments @('tag', '-d', $relTag))
+        $ghAssets = @($zipPath)
+        if ($installerPath) { $ghAssets += $installerPath }
+        & gh -C $gitDir release create $relTag @ghAssets --title $relName --notes $relNotes --latest 2>$null
         if ($LASTEXITCODE -eq 0) { Write-Host "[OK] Release 已创建: $relTag" -ForegroundColor Green }
         else { Write-Warning "gh release create 失败（退出码 $LASTEXITCODE）；源码已推送，可稍后手动发布 Release。" }
     } else {
@@ -450,6 +528,7 @@ try {
     Write-Banner "发布成功完成（源码已推送 GitHub）"
     Write-Host "产物 exe : $exePath" -ForegroundColor Green
     Write-Host "发布包  : $zipPath" -ForegroundColor Green
+    if ($installerPath) { Write-Host "安装包  : $installerPath" -ForegroundColor Green }
     Write-Host "内容    : $($filesToPack.Count) 个文件（含 $exeName + 文档）" -ForegroundColor Green
     exit 0
 } catch {
