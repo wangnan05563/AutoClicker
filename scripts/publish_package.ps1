@@ -18,6 +18,129 @@ function Write-Banner($msg) {
     Write-Host ("=" * 60) -ForegroundColor DarkGray
 }
 
+# ---------- 发布前置检查（对齐 AirMirror 一键发布的 fast-fail 思路） ----------
+function Get-MissingPythonImports($PythonPath, $Imports) {
+    # native 子进程写 stderr 在 $ErrorActionPreference='Stop' 下会抛 RemoteException，
+    # 故此处临时降为 Continue 并用 2>$null 丢弃，仅以退出码判定（纯探测，不创建窗口）。
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $missing = @()
+        foreach ($m in $Imports) {
+            & $PythonPath -c "import $m" 2>$null
+            if ($LASTEXITCODE -ne 0) { $missing += $m }
+        }
+        return $missing
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+}
+
+function Resolve-PreflightPython($Cfg) {
+    # 合并'构建必需'与'发布前校验'的模块清单，去重
+    $imports = @($Cfg.runtime.required_imports) + @($Cfg.runtime.publish_preflight_imports)
+    $imports = @($imports | Where-Object { $_ } | Select-Object -Unique)
+
+    $candidates = @()
+    foreach ($c in $Cfg.runtime.python_candidates) {
+        $p = [System.Environment]::ExpandEnvironmentVariables($c)
+        if ($p -and (Test-Path $p)) { $candidates += $p }
+    }
+    $cmd = Get-Command python -ErrorAction SilentlyContinue
+    if ($cmd) { $candidates += $cmd.Source }
+    $py = Get-Command py -ErrorAction SilentlyContinue
+    if ($py) { $candidates += $py.Source }
+    $candidates = @($candidates | Select-Object -Unique)
+
+    $attempts = @()
+    foreach ($p in $candidates) {
+        $miss = @(Get-MissingPythonImports $p $imports)
+        if ($miss.Count -eq 0) { return @{ Python = $p; Missing = @() } }
+        $attempts += "$p -> missing: $($miss -join ', ')"
+    }
+    return @{ Python = $null; Missing = $attempts }
+}
+
+function Import-GitHubToken($GitDir) {
+    # 载入 GitHub Token（环境变量 > 项目 .env > ~/.git-credentials）；绝不回显值
+    if ($env:GITHUB_TOKEN) { return $true }
+    $envFilePath = Join-Path $GitDir ".env"
+    if (Test-Path $envFilePath) {
+        foreach ($raw in (Get-Content $envFilePath -Encoding UTF8)) {
+            $line = $raw.Trim()
+            if ($line -eq '' -or $line.StartsWith('#')) { continue }
+            if ($line -match '^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$') {
+                $k = $Matches[1]; $v = $Matches[2].Trim()
+                if ($v -match '^"(.*)"$') { $v = $Matches[1] }
+                elseif ($v -match "^'(.*)'$") { $v = $Matches[1] }
+                $v = $v -replace '\s+#.*$', ''
+                if (($k -eq 'GH_TOKEN' -or $k -eq 'GITHUB_TOKEN') -and $v -ne '') {
+                    $env:GITHUB_TOKEN = $v
+                    return $true
+                }
+            }
+        }
+    }
+    $credPath = Join-Path $env:USERPROFILE ".git-credentials"
+    if (Test-Path $credPath) {
+        foreach ($line in (Get-Content $credPath -Encoding UTF8)) {
+            if ($line -match 'https://[^:@]+:([^@]+)@github\.com') { $env:GITHUB_TOKEN = $Matches[1]; return $true }
+            elseif ($line -match 'https://([^:@]+)@github\.com') { $env:GITHUB_TOKEN = $Matches[1]; return $true }
+        }
+    }
+    return $false
+}
+
+function Test-PublishPreflight($Cfg, $GitDir) {
+    Write-Banner "步骤 0/6: 发布前置检查（fast-fail）"
+    $ok = $true
+
+    # 1) git 工作树与 origin remote（抑制 native stderr，避免 Stop 模式下抛 RemoteException）
+    try {
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $inside = (& git -C $GitDir rev-parse --is-inside-work-tree 2>$null).Trim()
+            $insideOk = ($LASTEXITCODE -eq 0 -and $inside -eq 'true')
+            $remote = (& git -C $GitDir remote get-url origin 2>$null).Trim()
+            $remoteOk = ($LASTEXITCODE -eq 0 -and $remote)
+        } finally {
+            $ErrorActionPreference = $prevEAP
+        }
+        if (-not $insideOk) { throw 'not a git work tree' }
+        if (-not $remoteOk) { throw 'no origin remote' }
+        Write-Host "[OK] git 工作树与 origin remote: $remote" -ForegroundColor Green
+    } catch {
+        Write-Host "[FAIL] git 仓库/远程检查失败: $_" -ForegroundColor Red
+        $ok = $false
+    }
+
+    # 2) Python 与关键运行时依赖（兜住'缺依赖导致打包后功能失效'的坑）
+    $pyInfo = Resolve-PreflightPython $Cfg
+    if ($pyInfo.Python) {
+        $ver = (& $pyInfo.Python --version 2>$null).Trim()
+        Write-Host "[OK] Python 及全部前置依赖可用: $ver -> $($pyInfo.Python)" -ForegroundColor Green
+    } else {
+        Write-Host "[FAIL] 未找到满足全部前置依赖的 Python 解释器，逐个探测结果：" -ForegroundColor Red
+        foreach ($a in $pyInfo.Missing) { Write-Host "       - $a" -ForegroundColor Red }
+        Write-Host "       请在满足依赖的构建机运行，或为候选 Python 安装缺失模块（pip install ...）后重试。" -ForegroundColor Yellow
+        $ok = $false
+    }
+
+    # 3) Token 可用性（仅告警，不阻断源码推送与打包）
+    if (Import-GitHubToken $GitDir) {
+        Write-Host "[OK] GitHub Token 已就绪（用于创建 Release）" -ForegroundColor Green
+    } else {
+        Write-Host "[WARN] 未找到 GitHub Token：源码仍会推送，但 Release 创建将跳过。" -ForegroundColor Yellow
+    }
+
+    if (-not $ok) { throw "发布前置检查未通过，已中止（未做任何构建/推送）。" }
+}
+
+# 命令行开关（-DryRun 只跑前置检查；-SkipBuild 复用现有产物）
+$DRY_RUN = ($args -contains '-DryRun') -or ($args -contains '--dry-run')
+$SKIP_BUILD = ($args -contains '-SkipBuild') -or ($args -contains '--skip-build')
+
 try {
     # 本脚本位于 scripts/ 下，项目根目录为其父目录
     $PROJECT_ROOT = Split-Path $PSScriptRoot -Parent
@@ -26,6 +149,14 @@ try {
 
     Write-Banner "$($config.project.name) 一键发布"
     Write-Host "项目根目录: $PROJECT_ROOT"
+
+    # 步骤 0：发布前置检查（git/remote、Python 依赖、Token；任一硬性项失败即中止）
+    Test-PublishPreflight $config $PROJECT_ROOT
+
+    if ($DRY_RUN) {
+        Write-Banner "DryRun 完成：前置检查全部通过，未执行构建/打包/推送/发布。"
+        exit 0
+    }
 
     $distDir = $config.build.dist_dir
     $exeName = $config.build.exe_name
@@ -54,6 +185,11 @@ try {
         }
     } else {
         Write-Host "新鲜度检查已禁用，直接使用现有产物: $exePath" -ForegroundColor Gray
+    }
+
+    if ($SKIP_BUILD -and $needBuild) {
+        Write-Host "[WARN] -SkipBuild 已指定：产物过期但仍复用现有 exe（可能存在陈旧风险）。" -ForegroundColor Yellow
+        $needBuild = $false
     }
 
     if ($needBuild) {
