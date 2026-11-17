@@ -36,6 +36,29 @@ function Invoke-GitCommand {
     }
 }
 
+# GitHub Release 资产上传：流式上传（-InFile）+ 重试，避免大文件整读进内存导致连接中断。
+function Send-GitHubAsset {
+    param(
+        [Parameter(Mandatory = $true)][string]$UploadUrl,
+        [Parameter(Mandatory = $true)][hashtable]$Headers,
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string]$ContentType
+    )
+    $fileName = Split-Path $FilePath -Leaf
+    $url = $UploadUrl -replace '\{.*\}$', ("?name=" + [uri]::EscapeDataString($fileName))
+    for ($i = 1; $i -le 3; $i++) {
+        try {
+            Invoke-RestMethod -Uri $url -Method Post -Headers $Headers -InFile $FilePath `
+                -ContentType $ContentType -TimeoutSec 600 -ErrorAction Stop | Out-Null
+            return $true
+        } catch {
+            Write-Warning "资产上传失败（第 $i/3 次，$fileName）：$($_.Exception.Message)"
+            Start-Sleep -Seconds 4
+        }
+    }
+    return $false
+}
+
 # ---------- 发布前置检查（对齐 AirMirror 一键发布的 fast-fail 思路） ----------
 function Get-MissingPythonImports($PythonPath, $Imports) {
     # native 子进程写 stderr 在 $ErrorActionPreference='Stop' 下会抛 RemoteException，
@@ -498,16 +521,15 @@ try {
             $assets = @($zipPath)
             if ($installerPath) { $assets += $installerPath }
             foreach ($assetPath in $assets) {
-                $assetFile = Split-Path $assetPath -Leaf
-                $uploadUrl = $rel.upload_url -replace '\{.*\}$', ("?name=" + [uri]::EscapeDataString($assetFile))
-                $assetBytes = [System.IO.File]::ReadAllBytes($assetPath)
                 $ctype = if ([System.IO.Path]::GetExtension($assetPath).ToLower() -eq '.zip') { 'application/zip' } else { 'application/octet-stream' }
-                Invoke-RestMethod -Uri $uploadUrl -Method Post -Headers $headers -Body $assetBytes -ContentType $ctype | Out-Null
-                Write-Host "    已上传资产: $assetFile ($('{0:F2}' -f ((Get-Item $assetPath).Length / 1MB)) MB)" -ForegroundColor Green
+                if (-not (Send-GitHubAsset -UploadUrl $rel.upload_url -Headers $headers -FilePath $assetPath -ContentType $ctype)) {
+                    throw "GitHub 资产上传失败（已重试 3 次）: $(Split-Path $assetPath -Leaf)"
+                }
+                Write-Host "    已上传资产: $(Split-Path $assetPath -Leaf) ($('{0:F2}' -f ((Get-Item $assetPath).Length / 1MB)) MB)" -ForegroundColor Green
             }
             Write-Host "[OK] Release 已创建并上传资产: $relTag -> $($rel.html_url)" -ForegroundColor Green
         } catch {
-            Write-Warning "GitHub API 创建 Release 失败：$_ 源码已推送，可稍后手动发布 Release。"
+            throw "GitHub Release 发布失败：$($_.Exception.Message)（源码已推送；修复网络后可直接重跑本脚本）"
         }
     } elseif (($gh = Get-Command gh -ErrorAction SilentlyContinue) -and $repoOk) {
         Write-Host "==> 通过 gh 创建/更新 Release $relTag 并上传发布包..." -ForegroundColor Cyan
