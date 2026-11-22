@@ -38,9 +38,13 @@ from auto_clicker_layers.engine import (
 )
 from auto_clicker_layers.theme import (
     THEMES as _THEME_PALETTES,
+    SYSTEM_THEME_NAME as _THEME_SYSTEM_NAME,
+    load_user_themes as _theme_load_user_themes,
     shade_color as _theme_shade,
     system_is_dark as _theme_system_is_dark,
     resolve_palette as _theme_resolve_palette,
+    theme_display_map as _theme_display_map,
+    validate_theme_pack as _theme_validate_pack,
 )
 from auto_clicker_layers.config import (
     clone_defaults as _config_clone_defaults,
@@ -582,10 +586,17 @@ class AutoClicker:
 
     # ==================== P2 主题系统（TH-01 / TH-02 / TH-03） ====================
     def _init_theme(self):
-        """初始化主题：语义化调色板 + 可选接入 ttkbootstrap + 读取持久化主题"""
+        """初始化主题：5 套内置主题 + 用户 JSON 主题包 + 可选 ttkbootstrap。"""
+        self.user_theme_dir = os.path.expanduser('~/.auto_clicker/themes')
+        self._user_themes, self._theme_load_errors = _theme_load_user_themes(self.user_theme_dir)
         # TH-02：语义化变量集中在 theme 层，避免散落十六进制
-        self.THEMES = _THEME_PALETTES
-        self.theme_mode = self.config.get('theme_mode', 'light')
+        self.THEMES = dict(_THEME_PALETTES)
+        self.THEMES.update(self._user_themes)
+        self._theme_name_map = _theme_display_map(self.THEMES)
+        requested = self.config.get('theme_pack') or self.config.get('theme_mode', 'light')
+        if requested != 'system' and requested not in self.THEMES:
+            requested = 'light'
+        self.theme_mode = requested
         self._ttkb_style = None
         # TH-01：可选接入 ttkbootstrap（缺失则降级为纯 ttk + 手动语义配色）
         try:
@@ -614,15 +625,67 @@ class AutoClicker:
         return _theme_resolve_palette(getattr(self, 'theme_mode', 'light'), self.THEMES,
                                       self._system_is_dark)
 
-    def _apply_ttkbootstrap_theme(self):
+    def _current_theme_display_name(self):
+        if self.theme_mode == 'system':
+            return _THEME_SYSTEM_NAME
+        pal = self.THEMES.get(self.theme_mode, self.THEMES['light'])
+        return pal.get('name') or self.theme_mode
+
+    def _refresh_theme_selector(self):
+        """刷新主题下拉框：系统 + 5 套内置 + 用户主题。"""
+        try:
+            self._theme_name_map = _theme_display_map(self.THEMES)
+            names = list(self._theme_name_map.keys())
+            if getattr(self, 'theme_var', None) is not None:
+                self.theme_var.set(self._current_theme_display_name())
+            if getattr(self, 'theme_combo', None) is not None:
+                self.theme_combo['values'] = names
+        except Exception:
+            pass
+
+    def reload_user_themes(self):
+        """重新扫描用户主题目录，保留当前主题选择。"""
+        try:
+            self._user_themes, self._theme_load_errors = _theme_load_user_themes(self.user_theme_dir)
+            self.THEMES = dict(_THEME_PALETTES)
+            self.THEMES.update(self._user_themes)
+            if self.theme_mode != 'system' and self.theme_mode not in self.THEMES:
+                self.theme_mode = 'light'
+            self._refresh_theme_selector()
+        except Exception:
+            pass
+
+    def import_user_theme(self):
+        """FR-35：导入 JSON 主题包，校验后复制到 ~/.auto_clicker/themes/。"""
+        from tkinter import filedialog
+        try:
+            path = filedialog.askopenfilename(
+                title="导入主题包", filetypes=[("JSON 主题包", JSON_FILE_PATTERN)])
+            if not path:
+                return
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            pal, errors = _theme_validate_pack(data, existing_ids=set(_THEME_PALETTES))
+            if errors or not pal:
+                messagebox.showerror("主题包无效", "\n".join(errors or ['未知错误']))
+                return
+            os.makedirs(self.user_theme_dir, exist_ok=True)
+            dest = os.path.join(self.user_theme_dir, pal['id'] + '.json')
+            with open(dest, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self.reload_user_themes()
+            self.on_theme_change(pal['id'])
+            messagebox.showinfo("主题已导入", "已导入主题：%s" % (pal.get('name') or pal['id']))
+        except Exception as e:
+            messagebox.showerror("导入失败", str(e))
+
+    def _apply_ttkbootstrap_theme(self, pal=None):
         """切换 ttkbootstrap 主题（TH-01）；未安装或切换失败时静默降级。"""
         if self._ttkb_style is None:
             return
         try:
-            effective = self.theme_mode
-            if effective == 'system':
-                effective = 'dark' if self._system_is_dark() else 'light'
-            tb_name = 'darkly' if effective == 'dark' else 'cosmo'
+            pal = pal or self._resolve_palette()
+            tb_name = 'darkly' if pal.get('is_dark') else 'cosmo'
             self._ttkb_style.theme_use(tb_name)
         except Exception:
             pass
@@ -672,7 +735,7 @@ class AutoClicker:
         """
         try:
             style = ttk.Style(self.root)
-            dark = pal.get('bg') == self.THEMES['dark']['bg']
+            dark = bool(pal.get('is_dark'))
             available = set(style.theme_names())
             if dark:
                 if 'clam' in available:
@@ -816,7 +879,7 @@ class AutoClicker:
         try:
             pal = self._resolve_palette()
             self._current_palette = pal
-            self._apply_ttkbootstrap_theme()
+            self._apply_ttkbootstrap_theme(pal)
             self._apply_ttk_theme_styles(pal)
             # theme_use 会重置 ttk 样式字体，切换后需按统一基准重新覆盖
             self._apply_ttk_fonts()
@@ -838,15 +901,20 @@ class AutoClicker:
             pass
 
     def on_theme_change(self, mode):
-        """切换主题并持久化（TH-03）"""
+        """切换主题并持久化（FR-33/34/35）。"""
         try:
-            if mode not in ('light', 'dark', 'system'):
+            valid = set(self.THEMES.keys()) | {'system'}
+            if mode not in valid:
                 return
             self.theme_mode = mode
-            self.config['theme_mode'] = mode
+            self.config['theme_pack'] = mode
+            # 兼容旧字段：保留 light/dark/system 口径
+            if mode in ('light', 'dark', 'system'):
+                self.config['theme_mode'] = mode
+            else:
+                self.config['theme_mode'] = 'dark' if self._resolve_palette().get('is_dark') else 'light'
             self.save_config()
-            if getattr(self, 'theme_var', None) is not None:
-                self.theme_var.set({'light': '浅色', 'dark': '深色', 'system': '跟随系统'}.get(mode, '浅色'))
+            self._refresh_theme_selector()
             self._apply_theme()
             # 跟随系统模式：启动轮询，随系统深浅色变化
             if mode == 'system':
@@ -855,8 +923,8 @@ class AutoClicker:
             pass
 
     def on_theme_change_ui(self, event=None):
-        mapping = {'浅色': 'light', '深色': 'dark', '跟随系统': 'system'}
-        self.on_theme_change(mapping.get(self.theme_var.get(), 'light'))
+        mode = getattr(self, '_theme_name_map', {}).get(self.theme_var.get(), 'light')
+        self.on_theme_change(mode)
 
     def _poll_system_theme(self):
         """system 模式下每 5s 检测系统深浅色变化并应用（TH-03）"""
@@ -1549,16 +1617,18 @@ class AutoClicker:
                                           font=('微软雅黑', 11, 'bold'), foreground=self._color('danger'))
         self.status_text_label.pack(side=tk.RIGHT, padx=5)
         
-        # 主题选择器（TH-01 / TH-03）
+        # 主题选择器（FR-33/34/35）
         theme_row = ttk.Frame(header_frame)
         theme_row.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(theme_row, text="主题", font=('微软雅黑', 9)).pack(side=tk.LEFT)
-        self.theme_var = tk.StringVar(
-            value={'light': '浅色', 'dark': '深色', 'system': '跟随系统'}.get(self.theme_mode, '浅色'))
+        self.theme_var = tk.StringVar(value=self._current_theme_display_name())
         self.theme_combo = ttk.Combobox(theme_row, textvariable=self.theme_var,
-                                        values=['浅色', '深色', '跟随系统'], state='readonly', width=10)
+                                        values=list(self._theme_name_map.keys()),
+                                        state='readonly', width=16)
         self.theme_combo.pack(side=tk.LEFT, padx=(5, 0))
         self.theme_combo.bind('<<ComboboxSelected>>', self.on_theme_change_ui)
+        ttk.Button(theme_row, text="导入主题", command=self.import_user_theme,
+                   width=8).pack(side=tk.LEFT, padx=(6, 0))
 
         # FR-L01 / 6.12.1：Wayland 降级横幅（可关闭；纯文本，保持 UI-02 零 emoji）
         if not self.input_ok:
@@ -3246,7 +3316,7 @@ class AutoClicker:
                 base_path = os.path.dirname(__file__)
             
             # 查找当前主题对应的双套图标（16/32px 已打包进 ICO）
-            dark = getattr(self, '_current_palette', {}).get('bg') == self.THEMES['dark']['bg']
+            dark = bool(getattr(self, '_current_palette', {}).get('is_dark', False))
             preferred = 'tray_dark.ico' if dark else 'tray_light.ico'
             for name in (preferred, 'tray.ico', 'autoclicker.ico'):
                 icon_path = os.path.join(base_path, 'icons', name)

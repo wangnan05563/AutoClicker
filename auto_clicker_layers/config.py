@@ -29,6 +29,7 @@ DEFAULT_CONFIG = {
     'use_multi_points': False,
     'multi_points': [],
     'theme_mode': 'light',
+    'theme_pack': 'system',
     'schedule': {'enabled': False, 'start_at': '09:00',
                  'stop_after_min': 0, 'weekdays': [1, 2, 3, 4, 5]},
     'config_version': 2,
@@ -55,9 +56,12 @@ def normalize_config(config):
     """补齐默认字段、profiles/current_profile、config_version 与 schedule 子字段。"""
     if not isinstance(config, dict):
         config = {}
+    had_theme_pack = 'theme_pack' in config
     for key, value in DEFAULT_CONFIG.items():
         if key not in config:
             config[key] = json.loads(json.dumps(value))
+    if not had_theme_pack and config.get('theme_mode') in ('light', 'dark', 'system'):
+        config['theme_pack'] = config['theme_mode']
     try:
         if int(config.get('config_version', 0) or 0) < 2:
             config['config_version'] = 2
