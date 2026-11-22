@@ -39,6 +39,50 @@ for page in ('run', 'rules', 'records', 'settings'):
     assert elapsed < 0.1, 'page switch too slow: %s %.3fs' % (page, elapsed)
 print("GUI_SMOKE_OK")
 
+# FR-26：状态环、今日统计、会话保持与倒计时小数秒可刷新
+app._show_page('run')
+app.daily_stats = app_module._dashboard.empty_daily_stats()
+app.daily_stats.update({
+    'click_count': 20, 'success_count': 17, 'fail_count': 3,
+    'run_count': 2, 'runtime_seconds': 32.0,
+})
+app.last_run_stats = {
+    'timestamp': '2026-11-23T09:00:00', 'click_count': 4,
+    'success_count': 3, 'fail_count': 1, 'exception_count': 0,
+    'runtime_seconds': 10.0, 'interval_seconds': 10, 'mode': 'center',
+    'button': 'left', 'stop_reason': '手动停止',
+}
+app.refresh_run_dashboard()
+assert app.today_clicks_var.get() == '20'
+assert app.today_rate_var.get() == '85.0%'
+assert app.today_runs_var.get() == '2'
+assert '点击 4 次' in app.run_last_label.cget('text')
+assert app.run_session_check.cget('text') in ('开', '关')
+assert app.run_ring_canvas.find_all()
+app.is_running = True
+app.start_time = time.time() - 5
+app.click_count = 3
+app.success_count = 2
+app.fail_count = 1
+app._set_run_countdown(2.5, 3.0)
+assert '2.5' in app.run_state_detail_var.get()
+assert '2.5s' in app._ring_subtext
+app.is_running = False
+app._set_run_ring('stopped', '已停止', '等待开始', progress=0.0, detail='等待开始')
+# 异常态：顶栏/标题/状态环统一，原因只出现一次，诊断入口可点
+app.is_running = True
+app._mark_run_abnormal('连续 3 次点击失败，请检查输入后端或权限')
+assert app.status_text_label.cget('text') == '异常', app.status_text_label.cget('text')
+assert app._ring_state == 'abnormal'
+assert '点击线程仍在继续' in app.run_state_detail_var.get()
+assert '连续 3 次点击失败' in app.run_error_var.get()
+assert '连续 3 次点击失败' not in app.run_state_detail_var.get()
+assert app.run_diag_btn.winfo_manager() == 'pack'
+app.is_running = False
+app._do_set_status('已停止', app._color('muted'))
+app.refresh_run_dashboard()
+print("GUI_DASHBOARD_OK")
+
 # FR-25：Simple 隐藏高级卡片/记录页入口，Advanced 恢复且不重置参数
 assert app.config.get('ui_mode') == 'simple', app.config.get('ui_mode')
 assert app.p1_card.winfo_manager() == ''

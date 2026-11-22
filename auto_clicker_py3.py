@@ -58,6 +58,7 @@ from auto_clicker_layers.config import (
 from auto_clicker_layers import onboarding as _onboarding
 from auto_clicker_layers import run_report as _run_report
 from auto_clicker_layers import diagnostics as _diagnostics
+from auto_clicker_layers import dashboard as _dashboard
 
 # 点击抖动使用系统安全随机源，避免可预测的伪随机序列
 _RANDOM = random.SystemRandom()
@@ -371,8 +372,21 @@ class AutoClicker:
             'interval_seconds': 0.0, 'mode': '', 'button': '',
             'stop_reason': '',
         }
+        # FR-26：今日统计跨运行保留；只存聚合计数，不含点击坐标/窗口标题。
+        self.daily_stats_file = os.path.expanduser("~/.auto_clicker_daily_stats.json")
+        self.daily_stats = _dashboard.load(self.daily_stats_file)
+        self._daily_run_recorded = False
+        self._consecutive_click_failures = 0
+        self._last_abnormal_reason = ''
+        self._ring_state = 'stopped'
+        self._ring_progress = 0.0
+        self._ring_headline = '已停止'
+        self._ring_subtext = '等待开始'
 
         self.load_config()
+        # FR-26：运行台“会话保持”开关与规则页共用同一个变量，必须先于 setup_ui 创建
+        self.prevent_sleep_var = tk.BooleanVar(
+            value=bool(self.config.get('prevent_sleep', False)))
         self._init_theme()
         self._init_ui_fonts()
         self.setup_ui()
@@ -838,7 +852,7 @@ class AutoClicker:
     def _recolor_semantic_labels(self, pal):
         """TH-02：主题切换后同步语义色标签/画布，避免残留上一主题的硬编码色。"""
         try:
-            status_key = 'success' if getattr(self, 'is_running', False) else 'danger'
+            status_key = 'success' if getattr(self, 'is_running', False) else 'muted'
             pairs = (
                 ('status_text_label', status_key),
                 ('sb_status_label', status_key),
@@ -850,6 +864,15 @@ class AutoClicker:
                 ('next_click_label', 'primary'),
                 ('click_count_label', 'success'),
                 ('mouse_speed_label', 'primary'),
+                ('today_clicks_label', 'text'),
+                ('today_rate_label', 'success'),
+                ('today_runs_label', 'primary'),
+                ('run_last_label', 'muted'),
+                ('run_summary_label', 'muted'),
+                ('run_next_label', 'primary'),
+                ('run_error_label', 'danger'),
+                ('run_state_label', self._ring_color_key()),
+                ('run_state_detail_label', self._ring_color_key()),
             )
             for attr, key in pairs:
                 widget = getattr(self, attr, None)
@@ -940,6 +963,7 @@ class AutoClicker:
             self._refresh_nav_styles()
             if key == 'run' and hasattr(self, 'run_summary_label'):
                 self.run_summary_label.config(text=self._run_summary_text())
+                self.refresh_run_dashboard()
             if key == 'settings' and not getattr(self, '_diagnostics_report', None):
                 self.root.after(100, self.refresh_diagnostics)
         except Exception:
@@ -1026,11 +1050,347 @@ class AutoClicker:
             duration = self.config.get('duration_limit', 0) or '无限'
             sleep = '开' if self.config.get('prevent_sleep', False) else '关'
             return ("间隔：%s %s    模式：%s    次数上限：%s    时长上限：%s 分钟\n"
-                    "防锁屏：%s    多点位：%s" % (
+                    "会话保持：%s    多点位：%s" % (
                         interval, unit, mode, limit, duration, sleep,
                         '开' if self.config.get('use_multi_points', False) else '关'))
         except Exception:
             return "当前配置读取失败，请到「规则」页检查。"
+
+    def _run_metric(self, parent, row, column, title, value_var, color):
+        box = ttk.Frame(parent)
+        box.grid(row=row, column=column, sticky=tk.EW, padx=(0, 8), pady=(0, 8))
+        ttk.Label(box, text=title, font=('微软雅黑', 8),
+                  foreground=self._color('muted')).pack(anchor=tk.W)
+        label = ttk.Label(box, textvariable=value_var,
+                          font=('微软雅黑', 15, 'bold'), foreground=color)
+        label.pack(anchor=tk.W, pady=(2, 0))
+        return label
+
+    def _ring_color_key(self):
+        return {
+            'running': 'success',
+            'countdown': 'primary',
+            'abnormal': 'danger',
+            'paused': 'warning',
+        }.get(getattr(self, '_ring_state', 'stopped'), 'muted')
+
+    def _draw_run_ring(self):
+        """绘制状态环：倒计时按剩余比例收缩，运行中满环，停止为中性灰。"""
+        canvas = getattr(self, 'run_ring_canvas', None)
+        if canvas is None:
+            return
+        try:
+            pal = self._current_palette
+            color = pal.get(self._ring_color_key(), pal['muted'])
+            canvas.configure(bg=pal['surface'])
+            frame = getattr(self, 'run_ring_frame', None)
+            if frame is not None:
+                frame.configure(bg=pal['surface'])
+            canvas.delete('all')
+            canvas.create_oval(10, 10, 166, 166, outline=pal['surface_alt'], width=10)
+            progress = max(0.0, min(1.0, float(getattr(self, '_ring_progress', 0.0))))
+            if progress >= 0.999:
+                canvas.create_oval(10, 10, 166, 166, outline=color, width=10)
+            elif progress > 0:
+                canvas.create_arc(10, 10, 166, 166, start=90,
+                                  extent=-360.0 * progress, style='arc',
+                                  outline=color, width=10)
+            canvas.create_text(88, 63, text=str(self._ring_headline),
+                               font=('微软雅黑', 15, 'bold'), fill=pal['text'])
+            canvas.create_text(88, 102, text=str(self._ring_subtext),
+                               font=('微软雅黑', 12, 'bold'), fill=color)
+            canvas.create_text(88, 139, text="F6 启停 · F8/Esc 急停",
+                               font=('微软雅黑', 8), fill=pal['muted'])
+        except Exception:
+            pass
+
+    def _show_run_error(self, reason=''):
+        label = getattr(self, 'run_error_label', None)
+        if label is None:
+            return
+        reason = str(reason or '').strip()
+        if reason:
+            self.run_error_var.set("原因：" + reason)
+            try:
+                label.pack(anchor=tk.W, pady=(4, 0), before=self.run_actions)
+            except Exception:
+                pass
+        else:
+            try:
+                label.pack_forget()
+            except Exception:
+                pass
+        try:
+            if reason:
+                self.run_diag_btn.pack(side=tk.LEFT, padx=(8, 0))
+            else:
+                self.run_diag_btn.pack_forget()
+        except Exception:
+            pass
+
+    def _set_run_ring(self, state, headline=None, subtext=None, progress=None,
+                      detail=None, reason=''):
+        """统一刷新状态环、状态大字、原因和诊断入口。"""
+        if not hasattr(self, 'run_ring_canvas'):
+            return
+        self._ring_state = state
+        if headline is not None:
+            self._ring_headline = str(headline)
+        if subtext is not None:
+            self._ring_subtext = str(subtext)
+        if progress is not None:
+            self._ring_progress = max(0.0, min(1.0, float(progress)))
+        elif state in ('running', 'abnormal', 'paused'):
+            self._ring_progress = 1.0
+        elif state == 'stopped':
+            self._ring_progress = 0.0
+        if detail is not None:
+            self.run_state_detail_var.set(str(detail))
+        color_key = self._ring_color_key()
+        try:
+            self.run_state_label.config(
+                text=str(self._ring_headline), foreground=self._color(color_key))
+            self.run_state_detail_label.config(
+                foreground=self._color('muted' if state == 'stopped' else color_key))
+        except Exception:
+            pass
+        self._show_run_error(reason if state == 'abnormal' else '')
+        if state == 'abnormal':
+            self._last_abnormal_reason = str(reason or '')
+        self._draw_run_ring()
+        self._refresh_run_metrics()
+
+    def _update_run_detail(self):
+        if not hasattr(self, 'run_state_detail_var'):
+            return
+        state = getattr(self, '_ring_state', 'stopped')
+        if state == 'running':
+            elapsed = max(0, int(time.time() - getattr(self, 'start_time', time.time())))
+            mm, ss = elapsed // 60, elapsed % 60
+            self._ring_subtext = "%02d:%02d" % (mm, ss)
+            self.run_state_detail_var.set(
+                "已运行 %02d:%02d · 本次点击 %d 次" % (
+                    mm, ss, getattr(self, 'click_count', 0)))
+            self._draw_run_ring()
+        elif state == 'abnormal':
+            self.run_state_detail_var.set(
+                "点击线程仍在继续，可按 F8/Esc 停止" if self.is_running else "请查看诊断")
+        elif state == 'countdown':
+            # 倒计时由 _set_run_countdown 逐 100ms 刷新，避免这里覆盖小数秒
+            pass
+        else:
+            self.run_state_detail_var.set("等待开始")
+
+    def _sync_run_ring_from_status(self, text):
+        text = str(text or '').strip()
+        if not hasattr(self, 'run_ring_canvas'):
+            return
+        if '秒后启动' in text:
+            self._ring_state = 'countdown'
+            self._ring_headline = '倒计时'
+            self._ring_subtext = text.replace('后启动', '')
+            try:
+                self.run_state_detail_var.set("准备启动")
+            except Exception:
+                pass
+        elif text == '运行中':
+            self._ring_state = 'running'
+            self._ring_headline = '运行中'
+            self._ring_progress = 1.0
+            self._last_abnormal_reason = ''
+            try:
+                self.sb_countdown_label.config(text="--")
+            except Exception:
+                pass
+            self._update_run_detail()
+        elif text.startswith('异常'):
+            self._ring_state = 'abnormal'
+            self._ring_headline = '异常'
+            self._ring_subtext = '查看诊断'
+            self._ring_progress = 1.0
+            try:
+                self.sb_countdown_label.config(text="--")
+                self.countdown_bar['value'] = 0
+            except Exception:
+                pass
+            try:
+                self.run_state_detail_var.set(
+                    "点击线程仍在继续，可按 F8/Esc 停止"
+                    if self.is_running else "请查看诊断")
+            except Exception:
+                pass
+        elif text == '已停止':
+            if not getattr(self, 'input_ok', True):
+                self._ring_state = 'abnormal'
+                self._ring_headline = '异常'
+                self._ring_subtext = '输入不可用'
+                self._last_abnormal_reason = getattr(self, 'input_reason', '输入后端不可用')
+                try:
+                    self.run_state_detail_var.set("输入不可用，启动已禁用")
+                except Exception:
+                    pass
+            else:
+                self._ring_state = 'stopped'
+                self._ring_headline = '已停止'
+                self._ring_subtext = '等待开始'
+                self._ring_progress = 0.0
+                self._last_abnormal_reason = ''
+                try:
+                    self.run_state_detail_var.set("等待开始")
+                except Exception:
+                    pass
+        else:
+            self._ring_state = 'running'
+            self._ring_headline = text or '运行中'
+        try:
+            self.run_state_detail_label.config(
+                foreground=self._color('muted' if self._ring_state == 'stopped'
+                                       else self._ring_color_key()))
+        except Exception:
+            pass
+        self._show_run_error(
+            self._last_abnormal_reason if self._ring_state == 'abnormal' else '')
+        self._draw_run_ring()
+        self._refresh_run_metrics()
+
+    def _set_run_countdown(self, remaining, total):
+        """倒计时 100ms 刷新；剩余时间用单调时钟计算，显示误差 <200ms。"""
+        if not hasattr(self, 'run_ring_canvas') or not getattr(self, 'is_running', False):
+            return
+        total = max(0.001, float(total))
+        remaining = max(0.0, float(remaining))
+        fraction = max(0.0, min(1.0, remaining / total))
+        self._ring_state = 'countdown'
+        self._ring_headline = '倒计时'
+        self._ring_subtext = "%.1fs" % remaining
+        self._ring_progress = fraction
+        self.run_state_detail_var.set("剩余 %.1f 秒后开始" % remaining)
+        try:
+            self.run_state_label.config(text="倒计时", foreground=self._color('primary'))
+            self.run_state_detail_label.config(foreground=self._color('primary'))
+        except Exception:
+            pass
+        try:
+            self.countdown_bar['value'] = int((1.0 - fraction) * 100)
+            self.sb_countdown_label.config(text="%.1fs" % remaining)
+        except Exception:
+            pass
+        self._show_run_error('')
+        self._draw_run_ring()
+
+    def _refresh_next_plan(self):
+        label = getattr(self, 'run_next_label', None)
+        if label is None:
+            return
+        try:
+            enabled = self._schedule_settings()[0]
+            if enabled:
+                label.config(text="下次计划：%s" % self._schedule_next_text())
+            else:
+                label.config(text="下次计划：未启用（按 F6 手动启动）")
+        except Exception:
+            label.config(text="下次计划：读取失败")
+
+    def _refresh_run_metrics(self):
+        """今日统计 = 已落盘基线 + 正在运行的当前会话（不提前写盘）。"""
+        if not hasattr(self, 'today_clicks_var'):
+            return
+        try:
+            runtime = 0.0
+            if self.is_running:
+                runtime = max(0.0, time.time() - getattr(self, 'start_time', time.time()))
+            view = _dashboard.merge_session(
+                self.daily_stats,
+                click_count=getattr(self, 'click_count', 0),
+                success_count=getattr(self, 'success_count', 0),
+                fail_count=getattr(self, 'fail_count', 0),
+                exception_count=getattr(self, 'exception_count', 0),
+                runtime_seconds=runtime,
+                running=bool(self.is_running),
+            )
+            self.daily_stats = _dashboard.normalize(self.daily_stats)
+            self.today_clicks_var.set(str(view['click_count']))
+            self.today_rate_var.set(_dashboard.success_rate_text(view))
+            self.today_runs_var.set(str(view['run_count']))
+            self.run_summary_label.config(text=self._run_summary_text())
+            last = self.last_run_stats if self.last_run_stats.get('timestamp') else {}
+            self.run_last_label.config(text=_dashboard.last_run_text(last))
+            enabled = bool(getattr(self, 'prevent_sleep_var', None) and
+                           self.prevent_sleep_var.get())
+            if hasattr(self, 'run_session_check'):
+                self.run_session_check.config(text="开" if enabled else "关")
+            self._refresh_next_plan()
+        except Exception:
+            pass
+
+    def refresh_run_dashboard(self):
+        """供页面切换/主题刷新/冒烟测试调用的统一刷新入口。"""
+        if not hasattr(self, 'run_ring_canvas'):
+            return
+        if self.is_running:
+            if self._ring_state == 'countdown':
+                self._refresh_run_metrics()
+                return
+            if self._last_abnormal_reason:
+                self._set_run_ring('abnormal', '异常', '查看诊断',
+                                   detail="请查看诊断",
+                                   reason=self._last_abnormal_reason)
+            else:
+                self._set_run_ring('running', '运行中', '00:00',
+                                   progress=1.0)
+                self._update_run_detail()
+        elif not getattr(self, 'input_ok', True):
+            self._set_run_ring('abnormal', '异常', '输入不可用',
+                               detail=getattr(self, 'input_reason', '输入后端不可用'),
+                               reason=getattr(self, 'input_reason', '输入后端不可用'))
+        else:
+            self._set_run_ring('stopped', '已停止', '等待开始', progress=0.0,
+                               detail="等待开始")
+        self._refresh_run_metrics()
+
+    def _open_run_diagnostics(self):
+        try:
+            self.show_diagnostics_window()
+        except Exception as e:
+            self.log_message("打开诊断中心失败: " + str(e))
+
+    def _record_daily_run(self, run=None):
+        """一次运行结束后累加今日统计；失败只记日志，不影响停止流程。"""
+        if self._daily_run_recorded:
+            return
+        self._daily_run_recorded = True
+        try:
+            self.daily_stats = _dashboard.record_run(
+                self.daily_stats, run or self.last_run_stats)
+            self.daily_stats = _dashboard.save(self.daily_stats_file, self.daily_stats)
+            self._refresh_run_metrics()
+        except Exception as e:
+            try:
+                self.log_message("保存今日统计失败: " + str(e))
+            except Exception:
+                pass
+
+    def _mark_run_abnormal(self, reason):
+        reason = str(reason or '运行异常').strip()
+        self._last_abnormal_reason = reason
+        # 顶栏、窗口标题与运行台同步进入异常态，避免只红一个局部
+        try:
+            self._do_set_status("异常", self._color('danger'))
+        except Exception:
+            pass
+        self._ring_state = 'abnormal'
+        self._ring_headline = '异常'
+        self._ring_subtext = '查看诊断'
+        self._ring_progress = 1.0
+        try:
+            self.run_state_detail_var.set(
+                "点击线程仍在继续，可按 F8/Esc 停止" if self.is_running else "请查看诊断")
+            self.run_state_detail_label.config(foreground=self._color('danger'))
+            self.countdown_bar['value'] = 0
+        except Exception:
+            pass
+        self._show_run_error(reason)
+        self._draw_run_ring()
 
     def _apply_theme(self):
         """运行时应用主题：切换 ttk 主题 + 重着色语义化控件（TH-01/TH-02）"""
@@ -1067,6 +1427,13 @@ class AutoClicker:
                         _diagnostics.STATUS_WARN, foreground=pal['warning'])
                     self._diag_text.tag_config(
                         _diagnostics.STATUS_FAIL, foreground=pal['danger'])
+                except Exception:
+                    pass
+            # FR-26：状态环与统计卡随主题重着色
+            if hasattr(self, 'run_ring_canvas'):
+                try:
+                    self._draw_run_ring()
+                    self._refresh_run_metrics()
                 except Exception:
                     pass
             try:
@@ -1239,6 +1606,7 @@ class AutoClicker:
             self._schedule_last_tick = mono
             if gap > 90 and self.config.get('schedule', {}).get('enabled'):
                 self.log_message("检测到系统休眠/卡顿 %.0f 秒，补算定时计划" % gap)
+            self._refresh_next_plan()
             self._schedule_check()
         except Exception as e:
             print("定时计划检查失败: " + str(e))
@@ -1288,6 +1656,10 @@ class AutoClicker:
                 self.log_message("已禁用防止系统锁屏")
         except Exception as e:
             print(MSG_SAVE_CONFIG_FAILED + str(e))
+        try:
+            self._refresh_run_metrics()
+        except Exception:
+            pass
 
     def on_mouse_follow_changed(self):
         """鼠标跟随选项改变时的回调"""
@@ -2745,10 +3117,10 @@ class AutoClicker:
         self.status_indicator = tk.Canvas(title_container, width=12, height=12,
                                          highlightthickness=0, bg='white')
         self.status_indicator.pack(side=tk.RIGHT, padx=5)
-        self.status_circle = self.status_indicator.create_oval(2, 2, 10, 10, fill='red', outline='')
+        self.status_circle = self.status_indicator.create_oval(2, 2, 10, 10, fill=self._color('muted'), outline='')
         self.status_text_label = ttk.Label(title_container, text="已停止",
                                           font=('微软雅黑', 11, 'bold'),
-                                          foreground=self._color('danger'))
+                                          foreground=self._color('muted'))
         self.status_text_label.pack(side=tk.RIGHT, padx=5)
 
         # 顶部固定状态条：状态/倒计时/计数/运行时长
@@ -2757,7 +3129,7 @@ class AutoClicker:
         self.status_bar = status_strip
         self.sb_status_label = ttk.Label(status_strip, text="● 已停止",
                                          font=('微软雅黑', 9, 'bold'),
-                                         foreground=self._color('danger'))
+                                         foreground=self._color('muted'))
         self.sb_status_label.pack(side=tk.LEFT)
         ttk.Label(status_strip, text="倒计时", font=('微软雅黑', 8)).pack(
             side=tk.LEFT, padx=(10, 3))
@@ -2808,26 +3180,87 @@ class AutoClicker:
                           side=tk.RIGHT, padx=(0, 4))
             self._input_banner = warn_bar
 
-        # ==================== 运行台 ====================
-        run_card = ttk.LabelFrame(self.run_page, text="运行台", padding="18")
+        # ==================== 运行台（FR-26） ====================
+        run_card = ttk.LabelFrame(self.run_page, text="运行台", padding="16")
         run_card.pack(fill=tk.X, pady=(0, 14))
-        self.run_state_label = ttk.Label(run_card, text="已停止",
-                                         font=('微软雅黑', 22, 'bold'),
-                                         foreground=self._color('danger'))
-        self.run_state_label.pack(anchor=tk.W)
-        ttk.Label(run_card, text="底部操作条固定可用；点击参数在「规则」页维护。",
-                  font=('微软雅黑', 10), foreground=self._color('muted')).pack(
-                      anchor=tk.W, pady=(2, 10))
-        ttk.Separator(run_card, orient='horizontal').pack(fill=tk.X, pady=(0, 10))
-        self.run_summary_label = ttk.Label(run_card, text=self._run_summary_text(),
-                                           font=('微软雅黑', 10), justify=tk.LEFT)
-        self.run_summary_label.pack(anchor=tk.W)
-        self.run_next_label = ttk.Label(run_card, text="下次计划：--",
-                                        font=('微软雅黑', 9),
-                                        foreground=self._color('primary'))
-        self.run_next_label.pack(anchor=tk.W, pady=(8, 0))
-        ttk.Button(run_card, text="调整点击规则", command=lambda: self._show_page('rules')).pack(
-            anchor=tk.W, pady=(12, 0))
+        self.run_card = run_card
+
+        dashboard = ttk.Frame(run_card)
+        dashboard.pack(fill=tk.X)
+        ring_frame = tk.Frame(dashboard, bg=self._color('surface'))
+        ring_frame.pack(side=tk.LEFT, padx=(0, 18), anchor=tk.N)
+        self.run_ring_frame = ring_frame
+        self.run_ring_canvas = tk.Canvas(
+            ring_frame, width=176, height=176, highlightthickness=0,
+            bg=self._color('surface'))
+        self.run_ring_canvas.pack()
+        self._draw_run_ring()
+
+        dashboard_right = ttk.Frame(dashboard)
+        dashboard_right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.run_state_label = ttk.Label(
+            dashboard_right, text="已停止", font=('微软雅黑', 20, 'bold'),
+            foreground=self._color('muted'))
+        # 状态大字由状态环承担，右侧只保留更具体的运行详情，避免同一状态重复出现。
+        self.run_state_detail_var = tk.StringVar(value="等待开始")
+        self.run_state_detail_label = ttk.Label(
+            dashboard_right, textvariable=self.run_state_detail_var,
+            font=('微软雅黑', 16, 'bold'), foreground=self._color('muted'))
+        self.run_state_detail_label.pack(anchor=tk.W, pady=(0, 10))
+
+        metrics = ttk.Frame(dashboard_right)
+        metrics.pack(fill=tk.X, pady=(0, 2))
+        for column in range(2):
+            metrics.columnconfigure(column, weight=1)
+        self.today_clicks_var = tk.StringVar(value="0")
+        self.today_rate_var = tk.StringVar(value="--")
+        self.today_runs_var = tk.StringVar(value="0")
+        self.today_clicks_label = self._run_metric(
+            metrics, 0, 0, "今日点击", self.today_clicks_var, self._color('text'))
+        self.today_rate_label = self._run_metric(
+            metrics, 0, 1, "今日成功率", self.today_rate_var, self._color('success'))
+        self.today_runs_label = self._run_metric(
+            metrics, 1, 0, "今日运行", self.today_runs_var, self._color('primary'))
+        session_box = ttk.Frame(metrics)
+        session_box.grid(row=1, column=1, sticky=tk.EW, padx=(8, 0), pady=(0, 8))
+        ttk.Label(session_box, text="会话保持", font=('微软雅黑', 8),
+                  foreground=self._color('muted')).pack(anchor=tk.W)
+        self.run_session_check = ttk.Checkbutton(
+            session_box, text="关", variable=self.prevent_sleep_var,
+            command=self.on_prevent_sleep_changed)
+        self.run_session_check.pack(anchor=tk.W, pady=(2, 0))
+
+        ttk.Separator(dashboard_right, orient='horizontal').pack(fill=tk.X, pady=(2, 8))
+        self.run_last_label = ttk.Label(
+            dashboard_right, text="上次运行：暂无", font=('微软雅黑', 9),
+            foreground=self._color('muted'))
+        self.run_last_label.pack(anchor=tk.W)
+        self.run_summary_label = ttk.Label(
+            dashboard_right, text=self._run_summary_text(),
+            font=('微软雅黑', 9), justify=tk.LEFT,
+            foreground=self._color('muted'))
+        self.run_summary_label.pack(anchor=tk.W, pady=(4, 0))
+        self.run_next_label = ttk.Label(
+            dashboard_right, text="下次计划：未启用（按 F6 手动启动）",
+            font=('微软雅黑', 9), foreground=self._color('primary'))
+        self.run_next_label.pack(anchor=tk.W, pady=(6, 0))
+
+        self.run_error_var = tk.StringVar(value="")
+        self.run_error_label = ttk.Label(
+            dashboard_right, textvariable=self.run_error_var,
+            font=('微软雅黑', 9), foreground=self._color('danger'),
+            wraplength=560, justify=tk.LEFT)
+        # 仅在异常/输入不可用时 pack，不占用正常布局高度
+
+        run_actions = ttk.Frame(dashboard_right)
+        run_actions.pack(anchor=tk.W, pady=(8, 0))
+        self.run_actions = run_actions
+        ttk.Button(run_actions, text="调整点击规则",
+                   command=lambda: self._show_page('rules')).pack(side=tk.LEFT)
+        self.run_diag_btn = ttk.Button(
+            run_actions, text="查看诊断", command=self._open_run_diagnostics)
+        self.run_diag_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.run_diag_btn.pack_forget()
 
         # ==================== 底部固定操作条 ====================
         ttk.Separator(bottom_bar, orient='horizontal').pack(fill=tk.X, pady=(0, 6))
@@ -2879,6 +3312,7 @@ class AutoClicker:
         # 默认选中运行台
         self._active_page = 'run'
         self._show_page('run')
+        self.root.after(50, self.refresh_run_dashboard)
 
         # ==================== 配置区域 - 两列布局 ====================
         config_container = ttk.Frame(self.rules_page)
@@ -3006,7 +3440,6 @@ class AutoClicker:
         options_frame = ttk.LabelFrame(right_card, text="选项", padding="10")
         options_frame.pack(fill=tk.X, pady=(10, 0))
         
-        self.prevent_sleep_var = tk.BooleanVar(value=self.config['prevent_sleep'])
         self.prevent_sleep_check = ttk.Checkbutton(options_frame, text="防止系统锁屏",
                                              variable=self.prevent_sleep_var,
                                              command=self.on_prevent_sleep_changed)
@@ -3702,6 +4135,8 @@ class AutoClicker:
                 self.root.title(base_title + " - " + text)
             else:
                 self.root.title(base_title)
+            # FR-26：状态环、原因与今日统计同步刷新
+            self._sync_run_ring_from_status(text)
         except Exception:
             pass
 
@@ -3711,6 +4146,10 @@ class AutoClicker:
             self.sb_count_label.config(text="总点击: " + str(self.click_count))
             self.sb_success_label.config(text="成功: " + str(self.success_count))
             self.sb_fail_label.config(text="失败: " + str(self.fail_count))
+        except Exception:
+            pass
+        try:
+            self._refresh_run_metrics()
         except Exception:
             pass
 
@@ -3725,6 +4164,7 @@ class AutoClicker:
                     mm = elapsed // 60
                     ss = elapsed % 60
                     self.sb_runtime_label.config(text="运行时长: %02d:%02d" % (mm, ss))
+                    self._update_run_detail()
                 except Exception:
                     pass
                 self._runtime_after_id = self.root.after(1000, _tick)
@@ -3755,18 +4195,23 @@ class AutoClicker:
         self._ui(self._set_sb_counts)
         countdown = self.startup_countdown
         if countdown > 0:
-            self._ui(self.countdown_bar.config, value=0)
-            self._ui(self.sb_countdown_label.config, text=f"{countdown}s")
-            for i in range(countdown, 0, -1):
-                if not self.is_running:
-                    return
-                self._set_status(f"{i} 秒后启动", 'orange')
-                self._set_next(f"启动倒计时 {i}s")
-                self._ui(self.countdown_bar.config, value=int((countdown - i) / countdown * 100))
-                self._ui(self.sb_countdown_label.config, text=f"{i}s")
-                time.sleep(1)
+            deadline = time.monotonic() + countdown
+            last_second = None
+            while self.is_running:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                # 10Hz 刷新状态环；状态条文字只在整秒变化时更新，避免无谓重绘
+                self._ui(self._set_run_countdown, remaining, countdown)
+                second = max(1, int(remaining + 0.999))
+                if second != last_second:
+                    self._set_status("%d 秒后启动" % second, 'orange')
+                    self._set_next("启动倒计时 %.1fs" % remaining)
+                    last_second = second
+                time.sleep(min(0.1, max(0.01, remaining)))
             if not self.is_running:
                 return
+            self._ui(self._set_run_countdown, 0.0, countdown)
         self._ui(self.countdown_bar.config, value=100)
         self._set_status("运行中", 'green')
         self._set_next("--")
@@ -3891,8 +4336,15 @@ class AutoClicker:
         self.click_count += 1
         if final_ok:
             self.success_count += 1
+            self._consecutive_click_failures = 0
         else:
             self.fail_count += 1
+            failures = getattr(self, '_consecutive_click_failures', 0) + 1
+            self._consecutive_click_failures = failures
+            if (failures >= 3 and self.success_count == 0
+                    and not getattr(self, '_last_abnormal_reason', '')):
+                self._ui(self._mark_run_abnormal,
+                         "连续 3 次点击失败，请检查输入后端或权限")
         self._ui(self.click_count_label.config, text=str(self.click_count))
         self._ui(self._set_sb_counts)
         return final_ok
@@ -4003,6 +4455,8 @@ class AutoClicker:
             except Exception as e:
                 self.log_message(f"点击过程中发生错误: {e}")
                 self.exception_count += 1
+                self._ui(self._mark_run_abnormal,
+                         "点击异常：%s" % str(e)[:80])
                 self._ui(self._set_sb_counts)
                 time.sleep(1)
                 
@@ -4118,6 +4572,9 @@ class AutoClicker:
             self.success_count = 0
             self.fail_count = 0
             self.exception_count = 0
+            self._daily_run_recorded = False
+            self._consecutive_click_failures = 0
+            self._last_abnormal_reason = ''
             self._pending_end_summary = False
             self.countdown_cancelled = False
             self._interval_change_event.clear()
@@ -4254,6 +4711,8 @@ class AutoClicker:
             self._pending_end_summary = bool(
                 was_running and not getattr(self, '_suppress_end_summary', False))
             self.log_message(_run_report.log_summary_line(self.last_run_stats))
+            if was_running:
+                self._record_daily_run(self.last_run_stats)
         except Exception:
             pass
 
@@ -4272,7 +4731,7 @@ class AutoClicker:
     def _apply_stopped_ui(self):
         """停止后的主线程 UI 复位（后台线程自动停止时经 _ui 队列调用）。"""
         # 更新状态指示器（含底部状态条与窗口标题联动）
-        self._do_set_status("已停止", self._color('danger'))
+        self._do_set_status("已停止", self._color('muted'))
         self.next_click_label.config(text="--")
 
         # P2 状态条复位（UI-03）
@@ -4841,6 +5300,21 @@ class AutoClicker:
         self._pending_end_summary = False
         try:
             self._close_end_summary()
+        except Exception:
+            pass
+        # FR-26：运行中直接退出也要把本次已发生的点击计入今日统计
+        try:
+            if self.is_running and not self._daily_run_recorded:
+                self._record_daily_run({
+                    'timestamp': datetime.now().isoformat(timespec='seconds'),
+                    'click_count': getattr(self, 'click_count', 0),
+                    'success_count': getattr(self, 'success_count', 0),
+                    'fail_count': getattr(self, 'fail_count', 0),
+                    'exception_count': getattr(self, 'exception_count', 0),
+                    'runtime_seconds': max(
+                        0.0, time.time() - getattr(self, 'start_time', time.time())),
+                    'stop_reason': '程序退出',
+                })
         except Exception:
             pass
         self.is_running = False
