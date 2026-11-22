@@ -10,13 +10,14 @@
     "build_dir": "release/build",
     "spec_dir": "scripts",
     "exe_name": "AutoClicker.exe",
+    "package_mode": "onedir",
     "build_script": "scripts/build_exe.py",
     "build_ps1": "scripts/build_package.ps1",
     "pyinstaller": {
       "module": "PyInstaller",
       "pip_package": "pyinstaller",
       "flags": [
-        "--onefile",
+        "--onedir",
         "--windowed",
         "--noconfirm",
         "--clean"
@@ -50,7 +51,11 @@
         "ttkbootstrap.widgets"
       ],
       "exclude_modules": [
-        "cv2"
+        "cv2",
+        "numpy",
+        "psutil",
+        "yaml",
+        "mouseinfo"
       ]
     },
     "clean_paths": [

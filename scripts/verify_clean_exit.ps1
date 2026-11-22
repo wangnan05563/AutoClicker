@@ -1,5 +1,5 @@
 param(
-    [string]$ExePath = (Join-Path $PSScriptRoot '..\release\dist\AutoClicker.exe'),
+    [string]$ExePath = (Join-Path $PSScriptRoot '..\release\dist\AutoClicker\AutoClicker.exe'),
     [int]$StartupTimeoutSeconds = 180
 )
 
@@ -63,6 +63,7 @@ try {
 }
 
 $gui = $null
+$startupWatch = [System.Diagnostics.Stopwatch]::StartNew()
 $deadline = (Get-Date).AddSeconds($StartupTimeoutSeconds)
 while ((Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 500
@@ -74,12 +75,14 @@ while ((Get-Date) -lt $deadline) {
         Select-Object -First 1
     if ($gui) { break }
 }
+$startupWatch.Stop()
 
 if (-not $gui) {
     Write-Error "启动超时：${StartupTimeoutSeconds}s 内未出现主窗口（launcher PID $($launcher.Id)）。"
 }
 
 Write-Host "GUI PID=$($gui.Id) title=$($gui.MainWindowTitle)"
+Write-Host ("启动耗时: {0:F2}s" -f $startupWatch.Elapsed.TotalSeconds)
 
 # 发送 WM_CLOSE；close_to_tray=false 时应走 exit_application 完全退出
 & taskkill /PID $gui.Id 2>&1 | Out-Host

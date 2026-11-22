@@ -201,7 +201,12 @@ try {
 
     $distDir = $config.build.dist_dir
     $exeName = $config.build.exe_name
-    $exePath = [System.IO.Path]::Combine($PROJECT_ROOT, $distDir, $exeName)
+    $appName = [System.IO.Path]::GetFileNameWithoutExtension($exeName)
+    if ([string]$config.build.package_mode -eq 'onedir') {
+        $exePath = [System.IO.Path]::Combine($PROJECT_ROOT, $distDir, $appName, $exeName)
+    } else {
+        $exePath = [System.IO.Path]::Combine($PROJECT_ROOT, $distDir, $exeName)
+    }
 
     # 步骤 1：确保构建产物
     Write-Banner "步骤 1/5: 确保构建产物"
@@ -245,7 +250,12 @@ try {
     # 步骤 2：收集发布文件
     Write-Banner "步骤 2/5: 收集发布文件"
     $filesToPack = New-Object System.Collections.ArrayList
-    [void]$filesToPack.Add((Resolve-Path $exePath).Path)
+    $appDir = Split-Path $exePath -Parent
+    if ([string]$config.build.package_mode -eq 'onedir') {
+        [void]$filesToPack.Add((Resolve-Path $appDir).Path)
+    } else {
+        [void]$filesToPack.Add((Resolve-Path $exePath).Path)
+    }
     foreach ($rel in $config.release.include) {
         $incPath = Join-Path $PROJECT_ROOT $rel
         if (Test-Path $incPath) {
@@ -294,15 +304,27 @@ try {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
     try {
-        $entry = $zip.Entries | Where-Object { $_.FullName -eq $exeName } | Select-Object -First 1
-        if ($null -eq $entry) { throw "发布包内缺少 $exeName。" }
-        $exeBytes = $entry.Length
+        $entryName = if ([string]$config.build.package_mode -eq 'onedir') { "$appName/$exeName" } else { $exeName }
+        $entry = $zip.Entries | Where-Object { $_.FullName -eq $entryName } | Select-Object -First 1
+        if ($null -eq $entry) { throw "发布包内缺少 $entryName。" }
         $minBytes = $config.verification.min_exe_size_mb * 1MB
-        if ([double]$exeBytes -lt $minBytes) {
-            throw "发布包内 $exeName 体积异常（$($exeBytes) 字节），打包可能不完整。"
+        if ([string]$config.build.package_mode -eq 'onedir') {
+            $hasInternal = $zip.Entries | Where-Object { $_.FullName -like "$appName/_internal/*" } | Select-Object -First 1
+            if ($null -eq $hasInternal) { throw "发布包内缺少 $appName/_internal 依赖目录。" }
+            $appBytes = ($zip.Entries | Where-Object { $_.FullName -like "$appName/*" } |
+                Measure-Object -Property Length -Sum).Sum
+            if ([double]$appBytes -lt $minBytes) {
+                throw "发布包内 $appName 目录体积异常（$($appBytes) 字节），打包可能不完整。"
+            }
+            Write-Host "[OK] 包内 $appName 目录解压后体积: $('{0:F2}' -f ([double]$appBytes / 1MB)) MB" -ForegroundColor Green
+        } else {
+            $exeBytes = $entry.Length
+            if ([double]$exeBytes -lt $minBytes) {
+                throw "发布包内 $entryName 体积异常（$($exeBytes) 字节），打包可能不完整。"
+            }
+            Write-Host "[OK] 包内 $entryName 体积: $('{0:F2}' -f ([double]$exeBytes / 1MB)) MB" -ForegroundColor Green
         }
-        Write-Host "[OK] 包内 $exeName 体积: $('{0:F2}' -f ([double]$exeBytes / 1MB)) MB" -ForegroundColor Green
-        Write-Host "[OK] 包内条目: $($zip.Entries.Count) 个（$((($zip.Entries | ForEach-Object { $_.FullName }) -join ', ')))" -ForegroundColor Gray
+        Write-Host "[OK] 包内条目: $($zip.Entries.Count) 个" -ForegroundColor Gray
     } finally {
         $zip.Dispose()
     }
@@ -336,9 +358,13 @@ try {
             "/DAPP_VERSION=$($config.release.version)",
             "/DAPP_BUILD=$buildVersion",
             "/DAPP_ARCH=$($config.release.arch)",
-            "/DSRC_EXE=$($exePath)",
             "/DOUT_FILE=$installerPath"
         )
+        if ([string]$config.build.package_mode -eq 'onedir') {
+            $defs += "/DSRC_DIR=$appDir"
+        } else {
+            $defs += "/DSRC_EXE=$exePath"
+        }
         $icon = Join-Path $PROJECT_ROOT 'icons/autoclicker.ico'
         if (Test-Path $icon) { $defs += "/DAPP_ICON=$icon" }
         $readme = Join-Path $PROJECT_ROOT 'README.md'

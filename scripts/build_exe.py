@@ -154,6 +154,17 @@ def apply_build_version():
     return info['version']
 
 
+def get_built_exe_path(cfg):
+    """按 onefile/onedir 返回实际 exe 路径；onedir 为 dist/<app>/<exe>。"""
+    build = cfg['build']
+    pyi = build['pyinstaller']
+    app_name = os.path.splitext(build['exe_name'])[0]
+    dist_dir = abs_from_root(build['dist_dir'])
+    if '--onefile' in (pyi.get('flags') or []):
+        return os.path.join(dist_dir, build['exe_name'])
+    return os.path.join(dist_dir, app_name, build['exe_name'])
+
+
 def build_exe():
     cfg = load_build_config()
     project = cfg['project']
@@ -188,17 +199,36 @@ def build_exe():
     print("\n" + "=" * 60)
 
     try:
-        subprocess.check_call(cmd)
+        # 清理构建子进程的模块搜索路径：Agent/IDE 注入的 PYTHONPATH 可能带入
+        # cv2/numpy 等无关大包，导致 PyInstaller 误收集数百 MB 依赖。
+        build_env = os.environ.copy()
+        build_env.pop('PYTHONPATH', None)
+        build_env['PATH'] = os.pathsep.join(
+            p for p in build_env.get('PATH', '').split(os.pathsep)
+            if 'cv2' not in p.lower()
+        )
+        subprocess.check_call(cmd, env=build_env)
         print("\n" + "=" * 60)
         print("✅ 打包成功!")
         print("=" * 60)
 
-        exe_path = os.path.join(abs_from_root(build['dist_dir']), build['exe_name'])
+        exe_path = get_built_exe_path(cfg)
         if os.path.exists(exe_path):
-            size_mb = os.path.getsize(exe_path) / (1024 * 1024)
-            print(f"\n📦 可执行文件: {exe_path}")
-            print(f"📊 文件大小: {size_mb:.2f} MB")
-            print("\n💡 提示: 可以直接运行此文件，无需其他依赖")
+            if build.get('package_mode') == 'onedir':
+                app_dir = os.path.dirname(exe_path)
+                size_mb = sum(
+                    os.path.getsize(os.path.join(root, name))
+                    for root, _dirs, files in os.walk(app_dir)
+                    for name in files
+                ) / (1024 * 1024)
+                print(f"\n📦 可执行文件: {exe_path}")
+                print(f"📊 目录总大小: {size_mb:.2f} MB")
+                print(f"\n💡 提示: onedir 产物，分发时需携带同目录依赖: {app_dir}")
+            else:
+                size_mb = os.path.getsize(exe_path) / (1024 * 1024)
+                print(f"\n📦 可执行文件: {exe_path}")
+                print(f"📊 文件大小: {size_mb:.2f} MB")
+                print("\n💡 提示: 可以直接运行此文件，无需其他依赖")
         return True
     except subprocess.CalledProcessError as e:
         print("\n" + "=" * 60)

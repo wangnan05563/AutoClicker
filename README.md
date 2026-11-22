@@ -51,7 +51,7 @@ python scripts/build_exe.py
 
 每次打包前会先生成当天唯一的构建版本号（`YYYYMMDD-序号`，如 `20261115-001`）并写回根 `package.json` 的 `version` 字段；双击 `scripts/构建打包.bat` 与直接运行 `build_exe.py` 走同一套逻辑，保证每次构建的版本号不重复。
 
-产物输出至 `release/dist/AutoClicker.exe`（单文件，无需其他依赖）。
+产物输出至 `release/dist/AutoClicker/AutoClicker.exe`（onedir 目录，分发时需携带同目录依赖；安装包/zip 已包含全部文件）。
 
 ## 使用说明
 
@@ -79,7 +79,7 @@ python scripts/build_exe.py
 - [银河麒麟部署指南](docs/银河麒麟部署指南.md)
 - [Wayland 降级说明](docs/Wayland降级说明.md)（Linux 建议使用 X11 会话；Wayland 下的限制与降级路径）
 
-> Linux 说明：模拟输入与全局热键在 **X11 会话**下工作正常。程序启动会检测 `XDG_SESSION_TYPE`；纯 Wayland 会话下会显示顶部横幅、禁用「启动」与「测试点击」，并提示切换到 X11 或安装 `ydotool`（当前版本尚未接入 ydotool 后端）。详见上方降级说明。
+> Linux 说明：模拟输入与全局热键在 **X11 会话**下工作正常。程序启动会检测 `XDG_SESSION_TYPE`；纯 Wayland 会话下会显示顶部横幅、禁用「启动」与「测试点击」，并提示切换到 X11 或安装 `ydotool` 并启动 `ydotoold`（已接入 ydotool 后端）。详见上方降级说明。
 
 ## 许可证
 

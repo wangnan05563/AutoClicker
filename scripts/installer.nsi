@@ -6,7 +6,8 @@ Unicode true
 ;   APP_VERSION  产品版本，如 2.0.2
 ;   APP_BUILD    构建版本，如 20261117-002
 ;   APP_ARCH     架构标识，如 win64
-;   SRC_EXE      待打包的 AutoClicker.exe 绝对路径
+;   SRC_DIR      onedir 产物目录（与 SRC_EXE 二选一）
+;   SRC_EXE      onefile 单文件产物（与 SRC_DIR 二选一）
 ;   OUT_FILE     输出安装包绝对路径
 ; 可选定义：
 ;   APP_ICON     安装包/卸载项图标（.ico 绝对路径）
@@ -26,7 +27,9 @@ Unicode true
   !define APP_ARCH "win64"
 !endif
 !ifndef SRC_EXE
-  !error "SRC_EXE 未定义：请通过 /DSRC_EXE=... 传入 AutoClicker.exe 路径"
+  !ifndef SRC_DIR
+    !error "SRC_DIR 或 SRC_EXE 未定义：请通过 /DSRC_DIR=... 或 /DSRC_EXE=... 传入产物路径"
+  !endif
 !endif
 !ifndef OUT_FILE
   !define OUT_FILE "AutoClicker-Setup.exe"
@@ -68,7 +71,11 @@ VIAddVersionKey "LegalCopyright" "AutoClicker"
 
 Section "AutoClicker 主程序" SEC_MAIN
   SetOutPath "$INSTDIR"
+!ifdef SRC_DIR
+  File /r "${SRC_DIR}\*"
+!else
   File "${SRC_EXE}"
+!endif
 !ifdef DOC_README
   File "${DOC_README}"
 !endif
@@ -99,11 +106,8 @@ Section "AutoClicker 主程序" SEC_MAIN
 SectionEnd
 
 Section "Uninstall"
-  Delete "$INSTDIR\AutoClicker.exe"
-  Delete "$INSTDIR\README.md"
-  Delete "$INSTDIR\LICENSE"
   Delete "$INSTDIR\Uninstall.exe"
-  RMDir "$INSTDIR"
+  RMDir /r "$INSTDIR"
 
   Delete "$SMPROGRAMS\AutoClicker\AutoClicker.lnk"
   Delete "$SMPROGRAMS\AutoClicker\卸载 AutoClicker.lnk"

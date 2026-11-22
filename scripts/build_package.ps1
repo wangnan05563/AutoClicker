@@ -3,6 +3,10 @@
 # 由 构建打包.bat 委派执行。所有中文输出在此（UTF-8 BOM）。
 # 逻辑：解析 Python -> 释放文件锁 -> 确保 PyInstaller -> 调用构建脚本（先分配唯一构建版本号）-> 校验产物 -> 启动冒烟测试。
 
+param(
+    [switch]$SkipBuild
+)
+
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $ErrorActionPreference = 'Stop'
 
@@ -44,6 +48,25 @@ function Resolve-BuildPython($Candidates, $RequiredImports) {
     $cmd2 = Get-Command py -ErrorAction SilentlyContinue
     if ($cmd2) { return $cmd2.Source }
     return $null
+}
+
+function Get-BuiltExePath($Config, $ProjectRoot) {
+    $dist = [System.IO.Path]::Combine($ProjectRoot, $Config.build.dist_dir)
+    if ([string]$Config.build.package_mode -eq 'onedir') {
+        $appName = [System.IO.Path]::GetFileNameWithoutExtension([string]$Config.build.exe_name)
+        return [System.IO.Path]::Combine($dist, $appName, [string]$Config.build.exe_name)
+    }
+    return [System.IO.Path]::Combine($dist, [string]$Config.build.exe_name)
+}
+
+function Get-ArtifactSizeMB($Config, $ExePath) {
+    if ([string]$Config.build.package_mode -eq 'onedir') {
+        $dir = Split-Path $ExePath -Parent
+        $bytes = (Get-ChildItem -LiteralPath $dir -Recurse -File -ErrorAction Stop |
+            Measure-Object -Property Length -Sum).Sum
+        return [double]$bytes / 1MB
+    }
+    return (Get-Item -LiteralPath $ExePath).Length / 1MB
 }
 
 function Stop-RunningInstance($ImageName, $WaitSeconds) {
@@ -104,39 +127,36 @@ try {
 
     # 4. 执行打包
     Write-Banner "步骤 4/5: 构建可执行文件"
-    $buildScript = Join-Path $PROJECT_ROOT $config.build.build_script
-    if (-not (Test-Path $buildScript)) { throw "未找到构建脚本: $buildScript" }
-    & $python $buildScript
-    if ($LASTEXITCODE -ne 0) { throw "$pyiModule 构建失败（退出码 $LASTEXITCODE）。" }
+    if ($SkipBuild) {
+        Write-Host "[跳过] -SkipBuild 已指定，复用现有产物。" -ForegroundColor Yellow
+    } else {
+        $buildScript = Join-Path $PROJECT_ROOT $config.build.build_script
+        if (-not (Test-Path $buildScript)) { throw "未找到构建脚本: $buildScript" }
+        & $python $buildScript
+        if ($LASTEXITCODE -ne 0) { throw "$pyiModule 构建失败（退出码 $LASTEXITCODE）。" }
+    }
 
     # 5. 校验产物
     Write-Banner "步骤 5/5: 校验构建产物"
-    $exePath = [System.IO.Path]::Combine($PROJECT_ROOT, $config.build.dist_dir, $config.build.exe_name)
+    $exePath = Get-BuiltExePath $config $PROJECT_ROOT
     if (-not (Test-Path $exePath)) { throw "未找到构建产物: $exePath" }
-    $sizeMB = (Get-Item $exePath).Length / 1MB
+    $sizeMB = Get-ArtifactSizeMB $config $exePath
     $minMB = $config.verification.min_exe_size_mb
-    if ($sizeMB -lt $minMB) { throw "产物体积过小（$('{0:F2}' -f $sizeMB) MB < $minMB MB），构建可能不完整。" }
-    Write-Host "[OK] 产物: $exePath ($('{0:F2}' -f $sizeMB) MB)" -ForegroundColor Green
+    $sizeLabel = if ([string]$config.build.package_mode -eq 'onedir') { '产物目录总大小' } else { '产物大小' }
+    if ($sizeMB -lt $minMB) { throw "$sizeLabel 过小（$('{0:F2}' -f $sizeMB) MB < $minMB MB），构建可能不完整。" }
+    Write-Host "[OK] 产物: $exePath ($sizeLabel $('{0:F2}' -f $sizeMB) MB)" -ForegroundColor Green
 
-    # 启动冒烟测试：确认 exe 真实可执行
+    # 启动冒烟 + 正常退出清理：避免旧版“只判断进程存活 5s”的假阳性，
+    # 同时验证不会残留 _MEI 目录或弹出 PyInstaller Warning。
     $smoke = $config.verification.launch_smoke_test
     if ($smoke.enabled) {
+        $verifyScript = Join-Path $PROJECT_ROOT 'scripts\verify_clean_exit.ps1'
+        if (-not (Test-Path $verifyScript)) { throw "未找到退出回归脚本: $verifyScript" }
         Write-Host ""
-        Write-Host "==> 启动冒烟测试（稳定期 $($smoke.stable_seconds)s / 超时 $($smoke.timeout_seconds)s）..." -ForegroundColor Cyan
-        try {
-            $proc = Start-Process -FilePath $exePath -PassThru -WindowStyle Hidden -ErrorAction Stop
-            # 先等稳定期再判定：onefile 解包阶段进程必然存活，立即判断会把
-            # "解包存活、随后崩溃"误判为成功（历史教训：pyautogui 缺失即如此）
-            Start-Sleep -Seconds $smoke.stable_seconds
-            if (-not $proc.HasExited) {
-                Write-Host "[OK] 可执行文件稳定运行 $($smoke.stable_seconds)s（PID $($proc.Id)）。执行成功已确认。" -ForegroundColor Green
-                try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
-            } else {
-                throw "可执行文件启动后立即退出（退出码 $($proc.ExitCode)）。产物可能缺依赖，请用 --console 诊断版查看报错。"
-            }
-        } catch {
-            Write-Warning "启动冒烟测试未通过： $_"
-        }
+        $smokeTimeout = [Math]::Max([int]$smoke.timeout_seconds, 90)
+        Write-Host "==> 启动/退出回归（超时 ${smokeTimeout}s）..." -ForegroundColor Cyan
+        & $verifyScript -ExePath $exePath -StartupTimeoutSeconds $smokeTimeout
+        if ($LASTEXITCODE -ne 0) { throw "启动/退出回归失败（退出码 $LASTEXITCODE）。" }
     }
 
     Write-Banner "构建成功完成"
