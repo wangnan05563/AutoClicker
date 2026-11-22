@@ -46,6 +46,7 @@ from auto_clicker_layers.theme import (
     theme_display_map as _theme_display_map,
     validate_theme_pack as _theme_validate_pack,
 )
+from auto_clicker_layers.version import APP_VERSION, BUILD_ID
 from auto_clicker_layers.config import (
     clone_defaults as _config_clone_defaults,
     read_config as _config_read,
@@ -207,7 +208,8 @@ SINGLE_INSTANCE_MUTEX_NAME = os.environ.get(
     "AUTOCLICKER_MUTEX_NAME", "AutoClicker_SingleInstance_Mutex")
 SINGLE_INSTANCE_LOCK_FILE = os.path.expanduser("~/.autoclicker.lock")
 WINDOW_TITLE = os.environ.get(
-    "AUTOCLICKER_WINDOW_TITLE", "桌面自动点击工具 v2.0.2 (Python 3.14)")
+    "AUTOCLICKER_WINDOW_TITLE",
+    "桌面自动点击工具 v%s (Build %s)" % (APP_VERSION, BUILD_ID))
 IS_SINGLE_INSTANCE = True
 EXISTING_WINDOW_HWND = None
 SINGLE_INSTANCE_LOCK_FD = None
@@ -285,16 +287,16 @@ class AutoClicker:
         self.root.title(WINDOW_TITLE)
         self._init_dpi_awareness()
 
-        # 窗口尺寸按 DPI 缩放（F-10 / CX-05）：720x800 是 96dpi 基准；
-        # 高 DPI 下若仍用固定物理像素，字体会把按钮挤成 1px（T05247 实测 200% 裁切）。
+        # 窗口尺寸按 DPI 缩放（F-10 / CX-05）：1000x720 是 96dpi 基准；
+        # 1024x768 与 1280x800 必须完整显示底部固定操作条，不允许主流程依赖滚动。
         dpi_ratio = max(1.0, min(getattr(self, '_dpi_scale', 1.3333) / 1.3333, 2.0))
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
-        win_w = min(int(720 * dpi_ratio), int(screen_w * 0.9))
-        win_h = min(int(800 * dpi_ratio), int(screen_h * 0.9))
+        win_w = min(int(1000 * dpi_ratio), int(screen_w * 0.9))
+        win_h = min(int(720 * dpi_ratio), int(screen_h * 0.9))
         self.root.geometry("%dx%d" % (win_w, win_h))
-        self._min_w = min(int(700 * dpi_ratio), win_w)
-        self._min_h = min(int(760 * dpi_ratio), win_h)
+        self._min_w = min(int(900 * dpi_ratio), win_w)
+        self._min_h = min(int(620 * dpi_ratio), win_h)
         self.root.minsize(self._min_w, self._min_h)
         
         self.is_running = False
@@ -832,6 +834,11 @@ class AutoClicker:
             canvas = getattr(self, 'main_canvas', None)
             if canvas is not None:
                 canvas.configure(bg=pal['bg'], highlightbackground=pal['bg'])
+            for page_canvas in getattr(self, '_page_canvases', {}).values():
+                try:
+                    page_canvas.configure(bg=pal['bg'], highlightbackground=pal['bg'])
+                except Exception:
+                    pass
             indicator = getattr(self, 'status_indicator', None)
             if indicator is not None:
                 indicator.configure(bg=pal['bg'])
@@ -874,6 +881,74 @@ class AutoClicker:
             except Exception:
                 pass
 
+    def _create_page(self, host, key, padding=14):
+        """创建可切换页面容器（FR-24）：独立滚动，切换只 tkraise。"""
+        holder = ttk.Frame(host)
+        holder.grid(row=0, column=0, sticky='nsew')
+        canvas = tk.Canvas(holder, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(holder, orient='vertical', command=canvas.yview)
+        body = ttk.Frame(canvas, padding=padding)
+        window = canvas.create_window((0, 0), window=body, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        body.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>', lambda e: canvas.itemconfig(window, width=e.width))
+        canvas.bind('<Enter>', lambda e, c=canvas: setattr(self, 'main_canvas', c))
+        self._page_holders[key] = holder
+        self._page_canvases[key] = canvas
+        self._page_frames[key] = body
+        return body
+
+    def _show_page(self, key):
+        """切换左侧导航页面；控件实例与配置状态保持不变。"""
+        holder = getattr(self, '_page_holders', {}).get(key)
+        if holder is None:
+            return
+        try:
+            holder.tkraise()
+            self._active_page = key
+            self.main_canvas = self._page_canvases.get(key, self.main_canvas)
+            self.main_canvas.yview_moveto(0)
+            self._refresh_nav_styles()
+            if key == 'run' and hasattr(self, 'run_summary_label'):
+                self.run_summary_label.config(text=self._run_summary_text())
+        except Exception:
+            pass
+
+    def _refresh_nav_styles(self):
+        """按当前主题高亮导航项。"""
+        try:
+            pal = self._resolve_palette()
+            active = getattr(self, '_active_page', 'run')
+            for key, btn in getattr(self, 'nav_buttons', {}).items():
+                selected = key == active
+                btn.configure(
+                    bg=pal['primary'] if selected else pal['surface'],
+                    fg=pal['on_primary'] if selected else pal['text'],
+                    activebackground=pal['primary_hover'] if selected else pal['surface_alt'],
+                    activeforeground=pal['on_primary'] if selected else pal['text'],
+                )
+        except Exception:
+            pass
+
+    def _run_summary_text(self):
+        """运行台配置摘要（只读，避免与规则页控件状态不同步）。"""
+        try:
+            mode_key = self.config.get('click_mode', 'random')
+            mode = getattr(self, 'mode_map', {}).get(mode_key, mode_key)
+            unit = self.config.get('interval_unit', 's')
+            interval = self.config.get('interval_seconds', 10)
+            limit = self.config.get('click_limit', 0) or '无限'
+            duration = self.config.get('duration_limit', 0) or '无限'
+            sleep = '开' if self.config.get('prevent_sleep', False) else '关'
+            return ("间隔：%s %s    模式：%s    次数上限：%s    时长上限：%s 分钟\n"
+                    "防锁屏：%s    多点位：%s" % (
+                        interval, unit, mode, limit, duration, sleep,
+                        '开' if self.config.get('use_multi_points', False) else '关'))
+        except Exception:
+            return "当前配置读取失败，请到「规则」页检查。"
+
     def _apply_theme(self):
         """运行时应用主题：切换 ttk 主题 + 重着色语义化控件（TH-01/TH-02）"""
         try:
@@ -886,6 +961,7 @@ class AutoClicker:
             # 语义化重着色已知 tk/ttk 控件（TH-02）
             self._recolor_action_buttons(pal)
             self._recolor_semantic_labels(pal)
+            self._refresh_nav_styles()
             # 托盘图标跟随浅/深主题刷新（T05257）
             self._refresh_tray_icon()
             if getattr(self, 'log_text', None):
@@ -1278,6 +1354,43 @@ class AutoClicker:
             self.log_message("设置开机自启失败: " + str(e))
             messagebox.showerror("错误", "设置开机自启失败: " + str(e))
 
+    def open_config_dir(self):
+        """FR-04：打开配置文件所在目录。"""
+        try:
+            d = os.path.dirname(self.config_file) or os.path.expanduser('~')
+            if IS_WINDOWS:
+                os.startfile(d)
+            elif IS_LINUX:
+                import subprocess
+                subprocess.Popen(['xdg-open', d])
+            else:
+                messagebox.showinfo("配置目录", d)
+        except Exception as e:
+            self.log_message("打开配置目录失败: " + str(e))
+
+    def copy_version_info(self):
+        """FR-04：复制版本与路径信息，便于反馈问题。"""
+        text = "\n".join((
+            "AutoClicker %s" % get_version_text(),
+            "Python %d.%d.%d" % sys.version_info[:3],
+            "配置: " + self.config_file,
+            "日志: " + getattr(self, 'log_dir', os.path.expanduser('~/.auto_clicker_logs')),
+        ))
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.show_notice("版本信息已复制", level='operation')
+        except Exception as e:
+            messagebox.showinfo("版本信息", text + "\n\n复制失败: " + str(e))
+
+    def open_project_home(self):
+        """FR-04：打开项目主页（只读外链，不在应用内联网）。"""
+        try:
+            import webbrowser
+            webbrowser.open("https://github.com/wangnan05563/AutoClicker")
+        except Exception as e:
+            messagebox.showinfo("项目主页", "https://github.com/wangnan05563/AutoClicker\n" + str(e))
+
     def open_log_dir(self):
         """CX-10：打开日志目录"""
         try:
@@ -1553,93 +1666,125 @@ class AutoClicker:
             print(MSG_SAVE_CONFIG_FAILED + str(e))
                 
     def setup_ui(self):
-        """设置现代化UI界面 - 采用卡片式布局和响应式设计"""
+        """信息架构：顶部状态条 + 左侧 4 导航 + 底部固定操作条（FR-24）。"""
         self._icons_ready = False
-        # 设置窗口最小尺寸（与 __init__ 的 DPI 缩放值保持一致：CX-05）
-        self.root.minsize(getattr(self, '_min_w', 700), getattr(self, '_min_h', 760))
-        
-        # 创建主容器 - 使用Canvas支持滚动
+        self.root.minsize(getattr(self, '_min_w', 900), getattr(self, '_min_h', 620))
+
         main_container = ttk.Frame(self.root)
         main_container.pack(fill=tk.BOTH, expand=True)
-        
-        # 创建Canvas和滚动条
-        canvas = tk.Canvas(main_container, highlightthickness=0)
-        self.main_canvas = canvas
-        scrollbar = ttk.Scrollbar(main_container, orient="vertical", command=canvas.yview)
-        
-        # 创建可滚动框架
-        self.main_frame = ttk.Frame(canvas, padding="20")
-        
-        # 配置Canvas
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        # 布局
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        topbar = ttk.Frame(main_container, padding=(12, 8, 12, 4))
+        topbar.pack(side=tk.TOP, fill=tk.X)
+        bottom_bar = ttk.Frame(main_container, padding=(12, 6, 12, 8))
+        bottom_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        body = ttk.Frame(main_container)
+        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        nav_panel = ttk.Frame(body, padding=(8, 8, 4, 8))
+        nav_panel.pack(side=tk.LEFT, fill=tk.Y)
+        nav_panel.pack_propagate(False)
+        nav_panel.configure(width=156)
+        content_host = ttk.Frame(body)
+        content_host.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        content_host.grid_rowconfigure(0, weight=1)
+        content_host.grid_columnconfigure(0, weight=1)
+
+        self._page_holders = {}
+        self._page_canvases = {}
+        self._page_frames = {}
+        self.main_canvas = None
+        self.run_page = self._create_page(content_host, 'run', padding=16)
+        self.rules_page = self._create_page(content_host, 'rules', padding=14)
+        self.records_page = self._create_page(content_host, 'records', padding=14)
+        self.settings_page = self._create_page(content_host, 'settings', padding=14)
+        self.main_frame = self.run_page
         self._bind_main_mousewheel()
-        
-        # 将主框架添加到Canvas
-        canvas_window = canvas.create_window((0, 0), window=self.main_frame, anchor="nw", width=680)
-        
-        # 更新滚动区域
-        def on_frame_configure(event):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-        self.main_frame.bind("<Configure>", on_frame_configure)
-        
-        # 更新Canvas窗口宽度
-        def on_canvas_configure(event):
-            canvas.itemconfig(canvas_window, width=event.width)
-        canvas.bind("<Configure>", on_canvas_configure)
-        
-        # ==================== 头部区域 ====================
-        header_frame = ttk.Frame(self.main_frame)
-        header_frame.pack(fill=tk.X, pady=(0, 15))
+
+        # 左侧导航不超过 4 项
+        ttk.Label(nav_panel, text="AutoClicker", font=('微软雅黑', 12, 'bold')).pack(
+            anchor=tk.W, padx=8, pady=(4, 12))
+        self.nav_buttons = {}
+        for key, label in (('run', '运行台'), ('rules', '规则'),
+                           ('records', '记录'), ('settings', '设置')):
+            btn = tk.Button(nav_panel, text=label, anchor=tk.W, justify=tk.LEFT,
+                            command=lambda k=key: self._show_page(k),
+                            font=('微软雅黑', 10, 'bold'), padx=12, pady=8,
+                            relief=tk.FLAT, bd=0, cursor='hand2')
+            btn.pack(fill=tk.X, pady=2)
+            self.nav_buttons[key] = btn
+        ttk.Label(nav_panel, text="F6 启动/停止\nF8 / Esc 急停",
+                  font=('微软雅黑', 8), foreground=self._color('muted'),
+                  justify=tk.LEFT).pack(side=tk.BOTTOM, anchor=tk.W, padx=8, pady=8)
+
+        # ==================== 顶部状态条 ====================
+        header_frame = ttk.Frame(topbar)
+        header_frame.pack(fill=tk.X)
         self.header_frame = header_frame
         # 8.3 操作级提示：顶部可关闭横幅（按需 pack，位于 header 之前）
-        self._notice_bar = NoticeBar(self.main_frame, self._color)
-        
-        # 标题和状态指示器
+        self._notice_bar = NoticeBar(topbar, self._color)
+
         title_container = ttk.Frame(header_frame)
         title_container.pack(fill=tk.X)
-        
-        # 主标题
-        title_label = ttk.Label(title_container, text="桌面自动点击工具", 
-                               font=('微软雅黑', 18, 'bold'))
+        title_label = ttk.Label(title_container, text="桌面自动点击工具",
+                               font=('微软雅黑', 16, 'bold'))
         title_label.pack(side=tk.LEFT)
-        
-        # 状态指示器（带颜色圆点）
-        self.status_indicator = tk.Canvas(title_container, width=12, height=12, 
+        self.title_version_label = ttk.Label(
+            title_container, text=get_version_text(),
+            font=('微软雅黑', 8), foreground=self._color('muted'))
+        self.title_version_label.pack(side=tk.LEFT, padx=(10, 0))
+
+        self.status_indicator = tk.Canvas(title_container, width=12, height=12,
                                          highlightthickness=0, bg='white')
         self.status_indicator.pack(side=tk.RIGHT, padx=5)
         self.status_circle = self.status_indicator.create_oval(2, 2, 10, 10, fill='red', outline='')
-        
-        self.status_text_label = ttk.Label(title_container, text="已停止", 
-                                          font=('微软雅黑', 11, 'bold'), foreground=self._color('danger'))
+        self.status_text_label = ttk.Label(title_container, text="已停止",
+                                          font=('微软雅黑', 11, 'bold'),
+                                          foreground=self._color('danger'))
         self.status_text_label.pack(side=tk.RIGHT, padx=5)
-        
-        # 主题选择器（FR-33/34/35）
-        theme_row = ttk.Frame(header_frame)
-        theme_row.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(theme_row, text="主题", font=('微软雅黑', 9)).pack(side=tk.LEFT)
-        self.theme_var = tk.StringVar(value=self._current_theme_display_name())
-        self.theme_combo = ttk.Combobox(theme_row, textvariable=self.theme_var,
-                                        values=list(self._theme_name_map.keys()),
-                                        state='readonly', width=16)
-        self.theme_combo.pack(side=tk.LEFT, padx=(5, 0))
-        self.theme_combo.bind('<<ComboboxSelected>>', self.on_theme_change_ui)
-        ttk.Button(theme_row, text="导入主题", command=self.import_user_theme,
-                   width=8).pack(side=tk.LEFT, padx=(6, 0))
+
+        # 顶部固定状态条：状态/倒计时/计数/运行时长
+        status_strip = ttk.Frame(topbar)
+        status_strip.pack(fill=tk.X, pady=(5, 0))
+        self.status_bar = status_strip
+        self.sb_status_label = ttk.Label(status_strip, text="● 已停止",
+                                         font=('微软雅黑', 9, 'bold'),
+                                         foreground=self._color('danger'))
+        self.sb_status_label.pack(side=tk.LEFT)
+        ttk.Label(status_strip, text="倒计时", font=('微软雅黑', 8)).pack(
+            side=tk.LEFT, padx=(10, 3))
+        self.countdown_bar = ttk.Progressbar(status_strip, orient='horizontal',
+                                             length=110, mode='determinate', maximum=100)
+        self.countdown_bar.pack(side=tk.LEFT, padx=(0, 4))
+        self.countdown_bar['value'] = 0
+        self.sb_countdown_label = ttk.Label(status_strip, text="--",
+                                            font=('微软雅黑', 8),
+                                            foreground=self._color('muted'))
+        self.sb_countdown_label.pack(side=tk.LEFT, padx=(0, 12))
+        self.sb_count_label = ttk.Label(status_strip, text="总点击: 0", font=('微软雅黑', 9))
+        self.sb_count_label.pack(side=tk.LEFT, padx=(0, 12))
+        self.sb_success_label = ttk.Label(status_strip, text="成功: 0",
+                                          font=('微软雅黑', 9),
+                                          foreground=self._color('success'))
+        self.sb_success_label.pack(side=tk.LEFT, padx=(0, 10))
+        self.sb_fail_label = ttk.Label(status_strip, text="失败: 0",
+                                       font=('微软雅黑', 9),
+                                       foreground=self._color('danger'))
+        self.sb_fail_label.pack(side=tk.LEFT, padx=(0, 10))
+        self.sb_runtime_label = ttk.Label(status_strip, text="运行时长: 00:00",
+                                          font=('微软雅黑', 9),
+                                          foreground=self._color('primary'))
+        self.sb_runtime_label.pack(side=tk.LEFT)
 
         # FR-L01 / 6.12.1：Wayland 降级横幅（可关闭；纯文本，保持 UI-02 零 emoji）
         if not self.input_ok:
-            warn_bar = tk.Frame(self.main_frame, bg=self._color('warning'))
-            warn_bar.pack(fill=tk.X, pady=(0, 10))
+            warn_bar = tk.Frame(topbar, bg=self._color('warning'))
+            warn_bar.pack(fill=tk.X, pady=(6, 0))
             tk.Label(warn_bar,
                      text="注意：Wayland 会话不支持模拟输入，启动已禁用",
                      bg=self._color('warning'), fg=self._color('on_warning'),
-                     font=('微软雅黑', 10, 'bold'), wraplength=500,
+                     font=('微软雅黑', 9, 'bold'), wraplength=500,
                      justify=tk.LEFT, anchor=tk.W).pack(
-                         side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 6), pady=7)
+                         side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 6), pady=5)
             tk.Button(warn_bar, text="详情", command=self.show_input_diag,
                       relief=tk.FLAT, bd=0, bg=self._color('warning'), fg=self._color('on_warning'),
                       activebackground=self._shade(self._color('warning')),
@@ -1654,81 +1799,80 @@ class AutoClicker:
                           side=tk.RIGHT, padx=(0, 4))
             self._input_banner = warn_bar
 
-        # 分隔线
-        separator = ttk.Separator(self.main_frame, orient='horizontal')
-        separator.pack(fill=tk.X, pady=(0, 15))
+        # ==================== 运行台 ====================
+        run_card = ttk.LabelFrame(self.run_page, text="运行台", padding="18")
+        run_card.pack(fill=tk.X, pady=(0, 14))
+        self.run_state_label = ttk.Label(run_card, text="已停止",
+                                         font=('微软雅黑', 22, 'bold'),
+                                         foreground=self._color('danger'))
+        self.run_state_label.pack(anchor=tk.W)
+        ttk.Label(run_card, text="底部操作条固定可用；点击参数在「规则」页维护。",
+                  font=('微软雅黑', 10), foreground=self._color('muted')).pack(
+                      anchor=tk.W, pady=(2, 10))
+        ttk.Separator(run_card, orient='horizontal').pack(fill=tk.X, pady=(0, 10))
+        self.run_summary_label = ttk.Label(run_card, text=self._run_summary_text(),
+                                           font=('微软雅黑', 10), justify=tk.LEFT)
+        self.run_summary_label.pack(anchor=tk.W)
+        self.run_next_label = ttk.Label(run_card, text="下次计划：--",
+                                        font=('微软雅黑', 9),
+                                        foreground=self._color('primary'))
+        self.run_next_label.pack(anchor=tk.W, pady=(8, 0))
+        ttk.Button(run_card, text="调整点击规则", command=lambda: self._show_page('rules')).pack(
+            anchor=tk.W, pady=(12, 0))
 
-        # ==================== 顶部运行状态条（UI-01 / UI-03） ====================
-        status_bar = ttk.LabelFrame(self.main_frame, text="运行状态", padding="10")
-        status_bar.pack(fill=tk.X, pady=(0, 15))
+        # ==================== 底部固定操作条 ====================
+        ttk.Separator(bottom_bar, orient='horizontal').pack(fill=tk.X, pady=(0, 6))
+        bottom_row = ttk.Frame(bottom_bar)
+        bottom_row.pack(fill=tk.X)
+        main_control_frame = ttk.Frame(bottom_row)
+        main_control_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # 状态文字 + 倒计时进度条（同一行）
-        sb_top = ttk.Frame(status_bar)
-        sb_top.pack(fill=tk.X, pady=(0, 6))
-        self.sb_status_label = ttk.Label(sb_top, text="● 已停止", font=('微软雅黑', 11, 'bold'), foreground=self._color('danger'))
-        self.sb_status_label.pack(side=tk.LEFT)
-        ttk.Label(sb_top, text="  启动倒计时", font=('微软雅黑', 9)).pack(side=tk.LEFT, padx=(10, 4))
-        self.countdown_bar = ttk.Progressbar(sb_top, orient='horizontal', length=160, mode='determinate', maximum=100)
-        self.countdown_bar.pack(side=tk.LEFT, padx=(0, 6))
-        self.countdown_bar['value'] = 0
-        self.sb_countdown_label = ttk.Label(sb_top, text="--", font=('微软雅黑', 9), foreground='gray')
-        self.sb_countdown_label.pack(side=tk.LEFT)
-
-        # 计数 / 运行时长（同一行）
-        sb_mid = ttk.Frame(status_bar)
-        sb_mid.pack(fill=tk.X)
-        self.sb_count_label = ttk.Label(sb_mid, text="总点击: 0", font=('微软雅黑', 10))
-        self.sb_count_label.pack(side=tk.LEFT, padx=(0, 16))
-        self.sb_success_label = ttk.Label(sb_mid, text="成功: 0", font=('微软雅黑', 10), foreground=self._color('success'))
-        self.sb_success_label.pack(side=tk.LEFT, padx=(0, 16))
-        self.sb_fail_label = ttk.Label(sb_mid, text="失败: 0", font=('微软雅黑', 10), foreground=self._color('danger'))
-        self.sb_fail_label.pack(side=tk.LEFT, padx=(0, 16))
-        self.sb_runtime_label = ttk.Label(sb_mid, text="运行时长: 00:00", font=('微软雅黑', 10), foreground=self._color('primary'))
-        self.sb_runtime_label.pack(side=tk.LEFT)
-
-        # ==================== 核心控制区域 ====================
-        control_card = ttk.LabelFrame(self.main_frame, text="核心控制", padding="15")
-        control_card.pack(fill=tk.X, pady=(0, 15))
-        
-        # 主控制按钮 - 大按钮设计
-        # 注意：tk.Button 带 image 时 width/height 的单位是「像素」而非字符/行，
-        # 旧代码 height=2 会把按钮压成 2px 色条（文字不可见）；改用 padx/pady 控制留白。
-        main_control_frame = ttk.Frame(control_card)
-        main_control_frame.pack(fill=tk.X, pady=(0, 10))
-        
+        # 主控制按钮：tk.Button 带 image 时 width/height 为像素，改用 padx/pady 控制留白。
         self.start_btn = tk.Button(main_control_frame, text=" 启动自动点击",
                                   command=self.start_clicking,
                                   font=('微软雅黑', 12, 'bold'),
                                   bg=self._color('success'), fg=self._color('on_success'),
                                   activebackground=self._shade(self._color('success')),
                                   activeforeground=self._color('on_success'),
-                                  padx=12, pady=8, cursor='hand2',
+                                  padx=12, pady=7, cursor='hand2',
                                   relief=tk.FLAT, bd=0)
-        self.start_btn.pack(side=tk.LEFT, padx=(0, 10), fill=tk.X, expand=True)
-        
+        self.start_btn.pack(side=tk.LEFT, padx=(0, 8), fill=tk.X, expand=True)
+
         self.stop_btn = tk.Button(main_control_frame, text=" 停止",
                                  command=self.stop_clicking,
                                  font=('微软雅黑', 12, 'bold'),
                                  bg=self._color('danger'), fg=self._color('on_danger'),
                                  activebackground=self._shade(self._color('danger')),
                                  activeforeground=self._color('on_danger'),
-                                 padx=12, pady=8, cursor='hand2',
+                                 padx=12, pady=7, cursor='hand2',
                                  relief=tk.FLAT, bd=0, state=tk.DISABLED)
-        self.stop_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        
-        # 测试按钮
-        self.test_btn = tk.Button(control_card, text=" 测试点击位置",
+        self.stop_btn.pack(side=tk.LEFT, padx=(0, 8), fill=tk.X, expand=True)
+
+        self.test_btn = tk.Button(main_control_frame, text=" 测试点击",
                                  command=self.test_click,
                                  font=('微软雅黑', 10),
                                  bg=self._color('primary'), fg=self._color('on_primary'),
                                  activebackground=self._shade(self._color('primary')),
                                  activeforeground=self._color('on_primary'),
-                                 pady=6, cursor='hand2',
+                                 padx=12, pady=7, cursor='hand2',
                                  relief=tk.FLAT, bd=0)
-        self.test_btn.pack(fill=tk.X, pady=(5, 0))
-        
+        self.test_btn.pack(side=tk.LEFT, fill=tk.X)
+
+        shortcut_frame = ttk.Frame(bottom_row)
+        shortcut_frame.pack(side=tk.RIGHT, padx=(12, 0))
+        ttk.Label(shortcut_frame, text="F6 启停 · F8/Esc 急停",
+                  font=('微软雅黑', 8), foreground=self._color('muted')).pack(anchor=tk.E)
+        self.footer_version_label = ttk.Label(
+            shortcut_frame, text=get_version_text(),
+            font=('微软雅黑', 8), foreground=self._color('muted'))
+        self.footer_version_label.pack(anchor=tk.E)
+
+        # 默认选中运行台
+        self._active_page = 'run'
+        self._show_page('run')
+
         # ==================== 配置区域 - 两列布局 ====================
-        config_container = ttk.Frame(self.main_frame)
+        config_container = ttk.Frame(self.rules_page)
         config_container.pack(fill=tk.X, pady=(0, 15))
         
         # 左列 - 基本配置
@@ -1890,7 +2034,7 @@ class AutoClicker:
         self.mouse_speed_label.pack(side=tk.LEFT)
         
         # ==================== 安全与终点控制（P0 止血） ====================
-        safety_card = ttk.LabelFrame(self.main_frame, text="安全", padding="15")
+        safety_card = ttk.LabelFrame(self.rules_page, text="安全", padding="15")
         safety_card.pack(fill=tk.X, pady=(0, 15))
 
         # 启动倒计时（CX-04）
@@ -1941,7 +2085,7 @@ class AutoClicker:
                        command=self.on_close_behavior_changed).pack(anchor=tk.W, pady=(4, 0))
 
         # ==================== P1 功能扩展：点击 / 节奏 / 多点位 ====================
-        p1_card = ttk.LabelFrame(self.main_frame, text="节奏与点击 (P1)", padding="15")
+        p1_card = ttk.LabelFrame(self.rules_page, text="节奏与点击 (P1)", padding="15")
         p1_card.pack(fill=tk.X, pady=(0, 15))
 
         row1 = ttk.Frame(p1_card)
@@ -1989,7 +2133,7 @@ class AutoClicker:
         ttk.Entry(mp_entry, textvariable=self.mp_y_var, width=8).pack(side=tk.LEFT)
 
         # ==================== P1 功能扩展：热键 / 配置方案 / 系统 ====================
-        p1b_card = ttk.LabelFrame(self.main_frame, text="高级 (P1)", padding="15")
+        p1b_card = ttk.LabelFrame(self.rules_page, text="高级 (P1)", padding="15")
         p1b_card.pack(fill=tk.X, pady=(0, 15))
 
         hk_row = ttk.Frame(p1b_card)
@@ -2046,7 +2190,7 @@ class AutoClicker:
         ttk.Button(sys_row, text="导出运行统计", command=self.export_run_stats).pack(side=tk.LEFT, padx=(10, 0))
 
         # ==================== 日志区域 ====================
-        log_card = ttk.LabelFrame(self.main_frame, text="运行日志", padding="10")
+        log_card = ttk.LabelFrame(self.records_page, text="运行日志", padding="10")
         log_card.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
 
         # 日志工具栏（UI-04：过滤 / 复制 / 清空；UI-01：可折叠）
@@ -2079,25 +2223,64 @@ class AutoClicker:
         self.log_text.tag_config('lvl_err', foreground=self._color('danger'))
         self.log_text.tag_config('lvl_warn', foreground=self._color('warning'))
         
+        # ==================== 设置：外观 ====================
+        theme_card = ttk.LabelFrame(self.settings_page, text="外观", padding="15")
+        theme_card.pack(fill=tk.X, pady=(0, 14))
+        ttk.Label(theme_card, text="主题", font=('微软雅黑', 10, 'bold')).pack(anchor=tk.W)
+        theme_row = ttk.Frame(theme_card)
+        theme_row.pack(fill=tk.X, pady=(6, 0))
+        self.theme_var = tk.StringVar(value=self._current_theme_display_name())
+        self.theme_combo = ttk.Combobox(theme_row, textvariable=self.theme_var,
+                                        values=list(self._theme_name_map.keys()),
+                                        state='readonly', width=18)
+        self.theme_combo.pack(side=tk.LEFT, padx=(0, 6))
+        self.theme_combo.bind('<<ComboboxSelected>>', self.on_theme_change_ui)
+        ttk.Button(theme_row, text="导入主题", command=self.import_user_theme,
+                   width=9).pack(side=tk.LEFT)
+        ttk.Label(theme_card, text="主题包仅包含 JSON 颜色令牌，不执行脚本。",
+                  font=('微软雅黑', 8), foreground=self._color('muted')).pack(
+                      anchor=tk.W, pady=(6, 0))
+
+        # ==================== 设置：关于（FR-04） ====================
+        about_card = ttk.LabelFrame(self.settings_page, text="关于", padding="15")
+        about_card.pack(fill=tk.X, pady=(0, 14))
+        about_grid = ttk.Frame(about_card)
+        about_grid.pack(fill=tk.X)
+        rows = (
+            ("产品版本", "v%s" % APP_VERSION),
+            ("构建号", BUILD_ID),
+            ("Python", "%d.%d.%d" % sys.version_info[:3]),
+            ("配置文件", self.config_file),
+            ("日志目录", getattr(self, 'log_dir', os.path.expanduser('~/.auto_clicker_logs'))),
+            ("许可证", "MIT License"),
+        )
+        for idx, (name, value) in enumerate(rows):
+            ttk.Label(about_grid, text=name + "：", font=('微软雅黑', 9, 'bold')).grid(
+                row=idx, column=0, sticky='w', padx=(0, 8), pady=2)
+            ttk.Label(about_grid, text=str(value), font=('微软雅黑', 9)).grid(
+                row=idx, column=1, sticky='w', pady=2)
+        about_btns = ttk.Frame(about_card)
+        about_btns.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(about_btns, text="打开配置目录", command=self.open_config_dir).pack(
+            side=tk.LEFT, padx=(0, 6))
+        ttk.Button(about_btns, text="打开日志目录", command=self.open_log_dir).pack(
+            side=tk.LEFT, padx=(0, 6))
+        ttk.Button(about_btns, text="复制版本信息", command=self.copy_version_info).pack(
+            side=tk.LEFT, padx=(0, 6))
+        ttk.Button(about_btns, text="项目主页", command=self.open_project_home).pack(
+            side=tk.LEFT)
+
         # ==================== 底部提示区域 ====================
-        footer_frame = ttk.Frame(self.main_frame)
+        footer_frame = ttk.Frame(self.settings_page)
         footer_frame.pack(fill=tk.X)
-        
-        # 快捷键提示
-        shortcut_frame = ttk.Frame(footer_frame)
-        shortcut_frame.pack(fill=tk.X, pady=(0, 5))
-        
-        shortcut_text = "快捷键: F6 启动/停止 · F8/Esc 紧急停止"
-        ttk.Label(shortcut_frame, text=shortcut_text, 
-                 font=('微软雅黑', 9), foreground=self._color('muted')).pack(anchor=tk.CENTER)
-        
-        # 版本信息
-        version_label = ttk.Label(footer_frame, text="v2.0.2 (Python 3.14)", 
-                                 font=('微软雅黑', 8), foreground=self._color('muted'))
-        version_label.pack(anchor=tk.CENTER)
-        
+        ttk.Label(footer_frame, text="快捷键: F6 启动/停止 · F8/Esc 紧急停止",
+                  font=('微软雅黑', 9), foreground=self._color('muted')).pack(anchor=tk.CENTER)
+        ttk.Label(footer_frame, text="v%s (Build %s)" % (APP_VERSION, BUILD_ID),
+                  font=('微软雅黑', 8), foreground=self._color('muted')).pack(anchor=tk.CENTER)
+
         # 更新状态标签引用
         self.status_label = self.status_text_label
+        self._show_page('run')
         
     def on_mode_change(self, event):
         """模式变更事件处理"""
@@ -2412,6 +2595,8 @@ class AutoClicker:
             self.status_label.config(text=text, foreground=color)
             if getattr(self, 'sb_status_label', None) is not None:
                 self.sb_status_label.config(text="● " + text, foreground=color)
+            if getattr(self, 'run_state_label', None) is not None:
+                self.run_state_label.config(text=text, foreground=color)
             # REQ-005：窗口标题随运行状态联动（停止时恢复基础标题）
             base_title = WINDOW_TITLE
             if text and text != "已停止":
@@ -3593,31 +3778,26 @@ def setup_dpi_awareness():
 
 
 def get_app_version():
-    """读取构建版本号（package.json）；打包后从 PyInstaller 资源目录读取。"""
-    import json as _json
-    candidates = []
-    bundle = getattr(sys, '_MEIPASS', None)
-    if bundle:
-        candidates.append(os.path.join(bundle, 'package.json'))
-    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'package.json'))
-    candidates.append(os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'package.json'))
-    for path in candidates:
-        try:
-            with open(path, 'r', encoding='utf-8-sig') as f:
-                version = (_json.load(f) or {}).get('version')
-            if version:
-                return str(version)
-        except (OSError, ValueError):
-            continue
-    return '20261115-001'
+    """产品版本（FR-04 双轨之一）。"""
+    return APP_VERSION
+
+
+def get_build_id():
+    """日期构建号（FR-04 双轨之一）。"""
+    return BUILD_ID
+
+
+def get_version_text():
+    """统一展示文本，供标题/关于页/日志使用。"""
+    return "v%s (Build %s)" % (APP_VERSION, BUILD_ID)
 
 
 def main():
     if '--version' in sys.argv or '-V' in sys.argv:
-        print("AutoClicker %s" % get_app_version())
+        print("AutoClicker %s" % get_version_text())
         return
     _install_crash_logging()
-    _write_crash_log("APP_START", "version=%s argv=%s" % (get_app_version(), sys.argv))
+    _write_crash_log("APP_START", "version=%s argv=%s" % (get_version_text(), sys.argv))
     if not IS_SINGLE_INSTANCE:
         activate_existing_window()
         show_single_instance_warning()

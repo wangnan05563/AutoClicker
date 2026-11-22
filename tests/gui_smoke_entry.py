@@ -3,6 +3,7 @@
 import os
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -26,5 +27,14 @@ root.update_idletasks()
 root.update()
 assert root.title() == app_module.WINDOW_TITLE, root.title()
 assert app.start_btn is not None
+assert app.test_btn is not None
+for page in ('run', 'rules', 'records', 'settings'):
+    assert page in app._page_frames, page
+    t0 = time.perf_counter()
+    app._show_page(page)
+    root.update_idletasks()
+    elapsed = time.perf_counter() - t0
+    assert app._active_page == page, page
+    assert elapsed < 0.1, 'page switch too slow: %s %.3fs' % (page, elapsed)
 print("GUI_SMOKE_OK")
 app.exit_application()

@@ -66,14 +66,12 @@ $gui = $null
 $startupWatch = [System.Diagnostics.Stopwatch]::StartNew()
 $deadline = (Get-Date).AddSeconds($StartupTimeoutSeconds)
 while ((Get-Date) -lt $deadline) {
-    Start-Sleep -Milliseconds 500
-    $gui = Get-Process AutoClicker -ErrorAction SilentlyContinue |
-        Where-Object {
-            $beforeProcessIds -notcontains $_.Id -and
-            $_.MainWindowTitle -eq $testTitle
-        } |
-        Select-Object -First 1
-    if ($gui) { break }
+    Start-Sleep -Milliseconds 300
+    # onedir 产物只有一个进程；直接按 PID 取，避免 Get-Process 全量枚举
+    # 在杀软/系统负载高时被拖慢，导致启动耗时统计严重失真。
+    $gui = Get-Process -Id $launcher.Id -ErrorAction SilentlyContinue
+    if ($gui -and $gui.MainWindowTitle -eq $testTitle) { break }
+    $gui = $null
 }
 $startupWatch.Stop()
 

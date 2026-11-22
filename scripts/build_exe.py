@@ -154,6 +154,25 @@ def apply_build_version():
     return info['version']
 
 
+def _write_runtime_version(cfg, build_id):
+    """生成 auto_clicker_layers/version.py，供运行时只读（FR-04）。
+
+    产品版本来自 release.version；构建号来自 package.json。
+    生成文件随源码一起打包，避免运行时读取 package.json 造成双轨。
+    """
+    app_version = str(cfg['release'].get('version') or '0.0.0')
+    target = os.path.join(ROOT_DIR, 'auto_clicker_layers', 'version.py')
+    content = (
+        "# -*- coding: utf-8 -*-\n"
+        '"""运行版本信息（由 scripts/build_exe.py 生成，请勿手工修改）。"""\n'
+        "APP_VERSION = %r\n"
+        "BUILD_ID = %r\n"
+    ) % (app_version, str(build_id))
+    with open(target, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(content)
+    print(f"✓ 生成运行版本文件: {target} ({app_version} / {build_id})")
+
+
 def get_built_exe_path(cfg):
     """按 onefile/onedir 返回实际 exe 路径；onedir 为 dist/<app>/<exe>。"""
     build = cfg['build']
@@ -180,8 +199,10 @@ def build_exe():
     print("=" * 60)
 
     # 打包前先分配本次构建的唯一版本号（写回根 package.json）
-    if apply_build_version() is None:
+    build_id = apply_build_version()
+    if build_id is None:
         return False
+    _write_runtime_version(cfg, build_id)
 
     clean_build(cfg)
 

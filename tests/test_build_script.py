@@ -105,6 +105,18 @@ class BuildVersionTests(unittest.TestCase):
             f.write('{ broken json ')
         self.assertIsNone(build_exe.apply_build_version())
 
+    def test_write_runtime_version_generates_importable_module(self):
+        os.makedirs(os.path.join(self.tmp, 'auto_clicker_layers'), exist_ok=True)
+        cfg = {'release': {'version': '2.0.2'}}
+        build_exe._write_runtime_version(cfg, '20261122-007')
+        path = os.path.join(self.tmp, 'auto_clicker_layers', 'version.py')
+        self.assertTrue(os.path.isfile(path))
+        ns = {}
+        with open(path, encoding='utf-8') as f:
+            exec(f.read(), ns)
+        self.assertEqual(ns['APP_VERSION'], '2.0.2')
+        self.assertEqual(ns['BUILD_ID'], '20261122-007')
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
