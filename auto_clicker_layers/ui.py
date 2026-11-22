@@ -1,46 +1,73 @@
 # -*- coding: utf-8 -*-
-"""UI 层（NFR-09）：可复用的 Tk 组件（全屏区域选择遮罩、顶部错误横幅）。
+"""UI 层（NFR-09）：可复用的 Tk 组件（取点遮罩、顶部错误横幅）。
 
 主窗口的控件编排仍在入口文件作为组合根；这里只承载与业务无关的通用 UI 组件，
 便于单独实例化与测试。
 """
+import os
+import threading
+import time
 import tkinter as tk
 
-from auto_clicker_layers.engine import normalize_region
+from auto_clicker_layers import picker
 from auto_clicker_layers.platform_io import IS_WINDOWS
+
+ACCENT = '#60A5FA'
+ACCENT_STRONG = '#2563EB'
+DANGER = '#F87171'
+PANEL_BG = '#111827'
+PANEL_FG = '#F9FAFB'
+BASE_PROMPT = "拖拽框选 · 单击取点 · 方向键 1px/Shift 10px · Enter 确认 · Esc 取消"
+PIXEL_PANEL = 120
+PIXEL_BORDER = 6
+
+
+def _monitor_rects(ox, oy, sw, sh):
+    """返回所有显示器矩形；失败时退化为整个虚拟屏。"""
+    fallback = [(int(ox), int(oy), int(ox) + int(sw), int(oy) + int(sh))]
+    if not IS_WINDOWS:
+        return fallback
+    try:
+        import win32api
+        rects = []
+        for _handle, _hdc, rect in win32api.EnumDisplayMonitors():
+            rects.append(tuple(int(v) for v in rect))
+        return rects or fallback
+    except Exception:
+        return fallback
 
 
 class RegionSelector:
-    """FR-C01/8.1：全屏半透明遮罩 + 十字线 + 拖拽框选 + 实时尺寸标签。
+    """FR-27：全屏变暗遮罩 + 十字线 + 5×5 放大镜 + 框选/取点 + 键盘微调。"""
 
-    交互：
-      - 按下左键并拖拽：实时绘制选框，标签显示 `W×H (x,y)`；
-      - 松开左键：选框保留 1 秒后关闭并回调；几乎无位移时按单击取 1×1 点；
-      - 右键：撤销当前选框；
-      - Esc：立即取消，原配置不变；Enter：确认当前选框。
-    """
-
-    def __init__(self, parent, on_done):
+    def __init__(self, parent, on_done, warmup=False):
         self.parent = parent
         self.on_done = on_done
-        self.start_xy = None
         self.start_abs = None
-        self.rect_id = None
-        self.last_region = None
+        self.start_raw = None
+        self.selection = None
         self._finished = False
-        self._finish_after = None
+        self._rect_id = None
+        self._marker_ids = []
+        self._screen_image = None
+        self._screen_size = None
+        self._capture_done = False
+        self._revealed = False
+        self._reveal_after = None
+        self._magnifier_photo = None
 
         self.top = tk.Toplevel(parent)
         self.top.overrideredirect(True)
         self.top.configure(bg='#000000')
         try:
             self.top.attributes('-topmost', True)
-            self.top.attributes('-alpha', 0.45)
+            self.top.attributes('-alpha', 0.40)
         except Exception:
             pass
 
-        # 虚拟屏幕范围：Windows 用系统指标，其他平台用 Tk 虚拟根窗口
+        # 虚拟屏幕范围：负坐标显示器同样覆盖；Windows 再用 SetWindowPos 兜底。
         ox, oy, sw, sh = 0, 0, parent.winfo_screenwidth(), parent.winfo_screenheight()
+        primary_w, primary_h = sw, sh
         if IS_WINDOWS:
             try:
                 import ctypes
@@ -49,9 +76,14 @@ class RegionSelector:
                 oy = int(u.GetSystemMetrics(77))   # SM_YVIRTUALSCREEN
                 sw = int(u.GetSystemMetrics(78))   # SM_CXVIRTUALSCREEN
                 sh = int(u.GetSystemMetrics(79))   # SM_CYVIRTUALSCREEN
+                primary_w = int(u.GetSystemMetrics(0)) or sw
+                primary_h = int(u.GetSystemMetrics(1)) or sh
             except Exception:
                 pass
         self.origin_x, self.origin_y = ox, oy
+        self.width, self.height = sw, sh
+        self.bounds = (ox, oy, ox + sw, oy + sh)
+        self.monitor_rects = _monitor_rects(ox, oy, sw, sh)
         try:
             self.top.geometry("%dx%d%+d%+d" % (sw, sh, ox, oy))
         except Exception:
@@ -60,47 +92,111 @@ class RegionSelector:
         self.canvas = tk.Canvas(self.top, bg='#000000', highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.canvas.configure(cursor='crosshair')
-        self.hline = self.canvas.create_line(0, 0, sw, 0, fill='#60A5FA', width=1)
-        self.vline = self.canvas.create_line(0, 0, 0, sh, fill='#60A5FA', width=1)
-        self.prompt = tk.Label(
-            self.top, text="拖拽框选区域 · 单击取点 · Esc 取消 · 右键撤销 · Enter 确认",
-            bg='#1F2229', fg='#E8EAED', font=('微软雅黑', 10, 'bold'),
-            padx=14, pady=7)
-        # 提示条放在主屏可见区域中央，虚拟屏扩展到多屏时不会跑到副屏外
-        primary_w = sw
-        if IS_WINDOWS:
-            try:
-                import ctypes
-                primary_w = int(ctypes.windll.user32.GetSystemMetrics(0)) or sw
-            except Exception:
-                pass
-        self.prompt.place(x=max(0, primary_w // 2), y=18, anchor='n')
-        self.size_label = tk.Label(
-            self.top, text='', bg='#2563EB', fg='white',
-            font=('Consolas', 10, 'bold'), padx=8, pady=4)
-        self.size_label.place(x=20, y=20)
+        self.hline = self.canvas.create_line(0, 0, sw, 0, fill=ACCENT, width=1)
+        self.vline = self.canvas.create_line(0, 0, 0, sh, fill=ACCENT, width=1)
 
-        for widget in (self.top, self.canvas):
+        self.prompt = tk.Label(
+            self.top, text=BASE_PROMPT, bg='#1F2937', fg=PANEL_FG,
+            font=('微软雅黑', 10, 'bold'), padx=14, pady=7)
+        # 顶部提示固定在主屏中心，避免多屏时跑到副屏边缘。
+        self.prompt.place(
+            x=max(20, -ox + primary_w // 2), y=max(8, -oy + 18), anchor='n')
+
+        self.size_label = tk.Label(
+            self.top, text='', bg=ACCENT_STRONG, fg='white',
+            font=('Consolas', 10, 'bold'), padx=8, pady=4)
+        self.size_label.place(x=max(8, -ox + 20), y=max(8, -oy + 20))
+
+        # 放大镜放在主屏右上角，不覆盖中央取点区。
+        mag_x = max(20, -ox + primary_w - 170)
+        mag_y = max(8, -oy + 20)
+        self.magnifier = tk.Canvas(
+            self.top, width=PIXEL_PANEL + PIXEL_BORDER * 2,
+            height=PIXEL_PANEL + PIXEL_BORDER * 2,
+            bg=PANEL_BG, highlightthickness=1, highlightbackground=ACCENT)
+        self.magnifier.place(x=mag_x, y=mag_y)
+        self.mag_label = tk.Label(
+            self.top, text='5×5  (--, --)', bg=PANEL_BG, fg=PANEL_FG,
+            font=('Consolas', 9, 'bold'), padx=6, pady=3)
+        self.mag_label.place(x=mag_x, y=mag_y + PIXEL_PANEL + PIXEL_BORDER * 2 + 2)
+
+        bind_widgets = (self.top, self.canvas, self.magnifier, self.mag_label,
+                        self.prompt, self.size_label)
+        for widget in bind_widgets:
             widget.bind('<Motion>', self._on_motion)
             widget.bind('<ButtonPress-1>', self._on_press)
             widget.bind('<B1-Motion>', self._on_drag)
             widget.bind('<ButtonRelease-1>', self._on_release)
             widget.bind('<ButtonPress-3>', self._on_right)
-        self.top.bind('<Escape>', self._on_cancel)
-        self.top.bind('<Return>', self._on_confirm)
-        self.top.bind('<KP_Enter>', self._on_confirm)
+        for widget in (self.top, self.canvas):
+            widget.bind('<Escape>', self._on_cancel)
+            widget.bind('<Return>', self._on_confirm)
+            widget.bind('<KP_Enter>', self._on_confirm)
+            for key in ('Left', 'Right', 'Up', 'Down'):
+                widget.bind('<%s>' % key, self._on_nudge)
+                widget.bind('<Shift-%s>' % key, self._on_nudge)
 
-        self.top.update_idletasks()
-        # Windows 上负坐标虚拟屏由 SetWindowPos 兜底，避免 Tk 把 -x 解释成右边缘偏移
+        # 先隐藏遮罩，后台抓屏完成后再显示，避免把遮罩自身抓进 5×5 放大图。
+        self.top.withdraw()
+        if warmup:
+            # 启动期预热：建好完整控件树后立即销毁，避免首次取点时首次加载字体/控件类
+            # 造成主线程卡顿；不启动抓屏线程，也不会显示遮罩。
+            self._finished = True
+            self.top.destroy()
+            return
+        self._capture_deadline = time.monotonic() + 0.30
+        self._start_capture()
+        self._reveal_after = self.top.after(20, self._check_reveal)
+
+    def _start_capture(self):
+        if os.environ.get('AUTOCLICKER_PICKER_NO_CAPTURE') == '1':
+            self._capture_done = True
+            return
+
+        def worker():
+            try:
+                from PIL import ImageGrab
+                image = ImageGrab.grab(
+                    bbox=self.bounds,
+                    all_screens=bool(IS_WINDOWS),
+                )
+                if image.size == (self.width, self.height):
+                    self._screen_image = image.convert('RGB')
+                    self._screen_size = image.size
+            except Exception:
+                self._screen_image = None
+            finally:
+                self._capture_done = True
+
+        threading.Thread(target=worker, name='picker-capture', daemon=True).start()
+
+    def _check_reveal(self):
+        self._reveal_after = None
+        if self._finished:
+            return
+        if self._capture_done or time.monotonic() >= self._capture_deadline:
+            self._reveal()
+        else:
+            self._reveal_after = self.top.after(20, self._check_reveal)
+
+    def _reveal(self):
+        if self._finished or self._revealed:
+            return
+        self._revealed = True
+        try:
+            self.top.deiconify()
+            self.top.update_idletasks()
+        except Exception:
+            pass
         if IS_WINDOWS:
             try:
                 import ctypes
                 hwnd = self.top.winfo_id()
                 u = ctypes.windll.user32
-                # Tk 的顶层窗口外面还有一层 wrapper，必须对根 HWND 设置 TOPMOST
                 root_hwnd = u.GetAncestor(hwnd, 2) or hwnd
                 u.SetWindowPos(
-                    root_hwnd, -1, ox, oy, sw, sh, 0x0040)  # HWND_TOPMOST, SWP_SHOWWINDOW
+                    root_hwnd, -1, self.origin_x, self.origin_y,
+                    self.width, self.height, 0x0040)  # HWND_TOPMOST, SWP_SHOWWINDOW
             except Exception:
                 pass
         try:
@@ -109,105 +205,255 @@ class RegionSelector:
         except Exception:
             pass
         try:
-            # 全局 grab：遮罩必须优先拿到鼠标事件，避免被主窗口/其他窗口抢走
-            self.top.grab_set_global()
-        except Exception:
-            try:
-                self.top.grab_set()
-            except Exception:
-                pass
-        try:
-            self.top.focus_force()
+            # 遮罩已覆盖整个虚拟屏，局部 grab 足以把本应用鼠标事件留在遮罩上；
+            # 不用 grab_set_global：跨进程全局抓取在本机实测会让首次显示阻塞 2.8s。
+            self.top.grab_set()
         except Exception:
             pass
+        try:
+            self.top.focus_force()
+            self.canvas.focus_set()
+        except Exception:
+            pass
+        try:
+            px, py = self.top.winfo_pointerxy()
+            self._set_cursor(px, py)
+        except Exception:
+            self._set_cursor(
+                self.origin_x + self.width // 2,
+                self.origin_y + self.height // 2)
 
     def _abs_xy(self, event):
         return int(event.x_root), int(event.y_root)
 
-    def _draw_size(self, region, px, py):
-        text = "%d×%d (%d,%d)" % (region['width'], region['height'], region['x'], region['y'])
-        self.size_label.config(text=text)
-        # 标签放在光标右下方，贴近当前框选操作
-        self.size_label.place(x=max(0, px + 14), y=max(0, py + 14))
+    def _set_cursor(self, x, y):
+        x, y = picker.snap_point(
+            x, y, self.bounds, self.monitor_rects, picker.DEFAULT_SNAP_PX)
+        self.cursor_abs = (x, y)
+        self._move_crosshair(x, y)
+        self._refresh_magnifier(x, y)
+
+    def _move_crosshair(self, x, y):
+        cx = max(0, min(self.width - 1, x - self.origin_x))
+        cy = max(0, min(self.height - 1, y - self.origin_y))
+        self.canvas.coords(self.hline, 0, cy, self.width, cy)
+        self.canvas.coords(self.vline, cx, 0, cx, self.height)
+
+    def _refresh_magnifier(self, x, y):
+        try:
+            self.mag_label.config(text="5×5  (%d, %d)" % (x, y))
+        except Exception:
+            pass
+        try:
+            self.magnifier.delete('all')
+        except Exception:
+            return
+        box = picker.magnifier_box(x, y, self.bounds, 5)
+        if getattr(self, '_screen_image', None) is not None:
+            try:
+                from PIL import Image, ImageTk
+                ix1 = box[0] - self.origin_x
+                iy1 = box[1] - self.origin_y
+                ix2 = box[2] - self.origin_x
+                iy2 = box[3] - self.origin_y
+                crop = self._screen_image.crop((ix1, iy1, ix2, iy2))
+                enlarged = crop.resize(
+                    (PIXEL_PANEL, PIXEL_PANEL), Image.Resampling.NEAREST)
+                self._magnifier_photo = ImageTk.PhotoImage(enlarged)
+                self.magnifier.create_image(
+                    PIXEL_BORDER, PIXEL_BORDER, anchor='nw',
+                    image=self._magnifier_photo)
+            except Exception:
+                self._draw_magnifier_fallback()
+        else:
+            self._draw_magnifier_fallback()
+        # 5×5 网格 + 中心十字，方便判断像素落点。
+        for i in range(1, 5):
+            pos = PIXEL_BORDER + i * (PIXEL_PANEL // 5)
+            self.magnifier.create_line(pos, PIXEL_BORDER, pos,
+                                       PIXEL_BORDER + PIXEL_PANEL,
+                                       fill='#0B1220')
+            self.magnifier.create_line(PIXEL_BORDER, pos,
+                                       PIXEL_BORDER + PIXEL_PANEL, pos,
+                                       fill='#0B1220')
+        center = PIXEL_BORDER + PIXEL_PANEL // 2
+        self.magnifier.create_line(center - 7, center, center + 7, center,
+                                   fill=DANGER, width=2)
+        self.magnifier.create_line(center, center - 7, center, center + 7,
+                                   fill=DANGER, width=2)
+
+    def _draw_magnifier_fallback(self):
+        block = PIXEL_PANEL // 5
+        for row in range(5):
+            for col in range(5):
+                x1 = PIXEL_BORDER + col * block
+                y1 = PIXEL_BORDER + row * block
+                fill = '#1F2937' if (row + col) % 2 else '#374151'
+                if row == 2 and col == 2:
+                    fill = ACCENT_STRONG
+                self.magnifier.create_rectangle(
+                    x1, y1, x1 + block, y1 + block, fill=fill, outline='')
 
     def _on_motion(self, event):
         if self._finished:
             return
-        self.canvas.coords(self.hline, 0, event.y, self.canvas.winfo_width(), event.y)
-        self.canvas.coords(self.vline, event.x, 0, event.x, self.canvas.winfo_height())
+        self._set_cursor(*self._abs_xy(event))
 
     def _on_press(self, event):
         if self._finished:
             return
-        self.start_xy = (event.x, event.y)
-        self.start_abs = self._abs_xy(event)
-        self.last_region = None
-        if self.rect_id:
-            self.canvas.delete(self.rect_id)
-        self.rect_id = self.canvas.create_rectangle(
-            event.x, event.y, event.x, event.y,
-            outline='#60A5FA', width=2, fill='')
-        self.size_label.config(text='0×0')
-        self.size_label.place(x=max(0, event.x + 14), y=max(0, event.y + 14))
+        self.start_raw = self._abs_xy(event)
+        self.start_abs = picker.snap_point(
+            *self.start_raw, self.bounds, self.monitor_rects, picker.DEFAULT_SNAP_PX)
+        self.selection = None
+        self._clear_marker()
+        self.prompt.config(text=BASE_PROMPT)
+        sx = self.start_abs[0] - self.origin_x
+        sy = self.start_abs[1] - self.origin_y
+        self._rect_id = self.canvas.create_rectangle(
+            sx, sy, sx, sy, outline=ACCENT, width=2,
+            fill='#1E3A5F', stipple='gray25')
+        self.size_label.config(text='拖拽中…')
+        self._place_size_label(sx, sy)
+        self._set_cursor(*self.start_abs)
 
     def _on_drag(self, event):
-        if self._finished or not self.start_xy or not self.rect_id:
+        if self._finished or not self.start_raw:
             return
-        self.canvas.coords(self.rect_id, self.start_xy[0], self.start_xy[1], event.x, event.y)
-        x1, y1 = self._abs_xy(event)
-        sx, sy = self.start_abs if self.start_abs else (
-            self.origin_x + self.start_xy[0], self.origin_y + self.start_xy[1])
-        self.last_region = normalize_region(sx, sy, x1, y1)
-        self._draw_size(self.last_region, event.x, event.y)
+        end_raw = self._abs_xy(event)
+        self.selection = picker.rect_selection(
+            self.start_raw[0], self.start_raw[1], end_raw[0], end_raw[1],
+            self.bounds, self.monitor_rects,
+            threshold=picker.DEFAULT_SNAP_PX, click_threshold=-1)
+        self._draw_selection(self.selection)
+        self.prompt.config(text="松手后可方向键微调 · Enter 确认 · Esc 取消")
+        self._set_cursor(*end_raw)
 
     def _on_release(self, event):
-        if self._finished or not self.start_xy:
+        if self._finished or not self.start_raw:
             return
-        x1, y1 = self._abs_xy(event)
-        sx, sy = self.start_abs if self.start_abs else (
-            self.origin_x + self.start_xy[0], self.origin_y + self.start_xy[1])
-        self.last_region = normalize_region(sx, sy, x1, y1)
-        self._draw_size(self.last_region, event.x, event.y)
-        # 选框保留 1 秒，随后回填并关闭
-        self._finish_after = self.top.after(1000, self._finish_with_last)
+        end_raw = self._abs_xy(event)
+        self.selection = picker.rect_selection(
+            self.start_raw[0], self.start_raw[1], end_raw[0], end_raw[1],
+            self.bounds, self.monitor_rects)
+        self._draw_selection(self.selection)
+        self.prompt.config(text="已选区域 · 方向键微调 · Enter 确认 · Esc 取消")
+        self._set_cursor(*end_raw)
 
     def _on_right(self, event):
         if self._finished:
             return
-        if self.rect_id:
-            self.canvas.delete(self.rect_id)
-            self.rect_id = None
-        self.start_xy = None
+        self.selection = None
+        self.start_raw = None
         self.start_abs = None
-        self.last_region = None
+        self._clear_marker()
         self.size_label.config(text='已撤销当前选框')
+        self.prompt.config(text=BASE_PROMPT)
+        self._refresh_magnifier(*getattr(self, 'cursor_abs', (0, 0)))
+
+    def _on_nudge(self, event):
+        if self._finished:
+            return 'break'
+        step = 10 if (getattr(event, 'state', 0) & 0x0001) else 1
+        key = getattr(event, 'keysym', '')
+        dx = -step if key == 'Left' else step if key == 'Right' else 0
+        dy = -step if key == 'Up' else step if key == 'Down' else 0
+        if not dx and not dy:
+            return 'break'
+        if self.selection is None:
+            self.selection = picker.point_selection(
+                *getattr(self, 'cursor_abs', (self.origin_x, self.origin_y)),
+                bounds=self.bounds, monitor_rects=self.monitor_rects)
+        self.selection = picker.nudge_selection(
+            self.selection, dx, dy, self.bounds)
+        if self.selection is None:
+            return 'break'
+        self._draw_selection(self.selection)
+        x, y = self._selection_anchor(self.selection)
+        self.cursor_abs = (x, y)
+        self._move_crosshair(x, y)
+        self._refresh_magnifier(x, y)
+        self.prompt.config(text="方向键微调中 · Enter 确认 · Esc 取消")
+        return 'break'
+
+    def _selection_anchor(self, selection):
+        x = int(selection.get('x', 0))
+        y = int(selection.get('y', 0))
+        if not selection.get('point'):
+            x += max(0, int(selection.get('width', 1)) // 2)
+            y += max(0, int(selection.get('height', 1)) // 2)
+        return x, y
+
+    def _clear_marker(self):
+        for item in self._marker_ids:
+            try:
+                self.canvas.delete(item)
+            except Exception:
+                pass
+        self._marker_ids = []
+        if self._rect_id:
+            try:
+                self.canvas.delete(self._rect_id)
+            except Exception:
+                pass
+            self._rect_id = None
+
+    def _draw_selection(self, selection):
+        if self._finished or selection is None:
+            return
+        self._clear_marker()
+        x = int(selection.get('x', 0))
+        y = int(selection.get('y', 0))
+        w = max(1, int(selection.get('width', 1)))
+        h = max(1, int(selection.get('height', 1)))
+        cx = x - self.origin_x
+        cy = y - self.origin_y
+        if selection.get('point'):
+            self._rect_id = self.canvas.create_rectangle(
+                cx - 4, cy - 4, cx + 4, cy + 4,
+                outline=DANGER, width=2, fill='')
+            self._marker_ids = [
+                self.canvas.create_line(cx - 9, cy, cx + 9, cy, fill=DANGER, width=1),
+                self.canvas.create_line(cx, cy - 9, cx, cy + 9, fill=DANGER, width=1),
+            ]
+        else:
+            self._rect_id = self.canvas.create_rectangle(
+                cx, cy, cx + w, cy + h, outline=ACCENT, width=2,
+                fill='#1E3A5F', stipple='gray25')
+        self.size_label.config(
+            text="%d×%d  (%d, %d)" % (w, h, x, y))
+        self._place_size_label(cx + w, cy + h)
+
+    def _place_size_label(self, px, py):
+        x = min(max(8, px + 12), max(8, self.width - 220))
+        y = min(max(8, py + 12), max(8, self.height - 40))
+        self.size_label.place(x=x, y=y)
 
     def _on_confirm(self, event=None):
-        if self.last_region:
-            self._finish_with_last()
+        if self._finished:
+            return
+        selection = self.selection
+        if selection is None:
+            selection = picker.point_selection(
+                *getattr(self, 'cursor_abs', (self.origin_x, self.origin_y)),
+                bounds=self.bounds, monitor_rects=self.monitor_rects)
+        self._finish(dict(selection))
 
     def _on_cancel(self, event=None):
         if self._finished:
             return
         self._finish(None, cancelled=True)
 
-    def _finish_with_last(self):
-        if self._finished:
-            return
-        if self.last_region:
-            self._finish(self.last_region)
-        else:
-            self._finish(None, cancelled=True)
-
-    def _finish(self, region, cancelled=False):
+    def _finish(self, selection, cancelled=False):
         if self._finished:
             return
         self._finished = True
-        try:
-            if self._finish_after:
-                self.top.after_cancel(self._finish_after)
-        except Exception:
-            pass
+        if self._reveal_after:
+            try:
+                self.top.after_cancel(self._reveal_after)
+            except Exception:
+                pass
+            self._reveal_after = None
         try:
             self.top.grab_release()
         except Exception:
@@ -217,9 +463,18 @@ class RegionSelector:
         except Exception:
             pass
         try:
-            self.on_done(None if cancelled else region)
+            self.on_done(None if cancelled else selection)
         except Exception:
             pass
+
+
+def prewarm_region_selector(parent):
+    """启动期预热取点遮罩控件树；失败不影响主流程。"""
+    try:
+        RegionSelector(parent, lambda _selection: None, warmup=True)
+        return True
+    except Exception:
+        return False
 
 
 class NoticeBar:

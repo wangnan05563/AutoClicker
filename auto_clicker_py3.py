@@ -201,7 +201,7 @@ def normalize_region(x1, y1, x2, y2):
 # ==================== UI 组件层（auto_clicker_layers.ui）====================
 # NFR-09：全屏区域选择遮罩与顶部错误横幅已下沉到 auto_clicker_layers/ui.py，
 # 主文件保留主窗口（AutoClicker）作为组合根。
-from auto_clicker_layers.ui import RegionSelector, NoticeBar
+from auto_clicker_layers.ui import RegionSelector, NoticeBar, prewarm_region_selector
 
 # ERROR_ALREADY_EXISTS常量（在pywin32中可能未定义）
 ERROR_ALREADY_EXISTS = 183
@@ -390,6 +390,8 @@ class AutoClicker:
         self._init_theme()
         self._init_ui_fonts()
         self.setup_ui()
+        # FR-27：提前建立并销毁一次取点遮罩控件树，摊平首次取点的字体/控件初始化成本
+        prewarm_region_selector(self.root)
         self.root.after(30, self._poll_ui_queue)
         # FR-D01 定时计划：Tk 主线程每秒检查一次（休眠期间 after 暂停，唤醒后补算）
         self.root.after(1000, self._schedule_tick)

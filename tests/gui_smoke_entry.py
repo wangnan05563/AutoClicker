@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _TMP_HOME = tempfile.mkdtemp(prefix='autoclicker_smoke_')
 os.environ['USERPROFILE'] = _TMP_HOME
 os.environ['HOME'] = _TMP_HOME
+os.environ['AUTOCLICKER_PICKER_NO_CAPTURE'] = '1'
 
 # 预置空配置，避免首次运行引导弹窗阻塞冒烟流程（AutoClicker 会自动补齐默认值）
 with open(os.path.join(_TMP_HOME, '.auto_clicker_config_py3.json'), 'w', encoding='utf-8') as _f:
@@ -205,5 +206,110 @@ with zipfile.ZipFile(diag_path) as zf:
     assert 'summary.txt' in names
     assert 'config.json' in names
 print("GUI_DIAGNOSTICS_OK")
+
+# FR-27：遮罩框选/单击/方向键微调/Enter 确认，3 秒内完成；Esc 返回 None
+from auto_clicker_layers.ui import RegionSelector  # noqa: E402
+
+class _PickerEvent:
+    def __init__(self, x, y, state=0, keysym=''):
+        self.x_root = x
+        self.y_root = y
+        self.x = x
+        self.y = y
+        self.state = state
+        self.keysym = keysym
+
+def _wait_picker_reveal(selector, timeout=1.0):
+    end = time.time() + timeout
+    while time.time() < end and not selector._revealed:
+        root.update()
+        time.sleep(0.005)
+    assert selector._revealed, 'picker overlay not revealed'
+    root.update_idletasks()
+
+picker_results = []
+picker_t0 = time.perf_counter()
+picker = RegionSelector(root, picker_results.append)
+construct_elapsed = time.perf_counter() - picker_t0
+reveal_t0 = time.perf_counter()
+picker._check_reveal()
+update_elapsed = time.perf_counter() - reveal_t0
+print('PICKER_CONSTRUCT_MS', round(construct_elapsed * 1000, 1), 'REVEAL_MS', round(update_elapsed * 1000, 1))
+assert construct_elapsed < 0.1, 'picker construction blocked main thread: %.1fms' % (construct_elapsed * 1000)
+assert update_elapsed < 0.1, 'picker reveal blocked main thread: %.1fms' % (update_elapsed * 1000)
+root.update()
+picker._on_motion(_PickerEvent(500, 300))
+picker._on_press(_PickerEvent(500, 300))
+picker._on_drag(_PickerEvent(900, 600))
+picker._on_release(_PickerEvent(900, 600))
+assert picker.selection == {'x': 500, 'y': 300, 'width': 400, 'height': 300, 'point': False}
+assert '400×300' in picker.size_label.cget('text')
+picker._on_nudge(_PickerEvent(0, 0, state=0, keysym='Left'))
+assert picker.selection['x'] == 499
+picker._on_nudge(_PickerEvent(0, 0, state=1, keysym='Up'))
+assert picker.selection['y'] == 290
+assert picker.selection['width'] == 400 and picker.selection['height'] == 300
+assert time.perf_counter() - picker_t0 < 3.0, 'picker selection exceeded 3s'
+picker._on_confirm()
+root.update()
+assert picker_results[-1] == {'x': 499, 'y': 290, 'width': 400, 'height': 300, 'point': False}
+assert picker._finished
+
+picker2_results = []
+picker2 = RegionSelector(root, picker2_results.append)
+_wait_picker_reveal(picker2, timeout=0.1)
+picker2._on_motion(_PickerEvent(800, 500))
+picker2._on_press(_PickerEvent(800, 500))
+picker2._on_release(_PickerEvent(800, 500))
+assert picker2.selection['point'] is True
+assert picker2.selection['width'] == 1 and picker2.selection['height'] == 1
+picker2._on_nudge(_PickerEvent(0, 0, state=0, keysym='Left'))
+assert picker2.selection['x'] == 799
+picker2._on_right(_PickerEvent(800, 500))
+assert picker2.selection is None
+picker2._on_cancel()
+root.update()
+assert picker2_results[-1] is None
+assert picker2._finished
+
+# 应用级路径：取区域按钮异步打开遮罩，单击取点后 Enter 回填并持久化
+app._show_page('run')
+root.update()
+app.set_click_area()
+for _ in range(200):
+    root.update()
+    if app._region_selector is not None:
+        break
+    time.sleep(0.005)
+assert app._region_selector is not None, 'application region selector not opened'
+app_selector = app._region_selector
+_wait_picker_reveal(app_selector, timeout=0.1)
+app_selector._on_motion(_PickerEvent(640, 360))
+app_selector._on_press(_PickerEvent(640, 360))
+app_selector._on_release(_PickerEvent(640, 360))
+app_selector._on_confirm()
+root.update()
+assert app._region_selector is None
+assert app.config['click_area'] == {'x': 640, 'y': 360, 'width': 1, 'height': 1}
+assert '1x1 (640,360)' in app.area_label.cget('text')
+print("GUI_PICKER_APP_OK")
+
+# 应用级取消：Esc 后原区域保持不变
+old_area = dict(app.config['click_area'])
+app.set_click_area()
+for _ in range(200):
+    root.update()
+    if app._region_selector is not None:
+        break
+    time.sleep(0.005)
+assert app._region_selector is not None
+_wait_picker_reveal(app._region_selector, timeout=0.1)
+app._region_selector._on_cancel()
+root.update()
+assert app._region_selector is None
+assert app.config['click_area'] == old_area
+print("GUI_PICKER_APP_CANCEL_OK")
+
+print("GUI_PICKER_OK")
 
 app.exit_application()
