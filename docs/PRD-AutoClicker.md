@@ -1,5 +1,7 @@
 # AutoClicker 产品需求文档（PRD）
 
+> 2026-11-21 更新：本文件为 v1.0 历史归档；最新 PRD 见 [`PRD-AutoClicker-v2.0.md`](PRD-AutoClicker-v2.0.md)。
+
 | 项 | 内容 |
 |---|---|
 | 产品 | AutoClicker 桌面自动点击工具 |

@@ -1,5 +1,7 @@
 # AutoClicker 同款产品调研与优化需求梳理
 
+> 2026-11-21 更新：本文为 v2 历史基线；最新调研与需求见 [`GitHub同款产品调研与优化需求-v3-20261121.md`](GitHub同款产品调研与优化需求-v3-20261121.md)。
+
 > 调研对象：GitHub 及主流同类自动点击/输入自动化产品
 > 目标产品：AutoClicker v2.0（`auto_clicker_py3.py`，Python 3 + tkinter，Windows / 银河麒麟 V10）
 > 调研时间：2026-11-10 ｜ 数据口径：GitHub 星数/版本为本次检索所得，随仓库变动；功能描述以官方 README / 官网为准
