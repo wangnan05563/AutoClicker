@@ -99,6 +99,65 @@ KEEPALIVE_INTERVAL = 30
 MSG_SAVE_CONFIG_FAILED = "保存配置失败: "
 JSON_FILE_PATTERN = "*.json"
 
+# ==================== 崩溃诊断（独立于 UI/日志初始化）====================
+# 目标：即使 UI 尚未建立、Tk 回调抛异常、后台线程崩溃或进程收到致命信号，
+# 也能把现场写入磁盘，避免窗口版 exe 的 stderr 丢失后只剩“无提示退出”。
+CRASH_LOG_PATH = os.path.expanduser("~/.auto_clicker_logs/crash.log")
+_CRASH_STREAM = None
+
+
+def _write_crash_log(kind, detail):
+    """追加一条崩溃/生命周期记录；失败时静默，绝不影响主流程。"""
+    try:
+        os.makedirs(os.path.dirname(CRASH_LOG_PATH), exist_ok=True)
+        with open(CRASH_LOG_PATH, "a", encoding="utf-8", buffering=1) as fh:
+            fh.write("\n[%s] %s\n%s\n" % (
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"), kind, detail))
+    except Exception:
+        pass
+
+
+def _install_crash_logging():
+    """安装 faulthandler、sys/threading excepthook，尽早捕获致命错误。"""
+    global _CRASH_STREAM
+    try:
+        os.makedirs(os.path.dirname(CRASH_LOG_PATH), exist_ok=True)
+        if _CRASH_STREAM is None:
+            _CRASH_STREAM = open(CRASH_LOG_PATH, "a", encoding="utf-8", buffering=1)
+        import faulthandler
+        faulthandler.enable(file=_CRASH_STREAM, all_threads=True)
+    except Exception:
+        pass
+
+    import traceback
+
+    def _excepthook(exc_type, exc_value, exc_tb):
+        _write_crash_log("UNCAUGHT", "".join(
+            traceback.format_exception(exc_type, exc_value, exc_tb)))
+        try:
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+        except Exception:
+            pass
+
+    def _thread_excepthook(args):
+        _write_crash_log("THREAD_UNCAUGHT", "".join(
+            traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)))
+
+    sys.excepthook = _excepthook
+    threading.excepthook = _thread_excepthook
+
+
+def _tk_callback_exception(exc_type, exc_value, exc_tb):
+    """Tk 回调异常：窗口版 exe 没有 stderr，必须落盘。"""
+    import traceback
+    _write_crash_log("TK_CALLBACK", "".join(
+        traceback.format_exception(exc_type, exc_value, exc_tb)))
+    try:
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+    except Exception:
+        pass
+
+
 # ==================== 热键（keyboard，延迟导入）====================
 keyboard = None
 _KEYBOARD_LOADED = False
@@ -362,6 +421,20 @@ class AutoClicker:
             # 日志初始化失败不应阻断程序启动
             self._file_logger = None
             print("初始化日志失败: " + str(e))
+
+    def flush_logging(self):
+        """退出前强制刷盘：避免 os._exit/快速退出丢最后几行日志。"""
+        try:
+            if self._file_logger:
+                for handler in self._file_logger.handlers:
+                    handler.flush()
+        except Exception:
+            pass
+        try:
+            if _CRASH_STREAM:
+                _CRASH_STREAM.flush()
+        except Exception:
+            pass
 
     def _backup_config_before_migration(self):
         """CX-09：迁移/降级前备份原配置，避免旧配置丢失（PRD FR-G02）。"""
@@ -3310,18 +3383,25 @@ class AutoClicker:
             self.exit_application()
     
     def _shutdown_runtime(self):
-        """停止托盘、点击线程、保活与全局热键。"""
+        """停止托盘、点击线程、保活与全局热键；任何一步失败都不得阻断退出。"""
+        self.is_running = False
         try:
-            self._remove_tray_icon()
+            self._stop_runtime_tick()
+        except Exception:
+            pass
+        try:
+            self.stop_keepalive()
         except Exception:
             pass
         if self.click_thread and self.click_thread.is_alive():
             try:
-                self.click_thread.join(timeout=0.2)
+                # 唤醒 _wait_exact，避免长间隔下 join 等待整个睡眠周期
+                self._interval_change_event.set()
+                self.click_thread.join(timeout=1.5)
             except Exception:
                 pass
         try:
-            self.stop_keepalive()
+            self._remove_tray_icon()
         except Exception:
             pass
         try:
@@ -3363,11 +3443,36 @@ class AutoClicker:
 
     def exit_application(self):
         """完全退出应用程序 - 从托盘菜单调用（跨平台）"""
+        try:
+            self.log_message("开始退出程序：清理线程、托盘与全局热键")
+        except Exception:
+            pass
         self.is_running = False
-        self._shutdown_runtime()
-        self._persist_state_on_exit()
-        self._cleanup_linux_instance_lock()
-        self.root.destroy()
+        try:
+            self._shutdown_runtime()
+        except Exception:
+            pass
+        try:
+            self._persist_state_on_exit()
+        except Exception:
+            pass
+        try:
+            self._cleanup_linux_instance_lock()
+        except Exception:
+            pass
+        try:
+            self.flush_logging()
+        except Exception:
+            pass
+        _write_crash_log("APP_EXIT", "exit_application: cleanup finished")
+        try:
+            self.root.quit()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
 
 def activate_existing_window():
@@ -3441,6 +3546,8 @@ def main():
     if '--version' in sys.argv or '-V' in sys.argv:
         print("AutoClicker %s" % get_app_version())
         return
+    _install_crash_logging()
+    _write_crash_log("APP_START", "version=%s argv=%s" % (get_app_version(), sys.argv))
     if not IS_SINGLE_INSTANCE:
         activate_existing_window()
         show_single_instance_warning()
@@ -3449,10 +3556,27 @@ def main():
     setup_dpi_awareness()  # 必须在 tk.Tk() 之前，保证 DPI 感知对根窗口生效
     install_setting_restore_guards()
     root = tk.Tk()
+    root.report_callback_exception = _tk_callback_exception
 
     app = AutoClicker(root)
-
-    app.root.mainloop()
+    exit_code = 0
+    try:
+        app.root.mainloop()
+    except BaseException:
+        import traceback
+        _write_crash_log("APP_MAINLOOP_EXCEPTION", traceback.format_exc())
+        exit_code = 1
+    finally:
+        try:
+            app.flush_logging()
+        except Exception:
+            pass
+        _write_crash_log("APP_EXIT", "mainloop returned, exit_code=%d" % exit_code)
+        # Windows 窗口版 onefile：强制结束 Python 解释器，确保临时目录中的
+        # DLL/扩展句柄立即释放，避免 PyInstaller 父进程清理 _MEI 目录失败弹窗。
+        # Linux 保留正常解释器退出，让 atexit 的 xset/系统设置恢复逻辑执行。
+        if IS_WINDOWS:
+            os._exit(exit_code)
 
 
 if __name__ == "__main__":

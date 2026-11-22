@@ -1,6 +1,6 @@
 {
   "name": "autoclicker",
-  "version": "20261117-002",
+  "version": "20261122-002",
   "private": true,
   "description": "构建版本号载体：由 scripts/patch_version.py 在每次构建前更新为 YYYYMMDD-序号。"
 }
