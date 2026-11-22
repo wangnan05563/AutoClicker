@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import time
+import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -139,5 +140,26 @@ assert app._end_summary_window is not None
 app._close_end_summary()
 assert app._end_summary_window is None
 print("GUI_END_SUMMARY_OK")
+
+# FR-03：诊断卡片可刷新，详情窗口可开，一键生成脱敏诊断包
+app._show_page('settings')
+root.update_idletasks()
+report = app.refresh_diagnostics()
+assert report is not None
+assert report['schema'] == 'autoclicker.diagnostics/1'
+assert '总体状态' in app.diag_status_var.get()
+app.show_diagnostics_window()
+root.update_idletasks()
+assert app._diagnostics_window is not None
+app._close_diagnostics_window()
+assert app._diagnostics_window is None
+diag_path = app.create_diagnostic_package()
+assert os.path.isfile(diag_path), diag_path
+with zipfile.ZipFile(diag_path) as zf:
+    names = set(zf.namelist())
+    assert 'diagnostics.json' in names
+    assert 'summary.txt' in names
+    assert 'config.json' in names
+print("GUI_DIAGNOSTICS_OK")
 
 app.exit_application()

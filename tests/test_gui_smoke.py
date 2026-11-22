@@ -11,12 +11,14 @@ ENTRY = os.path.join(ROOT, 'tests', 'gui_smoke_entry.py')
 
 class GuiSmokeTests(unittest.TestCase):
     def test_main_window_builds_and_closes(self):
+        # 本机火绒实时扫描会让打包/源码启动偶发超过 60s，保留 120s 上限。
+        timeout = int(os.environ.get('AUTOCLICKER_GUI_SMOKE_TIMEOUT', '120'))
         proc = subprocess.run(
             [sys.executable, '-X', 'utf8', ENTRY],
             cwd=ROOT,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=timeout,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn('GUI_SMOKE_OK', proc.stdout)

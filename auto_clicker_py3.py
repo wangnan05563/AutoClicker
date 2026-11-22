@@ -57,6 +57,7 @@ from auto_clicker_layers.config import (
 )
 from auto_clicker_layers import onboarding as _onboarding
 from auto_clicker_layers import run_report as _run_report
+from auto_clicker_layers import diagnostics as _diagnostics
 
 # 点击抖动使用系统安全随机源，避免可预测的伪随机序列
 _RANDOM = random.SystemRandom()
@@ -307,6 +308,8 @@ class AutoClicker:
         self._region_selector = None
         self._region_starting = False
         self.config_file = os.path.expanduser("~/.auto_clicker_config_py3.json")
+        self.log_dir = os.path.expanduser("~/.auto_clicker_logs")
+        self.diagnostics_dir = os.path.expanduser("~/.auto_clicker_diagnostics")
         # 首启检测（6.9.1 引导与预设配置）：配置不存在即视为首次运行
         self.first_run = not os.path.exists(self.config_file)
         # FR-L01：会话输入能力探测（Wayland 降级，须早于 setup_ui 建按钮）
@@ -344,6 +347,13 @@ class AutoClicker:
         self._suppress_end_summary = False
         self._start_confirm_window = None
         self._end_summary_window = None
+        # FR-03：热键注册结果与诊断报告由设置页诊断中心读取
+        self._hotkey_state = {
+            'available': True, 'registered': False, 'keys': [],
+            'start': 'f6', 'emergency': 'f8', 'error': '',
+        }
+        self._diagnostics_report = None
+        self._diagnostics_window = None
         self._runtime_after_id = None
         self._log_buffer = []  # [(text, level)] 全量日志缓冲（UI-04 过滤用）
         self._pending_logs = []  # 磁盘日志尚未初始化时的待落盘消息
@@ -383,6 +393,11 @@ class AutoClicker:
             except Exception:
                 pass
             self.log_message("Wayland 降级：启动已禁用（会话=%s）" % self.input_session)
+        # FR-03：安装包缺关键依赖时启动即提示，不静默到点击失败
+        if IS_WINDOWS and (not HAS_WIN32GUI or not HAS_WIN32API):
+            self.show_operation_message(
+                "安装包缺少 pywin32 运行依赖，鼠标点击/托盘可能不可用；"
+                "请重新安装完整包，详见设置页“诊断中心”。", level='operation')
         # 热键/托盘初始化延迟到主窗口首次显示后：keyboard 全局钩子导入约 1.3 秒，
         # 不应阻塞 NFR-05 的启动时间；窗口先可见，再在空闲回调里注册。
         self._hotkey_queue = queue.Queue()
@@ -925,6 +940,8 @@ class AutoClicker:
             self._refresh_nav_styles()
             if key == 'run' and hasattr(self, 'run_summary_label'):
                 self.run_summary_label.config(text=self._run_summary_text())
+            if key == 'settings' and not getattr(self, '_diagnostics_report', None):
+                self.root.after(100, self.refresh_diagnostics)
         except Exception:
             pass
 
@@ -1035,6 +1052,23 @@ class AutoClicker:
                     self.log_text.configure(bg=pal['surface'], fg=pal['fg'])
                 except Exception:
                     pass
+            # FR-03：诊断卡片状态色与详情窗口随主题刷新
+            if getattr(self, '_diagnostics_report', None):
+                try:
+                    self._set_diag_card(self._diagnostics_report)
+                except Exception:
+                    pass
+            if getattr(self, '_diag_text', None):
+                try:
+                    self._diag_text.configure(bg=pal['surface'], fg=pal['text'])
+                    self._diag_text.tag_config(
+                        _diagnostics.STATUS_OK, foreground=pal['success'])
+                    self._diag_text.tag_config(
+                        _diagnostics.STATUS_WARN, foreground=pal['warning'])
+                    self._diag_text.tag_config(
+                        _diagnostics.STATUS_FAIL, foreground=pal['danger'])
+                except Exception:
+                    pass
             try:
                 self.root.configure(bg=pal['bg'])
             except Exception:
@@ -1080,8 +1114,18 @@ class AutoClicker:
     def save_config(self):
         try:
             _config_write(self.config_file, self.config)
+            self._config_save_error_notified = False
         except Exception as e:
             print(MSG_SAVE_CONFIG_FAILED + str(e))
+            if not getattr(self, '_config_save_error_notified', False):
+                self._config_save_error_notified = True
+                try:
+                    self.log_message("保存配置失败: " + str(e))
+                    self.show_operation_message(
+                        "保存配置失败：%s\n请在设置页“诊断中心”检查文件权限。"
+                        % e, level='operation')
+                except Exception:
+                    pass
     
     def save_config_if_running(self):
         """保存配置，如果程序正在运行则保存当前配置"""
@@ -1360,7 +1404,15 @@ class AutoClicker:
             self.config['hotkey_emergency'] = emer_k
             self.save_config()
             self._register_hotkeys()
+            if self._hotkey_state.get('error'):
+                messagebox.showerror(
+                    "热键注册失败",
+                    "启动/停止键未能注册：%s\n\n可在设置页“诊断中心”查看修复步骤。"
+                    % self._hotkey_state.get('error'))
+                self.refresh_diagnostics()
+                return
             self.log_message(f"热键已应用：启动={start_k}，紧急停止={emer_k}（Esc 始终为紧急停止）")
+            self.refresh_diagnostics()
         except Exception as e:
             messagebox.showerror("错误", "应用热键失败: " + str(e))
 
@@ -1416,6 +1468,60 @@ class AutoClicker:
         elif os.path.exists(desk):
             os.remove(desk)
 
+    def get_autostart_status(self):
+        """FR-03：读取系统自启项真实状态，供诊断中心判定。"""
+        enabled = bool(self.config.get('autostart', False))
+        if IS_WINDOWS:
+            try:
+                import winreg
+                key = winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Run",
+                    0, winreg.KEY_READ | winreg.KEY_SET_VALUE)
+                try:
+                    raw, _ = winreg.QueryValueEx(key, "AutoClicker")
+                    registered = True
+                except FileNotFoundError:
+                    raw, registered = '', False
+                finally:
+                    winreg.CloseKey(key)
+                path = str(raw or '').strip().strip('"')
+                return {
+                    'supported': True, 'enabled': enabled,
+                    'registered': registered, 'path': path,
+                    'path_exists': (os.path.exists(path) if path else None),
+                    'error': '',
+                }
+            except Exception as e:
+                return {
+                    'supported': True, 'enabled': enabled,
+                    'registered': False, 'path': '',
+                    'path_exists': None, 'error': str(e),
+                }
+        if IS_LINUX:
+            desk = os.path.expanduser("~/.config/autostart/autoclicker.desktop")
+            registered = os.path.isfile(desk)
+            path = ''
+            if registered:
+                try:
+                    with open(desk, 'r', encoding='utf-8', errors='replace') as fh:
+                        for line in fh:
+                            if line.startswith('Exec='):
+                                path = line.split('=', 1)[1].strip().strip('"')
+                                break
+                except OSError:
+                    pass
+            return {
+                'supported': True, 'enabled': enabled,
+                'registered': registered, 'path': path,
+                'path_exists': (os.path.exists(path) if path else None),
+                'error': '',
+            }
+        return {
+            'supported': False, 'enabled': enabled,
+            'registered': False, 'path': '', 'path_exists': None, 'error': '',
+        }
+
     def set_autostart(self, enable):
         try:
             if IS_WINDOWS:
@@ -1428,9 +1534,11 @@ class AutoClicker:
             self.config['autostart'] = enable
             self.save_config()
             self.log_message("开机自启已" + ("开启" if enable else "关闭"))
+            self.refresh_diagnostics()
         except Exception as e:
             self.log_message("设置开机自启失败: " + str(e))
             messagebox.showerror("错误", "设置开机自启失败: " + str(e))
+            self.refresh_diagnostics()
 
     def open_config_dir(self):
         """FR-04：打开配置文件所在目录。"""
@@ -1457,7 +1565,7 @@ class AutoClicker:
         try:
             self.root.clipboard_clear()
             self.root.clipboard_append(text)
-            self.show_notice("版本信息已复制", level='operation')
+            self.show_operation_message("版本信息已复制", level='operation')
         except Exception as e:
             messagebox.showinfo("版本信息", text + "\n\n复制失败: " + str(e))
 
@@ -1468,6 +1576,260 @@ class AutoClicker:
             webbrowser.open("https://github.com/wangnan05563/AutoClicker")
         except Exception as e:
             messagebox.showinfo("项目主页", "https://github.com/wangnan05563/AutoClicker\n" + str(e))
+
+    # ==================== FR-03 诊断中心 ====================
+    def build_diagnostics_context(self):
+        """从 UI/平台层采集诊断事实；不在报告里放大段原始配置。"""
+        home = os.path.expanduser("~")
+        username = os.path.basename(os.path.normpath(home))
+        log_dir = getattr(self, 'log_dir', os.path.expanduser("~/.auto_clicker_logs"))
+        diag_dir = getattr(self, 'diagnostics_dir',
+                           os.path.expanduser("~/.auto_clicker_diagnostics"))
+        frozen = bool(getattr(sys, 'frozen', False))
+        icon_path = None
+        try:
+            icon_path = self._get_icon_path()
+        except Exception:
+            icon_path = None
+        missing = []
+        if IS_WINDOWS:
+            if not HAS_WIN32GUI:
+                missing.append('pywin32 (win32gui)')
+            if not HAS_WIN32API:
+                missing.append('pywin32 (win32api)')
+        hotkey = dict(getattr(self, '_hotkey_state', {}) or {})
+        hotkey['start'] = str(self.config.get('hotkey_start', hotkey.get('start', 'f6')))
+        hotkey['emergency'] = str(self.config.get(
+            'hotkey_emergency', hotkey.get('emergency', 'f8')))
+        try:
+            screen = "%dx%d" % (self.root.winfo_screenwidth(), self.root.winfo_screenheight())
+        except Exception:
+            screen = ''
+        return {
+            'home': home,
+            'username': username,
+            'app_version': APP_VERSION,
+            'build_id': BUILD_ID,
+            'python': "%d.%d.%d" % sys.version_info[:3],
+            'platform': PLATFORM,
+            'frozen': frozen,
+            'executable': self._autostart_executable(),
+            'input_ok': bool(getattr(self, 'input_ok', True)),
+            'input_session': getattr(self, 'input_session', 'unknown'),
+            'input_backend': getattr(self, 'input_session', PLATFORM),
+            'input_reason': getattr(self, 'input_reason', ''),
+            'hotkeys': hotkey,
+            'autostart': self.get_autostart_status(),
+            'config_writable': _diagnostics.directory_writable(
+                os.path.dirname(self.config_file)),
+            'log_writable': _diagnostics.directory_writable(log_dir),
+            'diag_writable': _diagnostics.directory_writable(diag_dir),
+            'config_dir': os.path.dirname(self.config_file),
+            'missing_resources': missing,
+            'icon_missing': bool(frozen and not icon_path),
+            'crash_log': CRASH_LOG_PATH,
+            'dpi_scale': float(getattr(self, '_dpi_scale', 1.0)),
+            'screen': screen,
+            'config': dict(self.config or {}),
+        }
+
+    def _set_diag_card(self, report):
+        overall = report.get('overall', _diagnostics.STATUS_WARN)
+        self.diag_status_var.set("总体状态：%s" % report.get('overall_label', '需关注'))
+        color_key = {
+            _diagnostics.STATUS_OK: 'success',
+            _diagnostics.STATUS_WARN: 'warning',
+            _diagnostics.STATUS_FAIL: 'danger',
+        }.get(overall, 'muted')
+        try:
+            self.diag_status_label.config(foreground=self._color(color_key))
+        except Exception:
+            pass
+        issues = [c for c in report.get('checks', [])
+                  if c.get('status') != _diagnostics.STATUS_OK]
+        if not issues:
+            self.diag_issue_var.set(
+                "8 项检查全部通过：输入后端、热键、自启、权限、打包资源、"
+                "崩溃记录、会话/DPI、关键配置。")
+            return
+        lines = []
+        for item in issues[:3]:
+            lines.append("[%s] %s：%s" % (
+                _diagnostics.status_label(item.get('status')),
+                item.get('label', ''), item.get('detail', '')))
+        if len(issues) > 3:
+            lines.append("其余 %d 项请在“查看详情”中查看。" % (len(issues) - 3))
+        self.diag_issue_var.set("\n".join(lines))
+
+    def refresh_diagnostics(self):
+        """重新采集并刷新卡片；返回报告供窗口/诊断包复用。"""
+        try:
+            report = _diagnostics.build_report(self.build_diagnostics_context())
+            self._diagnostics_report = report
+            self._set_diag_card(report)
+            if getattr(self, '_diagnostics_window', None):
+                self._render_diagnostics_window(report)
+            self.log_message("诊断中心：总体=%s，异常项=%d" % (
+                report.get('overall_label'),
+                sum(1 for c in report.get('checks', [])
+                    if c.get('status') != _diagnostics.STATUS_OK)))
+            return report
+        except Exception as e:
+            self.log_message("诊断中心刷新失败: " + str(e))
+            self.diag_status_var.set("总体状态：需处理")
+            self.diag_issue_var.set("诊断采集失败：%s" % e)
+            return None
+
+    def _render_diagnostics_window(self, report):
+        text = getattr(self, '_diag_text', None)
+        if not text:
+            return
+        try:
+            text.configure(state=tk.NORMAL)
+            text.delete('1.0', tk.END)
+            text.insert(tk.END, "总体状态：%s\n生成时间：%s\n\n" % (
+                report.get('overall_label', ''), report.get('generated_at', '')))
+            for item in report.get('checks', []):
+                text.insert(tk.END, "[%s] %s\n" % (
+                    _diagnostics.status_label(item.get('status')),
+                    item.get('label', '')), (item.get('status'),))
+                text.insert(tk.END, "  %s\n" % item.get('detail', ''))
+                if item.get('fix'):
+                    text.insert(tk.END, "  修复：%s\n" % item['fix'])
+                text.insert(tk.END, "\n")
+            notes = report.get('notes')
+            if notes:
+                text.insert(tk.END, notes + "\n")
+            text.configure(state=tk.DISABLED)
+            self._diag_window_status_var.set("总体状态：%s" % report.get('overall_label', ''))
+        except Exception as e:
+            self.log_message("渲染诊断窗口失败: " + str(e))
+
+    def show_diagnostics_window(self):
+        """展示完整检查项与修复步骤。"""
+        try:
+            pal = self._resolve_palette()
+        except Exception:
+            pal = _theme_resolve_palette('light')
+        report = self.refresh_diagnostics()
+        if getattr(self, '_diagnostics_window', None):
+            try:
+                self._diagnostics_window.deiconify()
+                self._diagnostics_window.lift()
+                return
+            except Exception:
+                self._diagnostics_window = None
+        win = tk.Toplevel(self.root)
+        self._diagnostics_window = win
+        win.title("诊断中心 · AutoClicker")
+        win.geometry("780x560")
+        win.minsize(680, 480)
+        win.configure(bg=pal['bg'])
+        if self.root.winfo_viewable():
+            win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", self._close_diagnostics_window)
+        tk.Label(win, text="诊断中心", bg=pal['bg'], fg=pal['text'],
+                 font=('微软雅黑', 14, 'bold')).pack(anchor=tk.W, padx=18, pady=(14, 2))
+        self._diag_window_status_var = tk.StringVar(
+            value="总体状态：%s" % ((report or {}).get('overall_label', '')))
+        tk.Label(win, textvariable=self._diag_window_status_var,
+                 bg=pal['bg'], fg=pal['text'],
+                 font=('微软雅黑', 10, 'bold')).pack(anchor=tk.W, padx=18)
+        body = tk.Frame(win, bg=pal['bg'])
+        body.pack(fill=tk.BOTH, expand=True, padx=18, pady=10)
+        self._diag_text = tk.Text(
+            body, wrap=tk.WORD, font=('微软雅黑', 9), bg=pal['surface'],
+            fg=pal['text'], relief=tk.FLAT, padx=10, pady=10, state=tk.DISABLED)
+        self._diag_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll = ttk.Scrollbar(body, orient=tk.VERTICAL, command=self._diag_text.yview)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._diag_text['yscrollcommand'] = scroll.set
+        self._diag_text.tag_config(_diagnostics.STATUS_OK, foreground=pal['success'])
+        self._diag_text.tag_config(_diagnostics.STATUS_WARN, foreground=pal['warning'])
+        self._diag_text.tag_config(_diagnostics.STATUS_FAIL, foreground=pal['danger'])
+        btns = tk.Frame(win, bg=pal['bg'])
+        btns.pack(fill=tk.X, padx=18, pady=(0, 14))
+        ttk.Button(btns, text="刷新诊断", command=self.refresh_diagnostics).pack(
+            side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btns, text="一键复制诊断包",
+                   command=self.copy_diagnostic_package).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btns, text="打开诊断目录",
+                   command=self.open_diagnostics_dir).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btns, text="关闭", command=self._close_diagnostics_window).pack(
+            side=tk.RIGHT)
+        win.bind('<Escape>', lambda e: self._close_diagnostics_window())
+        if report:
+            self._render_diagnostics_window(report)
+
+    def _close_diagnostics_window(self):
+        win = getattr(self, '_diagnostics_window', None)
+        self._diagnostics_window = None
+        self._diag_text = None
+        if win:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    def create_diagnostic_package(self):
+        """生成脱敏 zip 并返回绝对路径；供按钮与测试复用。"""
+        report = self.refresh_diagnostics()
+        if not report:
+            raise RuntimeError("诊断采集失败，未生成诊断包")
+        diag_dir = getattr(self, 'diagnostics_dir',
+                           os.path.expanduser("~/.auto_clicker_diagnostics"))
+        path = _diagnostics.package_path(diag_dir)
+        log_dir = getattr(self, 'log_dir', os.path.expanduser("~/.auto_clicker_logs"))
+        home = os.path.expanduser("~")
+        username = os.path.basename(os.path.normpath(home))
+        tails = {
+            'app.log': _diagnostics.read_tail(
+                os.path.join(log_dir, 'autoclicker.log'), 60,
+                home=home, username=username),
+            'crash.log': _diagnostics.read_tail(
+                CRASH_LOG_PATH, 60, home=home, username=username),
+        }
+        _diagnostics.write_package(path, report, tails, self.config)
+        self.log_message("诊断包已生成：" + path)
+        return path
+
+    def copy_diagnostic_package(self):
+        """一键生成诊断包并把路径复制到剪贴板。"""
+        try:
+            path = self.create_diagnostic_package()
+            copied = True
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(path)
+                self.root.update_idletasks()
+            except Exception:
+                copied = False
+            self.log_message("诊断包路径已%s：%s" % ("复制" if copied else "生成", path))
+            self.show_operation_message(
+                "诊断包已生成%s：%s" % ("并复制路径" if copied else "", path),
+                level='operation')
+            if not copied:
+                messagebox.showinfo("诊断包", "已生成诊断包：\n%s" % path)
+            return path
+        except Exception as e:
+            self.log_message("生成诊断包失败: " + str(e))
+            messagebox.showerror("诊断包", "生成诊断包失败: " + str(e))
+            return None
+
+    def open_diagnostics_dir(self):
+        try:
+            d = getattr(self, 'diagnostics_dir',
+                        os.path.expanduser("~/.auto_clicker_diagnostics"))
+            os.makedirs(d, exist_ok=True)
+            if IS_WINDOWS:
+                os.startfile(d)
+            elif IS_LINUX:
+                import subprocess
+                subprocess.Popen(['xdg-open', d])
+            else:
+                messagebox.showinfo("诊断目录", d)
+        except Exception as e:
+            self.log_message("打开诊断目录失败: " + str(e))
 
     def open_log_dir(self):
         """CX-10：打开日志目录"""
@@ -2092,10 +2454,21 @@ class AutoClicker:
                              % (self.input_session, self.input_ok))
         except Exception:
             pass
+        fix = ""
+        try:
+            report = self.refresh_diagnostics()
+            for item in (report or {}).get('checks', []):
+                if item.get('id') == 'input' and item.get('fix'):
+                    fix = item['fix']
+                    break
+        except Exception:
+            pass
         messagebox.showwarning(
             "当前会话不支持模拟输入",
             "会话类型：%s\n\n%s\n\n启动按钮、启动热键与测试点击均已禁用。"
-            % (self.input_session, self.input_reason))
+            "%s\n\n设置页 → 诊断中心可复制脱敏诊断包。"
+            % (self.input_session, self.input_reason,
+               ("\n\n修复建议：\n" + fix) if fix else ""))
 
     # ==================== 8.3 错误提示分级组件 ====================
     def clear_field_error(self):
@@ -2907,6 +3280,38 @@ class AutoClicker:
                   font=('微软雅黑', 8), foreground=self._color('muted')).pack(
                       anchor=tk.W, pady=(6, 0))
 
+        # ==================== 设置：诊断中心（FR-03） ====================
+        diag_card = ttk.LabelFrame(self.settings_page, text="诊断中心", padding="15")
+        diag_card.pack(fill=tk.X, pady=(0, 14))
+        self.diag_card = diag_card
+        self.diag_status_var = tk.StringVar(value="尚未检查")
+        self.diag_status_label = ttk.Label(
+            diag_card, textvariable=self.diag_status_var,
+            font=('微软雅黑', 10, 'bold'), foreground=self._color('muted'))
+        self.diag_status_label.pack(anchor=tk.W)
+        self.diag_issue_var = tk.StringVar(
+            value="检查输入后端、热键、自启、权限、打包资源、崩溃记录、会话与 DPI。")
+        self.diag_issue_label = ttk.Label(
+            diag_card, textvariable=self.diag_issue_var,
+            font=('微软雅黑', 9), wraplength=620, justify=tk.LEFT)
+        self.diag_issue_label.pack(anchor=tk.W, fill=tk.X, pady=(6, 8))
+        diag_btns = ttk.Frame(diag_card)
+        diag_btns.pack(fill=tk.X)
+        ttk.Button(diag_btns, text="刷新诊断", width=9,
+                   command=self.refresh_diagnostics).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(diag_btns, text="查看详情", width=9,
+                   command=self.show_diagnostics_window).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(diag_btns, text="一键复制诊断包", width=15,
+                   command=self.copy_diagnostic_package).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(diag_btns, text="打开诊断目录", width=12,
+                   command=self.open_diagnostics_dir).pack(side=tk.LEFT)
+        ttk.Label(
+            diag_card,
+            text="诊断包仅含白名单环境字段、脱敏日志尾部与安全配置摘要；"
+                 "不含点击坐标、窗口标题、完整配置或完整日志。",
+            font=('微软雅黑', 8), foreground=self._color('muted')).pack(
+                anchor=tk.W, pady=(8, 0))
+
         # ==================== 设置：关于（FR-04） ====================
         about_card = ttk.LabelFrame(self.settings_page, text="关于", padding="15")
         about_card.pack(fill=tk.X, pady=(0, 14))
@@ -2974,8 +3379,16 @@ class AutoClicker:
         只能在主线程访问，否则会抛「main thread is not in main loop」，
         表现为物理 F6/F8/Esc 按了没反应。这里统一投递到主线程队列。
         """
+        start_k = str(self.config.get('hotkey_start', 'f6'))
+        emer_k = str(self.config.get('hotkey_emergency', 'f8'))
         kb = _get_keyboard()
         if not kb:
+            self._hotkey_state = {
+                'available': False, 'registered': False, 'keys': [],
+                'start': start_k, 'emergency': emer_k,
+                'error': 'keyboard 模块不可用',
+            }
+            print("注册快捷键失败: keyboard 模块不可用")
             return
         if not hasattr(self, '_hotkey_queue'):
             self._hotkey_queue = queue.Queue()
@@ -2987,14 +3400,30 @@ class AutoClicker:
                 pass
         self._hk_keys = []
         try:
-            start_k = self.config.get('hotkey_start', 'f6')
-            emer_k = self.config.get('hotkey_emergency', 'f8')
             kb.add_hotkey(start_k, lambda: self._hotkey_queue.put('toggle'))
+            self._hk_keys.append(start_k)
             kb.add_hotkey(emer_k, lambda: self._hotkey_queue.put('emergency'))
+            self._hk_keys.append(emer_k)
             kb.add_hotkey('esc', lambda: self._hotkey_queue.put('emergency'))
-            self._hk_keys = [start_k, emer_k, 'esc']
+            self._hk_keys.append('esc')
+            self._hotkey_state = {
+                'available': True, 'registered': True,
+                'keys': [start_k, emer_k, 'esc'],
+                'start': start_k, 'emergency': emer_k, 'error': '',
+            }
             print("快捷键已注册：启动=" + start_k + "，紧急停止=" + emer_k + "，Esc")
         except Exception as e:
+            # 部分注册成功时必须回收，避免半注册状态让 F6 或 F8 失效
+            for k in list(self._hk_keys):
+                try:
+                    kb.remove_hotkey(k)
+                except Exception:
+                    pass
+            self._hk_keys = []
+            self._hotkey_state = {
+                'available': True, 'registered': False, 'keys': [],
+                'start': start_k, 'emergency': emer_k, 'error': str(e),
+            }
             print("注册快捷键失败: " + str(e))
 
     def _poll_hotkey_queue(self):

@@ -1,6 +1,7 @@
 param(
     [string]$ExePath = (Join-Path $PSScriptRoot '..\release\dist\AutoClicker\AutoClicker.exe'),
-    [int]$StartupTimeoutSeconds = 180
+    [int]$StartupTimeoutSeconds = 180,
+    [int]$ExitTimeoutSeconds = 30
 )
 
 $ErrorActionPreference = 'Stop'
@@ -92,13 +93,13 @@ Write-Host ("启动耗时: {0:F2}s" -f $startupWatch.Elapsed.TotalSeconds)
 
 # 发送 WM_CLOSE；close_to_tray=false 时应走 exit_application 完全退出
 & taskkill /PID $gui.Id 2>&1 | Out-Host
-$exitDeadline = (Get-Date).AddSeconds(15)
+$exitDeadline = (Get-Date).AddSeconds($ExitTimeoutSeconds)
 while ((Get-Date) -lt $exitDeadline) {
     Start-Sleep -Milliseconds 500
     if (-not (Get-Process -Id $gui.Id -ErrorAction SilentlyContinue)) { break }
 }
 if (Get-Process -Id $gui.Id -ErrorAction SilentlyContinue) {
-    Write-Error "进程在 15s 内未退出（PID $($gui.Id)）。"
+    Write-Error "进程在 ${ExitTimeoutSeconds}s 内未退出（PID $($gui.Id)）。"
 }
 
 Start-Sleep -Seconds 3
