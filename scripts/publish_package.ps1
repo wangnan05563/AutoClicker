@@ -398,6 +398,7 @@ try {
     $publishPaths = @(
         ".gitignore",
         "auto_clicker_py3.py",
+        "package.json",
         "README.md",
         "LICENSE",
         "requirements.txt",
