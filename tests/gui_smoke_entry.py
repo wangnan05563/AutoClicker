@@ -37,4 +37,31 @@ for page in ('run', 'rules', 'records', 'settings'):
     assert app._active_page == page, page
     assert elapsed < 0.1, 'page switch too slow: %s %.3fs' % (page, elapsed)
 print("GUI_SMOKE_OK")
+
+# FR-25：Simple 隐藏高级卡片/记录页入口，Advanced 恢复且不重置参数
+assert app.config.get('ui_mode') == 'simple', app.config.get('ui_mode')
+assert app.p1_card.winfo_manager() == ''
+assert app.nav_buttons['records'].winfo_manager() == ''
+assert app.failsafe_check.winfo_manager() == ''
+assert app.close_tray_check.winfo_manager() == ''
+app.config['interval_seconds'] = 7
+app.ui_mode_var.set('advanced')
+app.on_ui_mode_change()
+root.update_idletasks()
+assert app.p1_card.winfo_manager() == 'pack'
+assert app.p1b_card.winfo_manager() == 'pack'
+assert app.nav_buttons['records'].winfo_manager() == 'pack'
+assert app.failsafe_check.winfo_manager() == 'pack'
+assert app.close_tray_check.winfo_manager() == 'pack'
+assert app.config['interval_seconds'] == 7
+app.ui_mode_var.set('simple')
+app.on_ui_mode_change()
+root.update_idletasks()
+assert app.p1_card.winfo_manager() == ''
+assert app.nav_buttons['records'].winfo_manager() == ''
+assert app.failsafe_check.winfo_manager() == ''
+assert app.close_tray_check.winfo_manager() == ''
+assert app.config['interval_seconds'] == 7
+print("GUI_MODE_OK")
+
 app.exit_application()

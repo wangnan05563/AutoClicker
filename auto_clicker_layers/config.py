@@ -30,6 +30,7 @@ DEFAULT_CONFIG = {
     'multi_points': [],
     'theme_mode': 'light',
     'theme_pack': 'system',
+    'ui_mode': 'simple',
     'schedule': {'enabled': False, 'start_at': '09:00',
                  'stop_after_min': 0, 'weekdays': [1, 2, 3, 4, 5]},
     'config_version': 2,
@@ -57,9 +58,16 @@ def normalize_config(config):
     if not isinstance(config, dict):
         config = {}
     had_theme_pack = 'theme_pack' in config
+    had_ui_mode = 'ui_mode' in config
+    was_empty = not config
     for key, value in DEFAULT_CONFIG.items():
         if key not in config:
             config[key] = json.loads(json.dumps(value))
+    if not had_ui_mode and not was_empty:
+        # 老用户默认保留全部能力；新装/空配置走 Simple。
+        config['ui_mode'] = 'advanced'
+    if config.get('ui_mode') not in ('simple', 'advanced'):
+        config['ui_mode'] = 'simple'
     if not had_theme_pack and config.get('theme_mode') in ('light', 'dark', 'system'):
         config['theme_pack'] = config['theme_mode']
     try:

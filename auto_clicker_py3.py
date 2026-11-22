@@ -362,7 +362,7 @@ class AutoClicker:
         self.root.after(1000, self._schedule_tick)
         # 磁盘日志延后到窗口可见后：logging.handlers 会拉入 shutil/socket/pickle，
         # 冷启动不必为首屏承担该导入成本；此前日志先入 _pending_logs，初始化后补写。
-        self.root.after(250, self.setup_logging)
+        self.root.after(1200, self.setup_logging)
         # 补记 DPI 诊断（此时日志/UI 设施已就绪）
         self.log_message("DPI 适配：系统缩放 %.2f，UI 字体基准 %dpt（不做二次放大）" % (
             getattr(self, '_dpi_scale', 1.0), getattr(self, 'ui_font_size', 9)))
@@ -377,13 +377,16 @@ class AutoClicker:
         # 热键/托盘初始化延迟到主窗口首次显示后：keyboard 全局钩子导入约 1.3 秒，
         # 不应阻塞 NFR-05 的启动时间；窗口先可见，再在空闲回调里注册。
         self._hotkey_queue = queue.Queue()
-        self.root.after(300, self.setup_hotkeys)
-        self.root.after(300, self._poll_hotkey_queue)
-        self.root.after(450, self.setup_tray_icon)
+        self.root.after(2000, self.setup_hotkeys)
+        self.root.after(2000, self._poll_hotkey_queue)
+        self.root.after(3000, self.setup_tray_icon)
         # 图标绘制约 0.5 秒（PIL 3 个图标）：窗口先可见，再在空闲回调补图标
-        self.root.after(250, self._load_action_icons)
+        self.root.after(1500, self._load_action_icons)
+        # 先完成首屏布局与映射，再让日志/图标/热键/托盘等冷启动重活进入事件队列，
+        # 避免窗口在“未响应”状态下被阻塞十几秒（007 启动回退实测）。
+        self.root.update_idletasks()
         if self.theme_mode == 'system':
-            self._poll_system_theme()
+            self.root.after(5000, self._poll_system_theme)
         
         # 6.9.1 引导与预设配置：首次运行写入推荐安全预设并弹出引导
         if self.first_run:
@@ -931,6 +934,60 @@ class AutoClicker:
                 )
         except Exception:
             pass
+
+    def on_ui_mode_change(self):
+        """FR-25：切换简单/高级模式，立即持久化，不触碰任何参数。"""
+        mode = self.ui_mode_var.get()
+        if mode not in ('simple', 'advanced'):
+            mode = 'simple'
+        self.config['ui_mode'] = mode
+        self._apply_ui_mode()
+        try:
+            self.save_config()
+        except Exception as e:
+            print(MSG_SAVE_CONFIG_FAILED + str(e))
+        try:
+            self.log_message("界面模式：%s" % ("高级" if mode == 'advanced' else "简单"))
+        except Exception:
+            pass
+
+    def _apply_ui_mode(self):
+        """Simple 只露出新手必需项；Advanced 恢复全部控件。"""
+        mode = self.config.get('ui_mode', 'simple')
+        advanced = mode == 'advanced'
+        try:
+            self.ui_mode_var.set(mode)
+            if advanced:
+                self.p1_card.pack(fill=tk.X, pady=(0, 15), after=self.safety_card)
+                self.p1b_card.pack(fill=tk.X, pady=(0, 15), after=self.p1_card)
+                self.target_container.pack(fill=tk.X, pady=(0, 8),
+                                           after=self.countdown_container)
+                self.motion_frame.pack(fill=tk.X, after=self.prevent_sleep_check)
+                self.failsafe_check.pack(anchor=tk.W, after=self.duration_container)
+                self.close_tray_check.pack(anchor=tk.W, pady=(4, 0),
+                                           after=self.failsafe_check)
+            else:
+                self.p1_card.pack_forget()
+                self.p1b_card.pack_forget()
+                self.target_container.pack_forget()
+                self.motion_frame.pack_forget()
+                self.failsafe_check.pack_forget()
+                self.close_tray_check.pack_forget()
+            records_btn = getattr(self, 'nav_buttons', {}).get('records')
+            settings_btn = getattr(self, 'nav_buttons', {}).get('settings')
+            if records_btn is not None:
+                if advanced:
+                    if settings_btn is not None:
+                        records_btn.pack(fill=tk.X, pady=2, before=settings_btn)
+                    else:
+                        records_btn.pack(fill=tk.X, pady=2)
+                else:
+                    records_btn.pack_forget()
+                    if getattr(self, '_active_page', 'run') == 'records':
+                        self._show_page('run')
+            self._refresh_nav_styles()
+        except Exception as e:
+            print("应用界面模式失败: %s" % e)
 
     def _run_summary_text(self):
         """运行台配置摘要（只读，避免与规则页控件状态不同步）。"""
@@ -1733,6 +1790,17 @@ class AutoClicker:
             font=('微软雅黑', 8), foreground=self._color('muted'))
         self.title_version_label.pack(side=tk.LEFT, padx=(10, 0))
 
+        # FR-25：简单 / 高级双模式，记住选择，切换不重置参数
+        mode_frame = ttk.Frame(title_container)
+        mode_frame.pack(side=tk.LEFT, padx=(14, 0))
+        ttk.Label(mode_frame, text="模式", font=('微软雅黑', 8),
+                  foreground=self._color('muted')).pack(side=tk.LEFT, padx=(0, 3))
+        self.ui_mode_var = tk.StringVar(value=self.config.get('ui_mode', 'simple'))
+        for text, value in (("简单", "simple"), ("高级", "advanced")):
+            ttk.Radiobutton(mode_frame, text=text, value=value,
+                            variable=self.ui_mode_var,
+                            command=self.on_ui_mode_change).pack(side=tk.LEFT, padx=2)
+
         self.status_indicator = tk.Canvas(title_container, width=12, height=12,
                                          highlightthickness=0, bg='white')
         self.status_indicator.pack(side=tk.RIGHT, padx=5)
@@ -1876,8 +1944,9 @@ class AutoClicker:
         config_container.pack(fill=tk.X, pady=(0, 15))
         
         # 左列 - 基本配置
-        left_card = ttk.LabelFrame(config_container, text="目标", padding="15")
-        left_card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+        self.left_card = ttk.LabelFrame(config_container, text="目标", padding="15")
+        self.left_card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+        left_card = self.left_card
         
         # 点击间隔配置
         interval_container = ttk.Frame(left_card)
@@ -1962,8 +2031,9 @@ class AutoClicker:
         self.field_error_label.pack(fill=tk.X, pady=(4, 0))
         
         # 右列 - 高级选项和状态
-        right_card = ttk.LabelFrame(config_container, text="状态监控", padding="15")
-        right_card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.right_card = ttk.LabelFrame(config_container, text="状态监控", padding="15")
+        self.right_card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        right_card = self.right_card
         
         # 状态信息
         status_info_frame = ttk.Frame(right_card)
@@ -1992,30 +2062,32 @@ class AutoClicker:
         self.click_count = 0
         
         # 高级选项
-        options_frame = ttk.LabelFrame(right_card, text="高级选项", padding="10")
+        options_frame = ttk.LabelFrame(right_card, text="选项", padding="10")
         options_frame.pack(fill=tk.X, pady=(10, 0))
         
         self.prevent_sleep_var = tk.BooleanVar(value=self.config['prevent_sleep'])
-        prevent_sleep_check = ttk.Checkbutton(options_frame, text="防止系统锁屏",
+        self.prevent_sleep_check = ttk.Checkbutton(options_frame, text="防止系统锁屏",
                                              variable=self.prevent_sleep_var,
                                              command=self.on_prevent_sleep_changed)
-        prevent_sleep_check.pack(anchor=tk.W, pady=3)
+        self.prevent_sleep_check.pack(anchor=tk.W, pady=3)
 
-        # 鼠标跟随设置
+        # 鼠标跟随设置（高级模式可见）
+        self.motion_frame = ttk.Frame(options_frame)
+        self.motion_frame.pack(fill=tk.X)
         self.mouse_follow_var = tk.BooleanVar(value=self.config['mouse_follow_enabled'])
-        mouse_follow_check = ttk.Checkbutton(options_frame, text="鼠标跟随移动",
+        mouse_follow_check = ttk.Checkbutton(self.motion_frame, text="鼠标跟随移动",
                                              variable=self.mouse_follow_var,
                                              command=self.on_mouse_follow_changed)
         mouse_follow_check.pack(anchor=tk.W, pady=3)
         
         self.mouse_move_only_var = tk.BooleanVar(value=self.config['mouse_move_only'])
-        mouse_move_only_check = ttk.Checkbutton(options_frame, text="   只移动不点击",
+        mouse_move_only_check = ttk.Checkbutton(self.motion_frame, text="   只移动不点击",
                                                 variable=self.mouse_move_only_var,
                                                 command=self.on_mouse_move_only_changed)
         mouse_move_only_check.pack(anchor=tk.W, pady=3)
         
         # 鼠标移动速度调节
-        speed_container = ttk.Frame(options_frame)
+        speed_container = ttk.Frame(self.motion_frame)
         speed_container.pack(fill=tk.X, pady=(5, 0))
         
         ttk.Label(speed_container, text="移动速度:", 
@@ -2034,12 +2106,14 @@ class AutoClicker:
         self.mouse_speed_label.pack(side=tk.LEFT)
         
         # ==================== 安全与终点控制（P0 止血） ====================
-        safety_card = ttk.LabelFrame(self.rules_page, text="安全", padding="15")
-        safety_card.pack(fill=tk.X, pady=(0, 15))
+        self.safety_card = ttk.LabelFrame(self.rules_page, text="安全", padding="15")
+        self.safety_card.pack(fill=tk.X, pady=(0, 15))
+        safety_card = self.safety_card
 
         # 启动倒计时（CX-04）
-        countdown_container = ttk.Frame(safety_card)
-        countdown_container.pack(fill=tk.X, pady=(0, 8))
+        self.countdown_container = ttk.Frame(safety_card)
+        self.countdown_container.pack(fill=tk.X, pady=(0, 8))
+        countdown_container = self.countdown_container
         ttk.Label(countdown_container, text="启动倒计时(秒, 0-5)",
                  font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
         self.countdown_var = tk.StringVar(value=str(self.config.get('startup_countdown', 3)))
@@ -2047,8 +2121,9 @@ class AutoClicker:
                  font=('微软雅黑', 11), width=8, justify='center').pack(side=tk.LEFT, padx=(5, 0))
 
         # FR-E03：前台目标窗口校验（标题/进程名关键字，留空不校验）
-        target_container = ttk.Frame(safety_card)
-        target_container.pack(fill=tk.X, pady=(0, 8))
+        self.target_container = ttk.Frame(safety_card)
+        self.target_container.pack(fill=tk.X, pady=(0, 8))
+        target_container = self.target_container
         ttk.Label(target_container, text="目标窗口关键字(留空=不校验)",
                  font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
         self.target_window_var = tk.StringVar(value=str(self.config.get('target_window_keyword', '')))
@@ -2056,8 +2131,9 @@ class AutoClicker:
                  font=('微软雅黑', 11), width=24).pack(side=tk.LEFT, padx=(5, 0))
 
         # 点击次数上限（CX-02）
-        limit_container = ttk.Frame(safety_card)
-        limit_container.pack(fill=tk.X, pady=(0, 8))
+        self.limit_container = ttk.Frame(safety_card)
+        self.limit_container.pack(fill=tk.X, pady=(0, 8))
+        limit_container = self.limit_container
         ttk.Label(limit_container, text="点击次数上限(0=无限)",
                  font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
         self.click_limit_var = tk.StringVar(value=str(self.config.get('click_limit', 0)))
@@ -2065,8 +2141,9 @@ class AutoClicker:
                  font=('微软雅黑', 11), width=8, justify='center').pack(side=tk.LEFT, padx=(5, 0))
 
         # 运行时长上限（CX-02）
-        duration_container = ttk.Frame(safety_card)
-        duration_container.pack(fill=tk.X, pady=(0, 8))
+        self.duration_container = ttk.Frame(safety_card)
+        self.duration_container.pack(fill=tk.X, pady=(0, 8))
+        duration_container = self.duration_container
         ttk.Label(duration_container, text="运行时长上限(分钟, 0=无限)",
                  font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
         self.duration_limit_var = tk.StringVar(value=str(self.config.get('duration_limit', 0)))
@@ -2075,18 +2152,23 @@ class AutoClicker:
 
         # 鼠标位移 failsafe（CX-01）
         self.failsafe_var = tk.BooleanVar(value=self.config.get('failsafe_enabled', False))
-        ttk.Checkbutton(safety_card, text="鼠标移动即停 (failsafe，移动>20px自动急停)",
-                       variable=self.failsafe_var).pack(anchor=tk.W)
+        self.failsafe_check = ttk.Checkbutton(
+            safety_card, text="鼠标移动即停 (failsafe，移动>20px自动急停)",
+            variable=self.failsafe_var)
+        self.failsafe_check.pack(anchor=tk.W)
 
         # 关闭行为（CX-06）
         self.close_to_tray_var = tk.BooleanVar(value=self.config.get('close_to_tray', True))
-        ttk.Checkbutton(safety_card, text="关闭窗口时最小化到托盘（否则直接退出）",
-                       variable=self.close_to_tray_var,
-                       command=self.on_close_behavior_changed).pack(anchor=tk.W, pady=(4, 0))
+        self.close_tray_check = ttk.Checkbutton(
+            safety_card, text="关闭窗口时最小化到托盘（否则直接退出）",
+            variable=self.close_to_tray_var,
+            command=self.on_close_behavior_changed)
+        self.close_tray_check.pack(anchor=tk.W, pady=(4, 0))
 
         # ==================== P1 功能扩展：点击 / 节奏 / 多点位 ====================
-        p1_card = ttk.LabelFrame(self.rules_page, text="节奏与点击 (P1)", padding="15")
-        p1_card.pack(fill=tk.X, pady=(0, 15))
+        self.p1_card = ttk.LabelFrame(self.rules_page, text="节奏与点击 (高级)", padding="15")
+        self.p1_card.pack(fill=tk.X, pady=(0, 15))
+        p1_card = self.p1_card
 
         row1 = ttk.Frame(p1_card)
         row1.pack(fill=tk.X, pady=(0, 6))
@@ -2133,8 +2215,9 @@ class AutoClicker:
         ttk.Entry(mp_entry, textvariable=self.mp_y_var, width=8).pack(side=tk.LEFT)
 
         # ==================== P1 功能扩展：热键 / 配置方案 / 系统 ====================
-        p1b_card = ttk.LabelFrame(self.rules_page, text="高级 (P1)", padding="15")
-        p1b_card.pack(fill=tk.X, pady=(0, 15))
+        self.p1b_card = ttk.LabelFrame(self.rules_page, text="高级", padding="15")
+        self.p1b_card.pack(fill=tk.X, pady=(0, 15))
+        p1b_card = self.p1b_card
 
         hk_row = ttk.Frame(p1b_card)
         hk_row.pack(fill=tk.X, pady=(0, 6))
@@ -2190,8 +2273,9 @@ class AutoClicker:
         ttk.Button(sys_row, text="导出运行统计", command=self.export_run_stats).pack(side=tk.LEFT, padx=(10, 0))
 
         # ==================== 日志区域 ====================
-        log_card = ttk.LabelFrame(self.records_page, text="运行日志", padding="10")
-        log_card.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        self.log_card = ttk.LabelFrame(self.records_page, text="运行日志", padding="10")
+        self.log_card.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        log_card = self.log_card
 
         # 日志工具栏（UI-04：过滤 / 复制 / 清空；UI-01：可折叠）
         log_toolbar = ttk.Frame(log_card)
@@ -2280,6 +2364,7 @@ class AutoClicker:
 
         # 更新状态标签引用
         self.status_label = self.status_text_label
+        self._apply_ui_mode()
         self._show_page('run')
         
     def on_mode_change(self, event):

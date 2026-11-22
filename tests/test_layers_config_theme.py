@@ -51,6 +51,20 @@ class ConfigLayerTests(unittest.TestCase):
         self.assertEqual(cfg.config_version({'config_version': 'x'}), 0)
         self.assertEqual(cfg.config_version(None), 0)
 
+    def test_ui_mode_defaults_to_simple_for_new_config(self):
+        self.assertEqual(cfg.normalize_config(None)['ui_mode'], 'simple')
+        self.assertEqual(cfg.normalize_config({})['ui_mode'], 'simple')
+
+    def test_legacy_config_keeps_advanced_ui_mode(self):
+        legacy = cfg.normalize_config({'interval_seconds': 3})
+        self.assertEqual(legacy['ui_mode'], 'advanced')
+
+    def test_explicit_ui_mode_wins_and_invalid_falls_back(self):
+        self.assertEqual(cfg.normalize_config({'ui_mode': 'simple',
+                                              'interval_seconds': 1})['ui_mode'], 'simple')
+        self.assertEqual(cfg.normalize_config({'ui_mode': 'advanced'})['ui_mode'], 'advanced')
+        self.assertEqual(cfg.normalize_config({'ui_mode': 'weird'})['ui_mode'], 'simple')
+
     def test_read_write_roundtrip(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, 'config.json')
