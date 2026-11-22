@@ -269,6 +269,7 @@ class ConfigTests(unittest.TestCase):
         self.obj.load_config()
         self.assertEqual(self.obj.config['interval_seconds'], 10)
         self.assertEqual(self.obj.config['config_version'], 2)
+        self.assertTrue(self.obj.config['start_confirm_enabled'])
         self.assertIsInstance(self.obj.config['profiles'], dict)
 
     def test_partial_config_is_merged_with_defaults(self):
@@ -306,6 +307,31 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(os.path.isabs(AutoClicker._autostart_executable()))
 
 
+class StartConfirmationTests(unittest.TestCase):
+    def test_confirmation_calls_dialog(self):
+        obj = make_clicker()
+        obj.show_start_confirmation = mock.Mock(return_value=False)
+        obj.log_message = mock.Mock()
+        self.assertFalse(obj._confirm_start({'start_confirm_enabled': True}, 'manual'))
+        obj.show_start_confirmation.assert_called_once()
+        self.assertEqual(len(obj.show_start_confirmation.call_args.args[0]), 4)
+
+    def test_disabled_skips_dialog(self):
+        obj = make_clicker()
+        obj.show_start_confirmation = mock.Mock(return_value=False)
+        obj.log_message = mock.Mock()
+        self.assertTrue(obj._confirm_start({'start_confirm_enabled': False}, 'manual'))
+        obj.show_start_confirmation.assert_not_called()
+
+    def test_schedule_skips_dialog(self):
+        obj = make_clicker()
+        obj.show_start_confirmation = mock.Mock(return_value=False)
+        obj.log_message = mock.Mock()
+        self.assertTrue(obj._confirm_start({'start_confirm_enabled': True}, 'schedule'))
+        obj.show_start_confirmation.assert_not_called()
+        obj.log_message.assert_called_once()
+
+
 class ClickLoopTests(unittest.TestCase):
     def _base_obj(self):
         obj = make_clicker()
@@ -324,6 +350,7 @@ class ClickLoopTests(unittest.TestCase):
         obj.click_count = 0
         obj.success_count = 0
         obj.fail_count = 0
+        obj.exception_count = 0
         obj.click_button = 'left'
         obj.hold_ms = 10
         obj.start_time = time.time()
@@ -351,6 +378,46 @@ class ClickLoopTests(unittest.TestCase):
         self.assertFalse(obj.is_running)
         obj.stop_clicking.assert_called_once()
         self.assertIn('failsafe', obj.stop_clicking.call_args.kwargs['reason'])
+
+
+class ClickCountTests(unittest.TestCase):
+    def _obj(self):
+        obj = make_clicker()
+        obj.click_count = 0
+        obj.success_count = 0
+        obj.fail_count = 0
+        obj.exception_count = 0
+        obj.mouse_move_only_cache = False
+        obj.click_button = 'left'
+        obj.hold_ms = 10
+        obj.click_count_label = FakeLabel()
+        obj._ui = mock.Mock()
+        obj._set_sb_counts = mock.Mock()
+        obj.log_message = mock.Mock()
+        return obj
+
+    def test_success_increments_success_only(self):
+        obj = self._obj()
+        with mock.patch.object(app_module, 'click_mouse', return_value=True):
+            ok = obj._click_once_at(10, 20)
+        self.assertTrue(ok)
+        self.assertEqual((obj.click_count, obj.success_count, obj.fail_count), (1, 1, 0))
+
+    def test_backend_failure_increments_fail_only(self):
+        obj = self._obj()
+        with mock.patch.object(app_module, 'click_mouse', return_value=False), \
+                mock.patch.object(app_module, '_pyautogui_click', return_value=False):
+            ok = obj._click_once_at(10, 20)
+        self.assertFalse(ok)
+        self.assertEqual((obj.click_count, obj.success_count, obj.fail_count), (1, 0, 1))
+
+    def test_fallback_success_counts(self):
+        obj = self._obj()
+        with mock.patch.object(app_module, 'click_mouse', return_value=False), \
+                mock.patch.object(app_module, '_pyautogui_click', return_value=True):
+            ok = obj._click_once_at(10, 20)
+        self.assertTrue(ok)
+        self.assertEqual((obj.click_count, obj.success_count, obj.fail_count), (1, 1, 0))
 
 
 class KeepaliveTests(unittest.TestCase):

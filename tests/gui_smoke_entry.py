@@ -98,4 +98,46 @@ assert app.config['click_limit'] == 1
 assert app.config['onboarding_done'] is True
 print("GUI_WIZARD_SKIP_KEEPS_CONFIG_OK")
 
+# FR-02：启动确认框可取消/继续，勾选“不再提示”会关闭后续确认
+app.config['start_confirm_enabled'] = True
+app.confirm_start_var.set(True)
+
+def _accept_start_confirm():
+    assert app._start_confirm_window is not None
+    app._start_confirm_remember_var.set(True)
+    app._finish_start_confirmation(True)
+
+root.after(80, _accept_start_confirm)
+assert app.show_start_confirmation(['间隔：10 秒', '目标：点 (1, 2)'])
+assert app.config['start_confirm_enabled'] is False
+assert app._start_confirm_window is None
+assert app.confirm_start_var.get() is False
+print("GUI_START_CONFIRM_OK")
+
+# FR-02：取消不启动，且不因取消而关闭后续确认
+app.config['start_confirm_enabled'] = True
+app.confirm_start_var.set(True)
+
+def _cancel_start_confirm():
+    app._finish_start_confirmation(False)
+
+root.after(80, _cancel_start_confirm)
+assert app.show_start_confirmation(['间隔：10 秒']) is False
+assert app.config['start_confirm_enabled'] is True
+print("GUI_START_CONFIRM_CANCEL_OK")
+
+# FR-02：结束摘要能打开，包含点击/成功/失败/异常并支持关闭
+app.last_run_stats = {
+    'timestamp': '2026-11-22T19:10:00', 'click_count': 3, 'success_count': 2,
+    'fail_count': 1, 'exception_count': 1, 'runtime_seconds': 65.4,
+    'interval_seconds': 10, 'mode': 'center', 'button': 'left',
+    'stop_reason': '达到点击次数上限 (3 次)',
+}
+app.show_end_summary(app.last_run_stats)
+root.update_idletasks()
+assert app._end_summary_window is not None
+app._close_end_summary()
+assert app._end_summary_window is None
+print("GUI_END_SUMMARY_OK")
+
 app.exit_application()

@@ -20,7 +20,7 @@ class ScheduleTests(unittest.TestCase):
         self.app._schedule_active_occurrence = None
         self.app.logs = []
         self.app.log_message = lambda text: self.app.logs.append(str(text))
-        self.app.start_clicking = lambda: setattr(self.app, 'is_running', True)
+        self.app.start_clicking = lambda source='manual': setattr(self.app, 'is_running', True)
         self.app.stop_clicking = lambda reason='': setattr(self.app, 'is_running', False)
 
     def test_workday_start_and_stop(self):

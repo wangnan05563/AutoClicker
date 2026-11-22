@@ -56,6 +56,7 @@ from auto_clicker_layers.config import (
     write_config as _config_write,
 )
 from auto_clicker_layers import onboarding as _onboarding
+from auto_clicker_layers import run_report as _run_report
 
 # 点击抖动使用系统安全随机源，避免可预测的伪随机序列
 _RANDOM = random.SystemRandom()
@@ -76,6 +77,7 @@ from auto_clicker_layers.platform_io import (
     _ydotool_move,
     _ydotool_click,
     _get_pyautogui,
+    _pyautogui_click,
     windows_move_mouse,
     windows_click,
     linux_move_mouse,
@@ -337,6 +339,11 @@ class AutoClicker:
         # P2 状态可视化默认值（UI-03）
         self.success_count = 0
         self.fail_count = 0
+        self.exception_count = 0
+        self._pending_end_summary = False
+        self._suppress_end_summary = False
+        self._start_confirm_window = None
+        self._end_summary_window = None
         self._runtime_after_id = None
         self._log_buffer = []  # [(text, level)] 全量日志缓冲（UI-04 过滤用）
         self._pending_logs = []  # 磁盘日志尚未初始化时的待落盘消息
@@ -350,8 +357,9 @@ class AutoClicker:
         # REQ-004 运行统计：最近一次会话快照（供导出）
         self.last_run_stats = {
             'timestamp': '', 'click_count': 0, 'success_count': 0,
-            'fail_count': 0, 'runtime_seconds': 0.0,
+            'fail_count': 0, 'exception_count': 0, 'runtime_seconds': 0.0,
             'interval_seconds': 0.0, 'mode': '', 'button': '',
+            'stop_reason': '',
         }
 
         self.load_config()
@@ -1164,7 +1172,7 @@ class AutoClicker:
             if (not running and now <= grace_end and key != self._schedule_last_occurrence):
                 self._schedule_last_occurrence = key
                 self._schedule_active_occurrence = key
-                self.start_clicking()
+                self.start_clicking(source='schedule')
                 if self.is_running:
                     self.log_message("定时计划触发：%s 启动" % occ.strftime('%m-%d %H:%M'))
                     result = 'started'
@@ -1359,6 +1367,16 @@ class AutoClicker:
     def on_autostart_changed(self):
         """CX-11：开机自启开关"""
         self.set_autostart(self.autostart_var.get())
+
+    def on_confirm_start_changed(self):
+        """FR-02：启动前确认开关，立即落盘供下次启动使用。"""
+        try:
+            enabled = bool(self.confirm_start_var.get())
+            self.config['start_confirm_enabled'] = enabled
+            self.save_config()
+            self.log_message("启动前确认已%s" % ("开启" if enabled else "关闭"))
+        except Exception as e:
+            self.log_message("保存启动前确认设置失败: " + str(e))
 
     @staticmethod
     def _autostart_executable():
@@ -1839,35 +1857,232 @@ class AutoClicker:
             pass
 
 
-    # ==================== REQ-004 运行统计与导出 ====================
-    def export_run_stats(self):
-        """将最近一次运行统计导出为 JSON / CSV（REQ-004）"""
+    # ==================== FR-02 启动确认 + 结束摘要 ====================
+    def _confirmation_snapshot(self, interval, countdown, click_limit,
+                               duration_limit, jitter, hold_ms):
+        """用当前控件值拼出确认快照，确保确认框与实际启动参数一致。"""
+        snapshot = dict(self.config or {})
+        snapshot.update({
+            'interval_seconds': interval,
+            'interval_unit': self.interval_unit_var.get(),
+            'click_mode': self.mode_var.get(),
+            'click_button': self.click_button_var.get(),
+            'hold_ms': hold_ms,
+            'jitter_pct': jitter,
+            'click_limit': click_limit,
+            'duration_limit': duration_limit,
+            'startup_countdown': countdown,
+            'prevent_sleep': self.prevent_sleep_var.get(),
+            'failsafe_enabled': self.failsafe_var.get(),
+            'mouse_move_only': self.mouse_move_only_var.get(),
+            'use_multi_points': self.use_multi_points_var.get(),
+            'multi_points': self.config.get('multi_points', []),
+            'target_window_keyword': self.target_window_var.get().strip(),
+            'hotkey_start': self.config.get('hotkey_start', 'f6'),
+            'hotkey_emergency': self.config.get('hotkey_emergency', 'f8'),
+            'start_confirm_enabled': self.config.get('start_confirm_enabled', True),
+        })
+        return snapshot
+
+    def _confirm_start(self, snapshot, source='manual'):
+        """按设置决定是否弹确认；定时任务跳过，避免无人值守卡在弹窗。"""
+        if not _run_report.should_confirm_start(snapshot, source):
+            if source == 'schedule':
+                self.log_message("定时任务启动：跳过启动前确认")
+            return True
+        confirmed = self.show_start_confirmation(_run_report.build_start_lines(snapshot))
+        if confirmed:
+            self.log_message("启动前确认已通过")
+        return confirmed
+
+    def show_start_confirmation(self, lines):
+        """展示启动参数确认框，返回用户是否继续；勾选可记住关闭后续确认。"""
         try:
-            from tkinter import filedialog
-            stats = getattr(self, 'last_run_stats', None)
-            if not stats or stats.get('click_count', 0) == 0:
-                messagebox.showinfo("提示", "暂无可导出的运行统计（请先完成至少一次点击）")
-                return
-            path = filedialog.asksaveasfilename(
-                defaultextension=".json",
-                filetypes=[("JSON", JSON_FILE_PATTERN), ("CSV", "*.csv")],
-                title="导出运行统计")
+            pal = self._resolve_palette()
+        except Exception:
+            pal = _theme_resolve_palette('light')
+        win = tk.Toplevel(self.root)
+        self._start_confirm_window = win
+        self._start_confirm_result = False
+        win.title("启动前确认 · AutoClicker")
+        win.configure(bg=pal['bg'])
+        win.resizable(False, False)
+        if self.root.winfo_viewable():
+            win.transient(self.root)
+
+        tk.Label(win, text="即将开始自动点击", bg=pal['bg'], fg=pal['text'],
+                 font=('微软雅黑', 16, 'bold')).pack(anchor=tk.W, padx=22, pady=(18, 4))
+        tk.Label(win, text="请确认以下参数；取消不会启动。", bg=pal['bg'],
+                 fg=pal['muted'], font=('微软雅黑', 9)).pack(anchor=tk.W, padx=22)
+
+        card = tk.Frame(win, bg=pal['surface'], highlightthickness=1,
+                        highlightbackground=pal['border'], padx=14, pady=10)
+        card.pack(fill=tk.X, padx=22, pady=(12, 8))
+        for line in lines:
+            tk.Label(card, text=str(line), bg=pal['surface'], fg=pal['text'],
+                     font=('微软雅黑', 10), justify=tk.LEFT, anchor=tk.W,
+                     wraplength=470).pack(anchor=tk.W, pady=2)
+
+        self._start_confirm_remember_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(win, text="以后不再显示此确认（可在设置中重新开启）",
+                        variable=self._start_confirm_remember_var).pack(
+                            anchor=tk.W, padx=22, pady=(2, 4))
+
+        btns = ttk.Frame(win)
+        btns.pack(fill=tk.X, padx=22, pady=(8, 18))
+        ttk.Button(btns, text="取消",
+                   command=lambda: self._finish_start_confirmation(False)).pack(
+                       side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(btns, text="继续并启动",
+                   command=lambda: self._finish_start_confirmation(True)).pack(
+                       side=tk.RIGHT)
+
+        win.protocol("WM_DELETE_WINDOW",
+                     lambda: self._finish_start_confirmation(False))
+        win.bind('<Escape>', lambda _e: self._finish_start_confirmation(False))
+        win.bind('<Return>', lambda _e: self._finish_start_confirmation(True))
+        win.update_idletasks()
+        if self.root.winfo_viewable():
+            x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - win.winfo_width()) // 2)
+            y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - win.winfo_height()) // 2)
+            win.geometry("+%d+%d" % (x, y))
+            win.grab_set()
+        else:
+            win.geometry("+%d+%d" % (
+                max(0, (win.winfo_screenwidth() - win.winfo_width()) // 2),
+                max(0, (win.winfo_screenheight() - win.winfo_height()) // 3)))
+        win.lift()
+        win.focus_force()
+        self.root.wait_window(win)
+        return bool(self._start_confirm_result)
+
+    def _finish_start_confirmation(self, confirmed):
+        """关闭启动确认框；仅在“继续”时应用“不再提示”。"""
+        win = getattr(self, '_start_confirm_window', None)
+        if win is None:
+            return
+        try:
+            if confirmed and self._start_confirm_remember_var.get():
+                self.config['start_confirm_enabled'] = False
+                self.save_config()
+                try:
+                    self.confirm_start_var.set(False)
+                except Exception:
+                    pass
+                self.log_message("启动前确认已关闭（用户勾选不再提示）")
+            self._start_confirm_result = bool(confirmed)
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            win.destroy()
+        finally:
+            self._start_confirm_window = None
+
+    def show_end_summary(self, stats=None):
+        """停止后展示本次运行摘要，并提供 JSON/CSV 导出。"""
+        stats = stats or getattr(self, 'last_run_stats', None) or {}
+        try:
+            pal = self._resolve_palette()
+        except Exception:
+            pal = _theme_resolve_palette('light')
+        self._close_end_summary()
+        win = tk.Toplevel(self.root)
+        self._end_summary_window = win
+        win.title("运行结束 · 摘要")
+        win.configure(bg=pal['bg'])
+        win.resizable(False, False)
+        if self.root.winfo_viewable():
+            win.transient(self.root)
+
+        tk.Label(win, text="本次运行已停止", bg=pal['bg'], fg=pal['text'],
+                 font=('微软雅黑', 16, 'bold')).pack(anchor=tk.W, padx=22, pady=(18, 4))
+        tk.Label(win, text="统计来自运行快照，与日志中的运行摘要一致。",
+                 bg=pal['bg'], fg=pal['muted'],
+                 font=('微软雅黑', 9)).pack(anchor=tk.W, padx=22)
+        card = tk.Frame(win, bg=pal['surface'], highlightthickness=1,
+                        highlightbackground=pal['border'], padx=14, pady=10)
+        card.pack(fill=tk.X, padx=22, pady=(12, 6))
+        for line in _run_report.build_end_lines(stats):
+            tk.Label(card, text=str(line), bg=pal['surface'], fg=pal['text'],
+                     font=('微软雅黑', 10), justify=tk.LEFT, anchor=tk.W,
+                     wraplength=470).pack(anchor=tk.W, pady=2)
+
+        btns = ttk.Frame(win)
+        btns.pack(fill=tk.X, padx=22, pady=(8, 18))
+        ttk.Button(btns, text="导出 JSON",
+                   command=lambda: self._export_last_run_stats('json')).pack(
+                       side=tk.LEFT)
+        ttk.Button(btns, text="导出 CSV",
+                   command=lambda: self._export_last_run_stats('csv')).pack(
+                       side=tk.LEFT, padx=(8, 0))
+        ttk.Button(btns, text="关闭", command=self._close_end_summary).pack(
+            side=tk.RIGHT)
+        win.protocol("WM_DELETE_WINDOW", self._close_end_summary)
+        win.bind('<Escape>', lambda _e: self._close_end_summary())
+        win.update_idletasks()
+        if self.root.winfo_viewable():
+            x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - win.winfo_width()) // 2)
+            y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - win.winfo_height()) // 2)
+            win.geometry("+%d+%d" % (x, y))
+            win.grab_set()
+        else:
+            win.geometry("+%d+%d" % (
+                max(0, (win.winfo_screenwidth() - win.winfo_width()) // 2),
+                max(0, (win.winfo_screenheight() - win.winfo_height()) // 3)))
+        win.lift()
+        win.focus_force()
+
+    def _close_end_summary(self):
+        win = getattr(self, '_end_summary_window', None)
+        if win is None:
+            return
+        try:
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            win.destroy()
+        finally:
+            self._end_summary_window = None
+
+    def _export_last_run_stats(self, fmt=None):
+        """导出最近一次运行统计；fmt 为空时按文件扩展名判断。"""
+        from tkinter import filedialog
+        stats = getattr(self, 'last_run_stats', None)
+        if not stats or not stats.get('timestamp'):
+            messagebox.showinfo("提示", "暂无可导出的运行统计（请先完成一次运行）")
+            return
+        try:
+            stamp = str(stats.get('timestamp', '')).replace(':', '-').replace('T', '-')
+            if fmt in ('json', 'csv'):
+                types = [("JSON", "*.json")] if fmt == 'json' else [("CSV", "*.csv")]
+                path = filedialog.asksaveasfilename(
+                    defaultextension='.' + fmt, filetypes=types,
+                    initialfile='AutoClicker-run-%s.%s' % (stamp, fmt),
+                    title="导出运行统计")
+            else:
+                path = filedialog.asksaveasfilename(
+                    defaultextension=".json",
+                    filetypes=[("JSON", JSON_FILE_PATTERN), ("CSV", "*.csv")],
+                    initialfile='AutoClicker-run-%s.json' % stamp,
+                    title="导出运行统计")
             if not path:
                 return
-            if path.lower().endswith('.csv'):
-                import csv
-                with open(path, 'w', encoding='utf-8-sig', newline='') as f:
-                    w = csv.writer(f)
-                    w.writerow(["项目", "数值"])
-                    for k, v in stats.items():
-                        w.writerow([k, v])
-            else:
-                with open(path, 'w', encoding='utf-8') as f:
-                    json.dump(stats, f, ensure_ascii=False, indent=2)
-            self.log_message("运行统计已导出：" + path)
-            messagebox.showinfo("导出成功", "运行统计已导出：\n" + path)
+            out_fmt = fmt or ('csv' if path.lower().endswith('.csv') else 'json')
+            _run_report.write_stats(path, stats, out_fmt)
+            self.log_message("运行统计已导出(%s)：%s" % (out_fmt, path))
+            messagebox.showinfo(
+                "导出成功", "运行统计已导出：\n" + path,
+                parent=getattr(self, '_end_summary_window', None) or self.root)
         except Exception as e:
-            messagebox.showerror("错误", "导出失败: " + str(e))
+            messagebox.showerror(
+                "错误", "导出失败: " + str(e),
+                parent=getattr(self, '_end_summary_window', None) or self.root)
+
+    def export_run_stats(self):
+        """将最近一次运行统计导出为 JSON / CSV（REQ-004）"""
+        self._export_last_run_stats()
 
     # ==================== FR-L01 Wayland 降级指引 ====================
     def show_input_diag(self):
@@ -2050,6 +2265,8 @@ class AutoClicker:
             self.jitter_var.set(str(self.config.get('jitter_pct', 0)))
             self.use_multi_points_var.set(self.config.get('use_multi_points', False))
             self.autostart_var.set(self.config.get('autostart', False))
+            if getattr(self, 'confirm_start_var', None) is not None:
+                self.confirm_start_var.set(bool(self.config.get('start_confirm_enabled', True)))
             self.hotkey_start_var.set(self.config.get('hotkey_start', 'f6'))
             self.hotkey_emergency_var.set(self.config.get('hotkey_emergency', 'f8'))
             sched = self.config.get('schedule') or {}
@@ -2676,6 +2893,20 @@ class AutoClicker:
                   font=('微软雅黑', 8), foreground=self._color('muted')).pack(
                       anchor=tk.W, pady=(6, 0))
 
+        # ==================== 设置：启动安全（FR-02） ====================
+        safety_card = ttk.LabelFrame(self.settings_page, text="启动安全", padding="15")
+        safety_card.pack(fill=tk.X, pady=(0, 14))
+        self.confirm_start_var = tk.BooleanVar(
+            value=bool(self.config.get('start_confirm_enabled', True)))
+        ttk.Checkbutton(safety_card, text="启动前显示参数确认摘要",
+                        variable=self.confirm_start_var,
+                        command=self.on_confirm_start_changed).pack(anchor=tk.W)
+        ttk.Label(safety_card,
+                  text="确认框展示间隔、目标、停止条件与热键；取消不会启动。"
+                       "每次停止后展示运行摘要，可导出 JSON/CSV。",
+                  font=('微软雅黑', 8), foreground=self._color('muted')).pack(
+                      anchor=tk.W, pady=(6, 0))
+
         # ==================== 设置：关于（FR-04） ====================
         about_card = ttk.LabelFrame(self.settings_page, text="关于", padding="15")
         about_card.pack(fill=tk.X, pady=(0, 14))
@@ -3091,6 +3322,7 @@ class AutoClicker:
         self.start_time = time.time()
         self.success_count = 0
         self.fail_count = 0
+        self.exception_count = 0
         self._ui(self._set_sb_counts)
         countdown = self.startup_countdown
         if countdown > 0:
@@ -3218,17 +3450,23 @@ class AutoClicker:
             return
         # FN-01/FN-02：支持按键类型与按住时长
         ok = click_mouse(x, y, button=self.click_button, hold_ms=self.hold_ms)
+        final_ok = bool(ok)
         if ok:
             self.log_message(f"在位置 ({x}, {y}) 执行点击[按键={self.click_button}]")
         else:
-            if _pyautogui_click(x, y, self.click_button):
+            final_ok = bool(_pyautogui_click(x, y, self.click_button))
+            if final_ok:
                 self.log_message(f"使用pyautogui在位置 ({x}, {y}) 执行点击")
             else:
                 self.log_message(f"点击失败且 pyautogui 不可用: ({x}, {y})")
         self.click_count += 1
-        self.success_count = self.click_count
+        if final_ok:
+            self.success_count += 1
+        else:
+            self.fail_count += 1
         self._ui(self.click_count_label.config, text=str(self.click_count))
         self._ui(self._set_sb_counts)
+        return final_ok
 
     def _limit_reached(self):
         """点击次数/运行时长达到上限时停止并返回 True。"""
@@ -3335,7 +3573,7 @@ class AutoClicker:
 
             except Exception as e:
                 self.log_message(f"点击过程中发生错误: {e}")
-                self.fail_count += 1
+                self.exception_count += 1
                 self._ui(self._set_sb_counts)
                 time.sleep(1)
                 
@@ -3414,7 +3652,7 @@ class AutoClicker:
             parts.append(", failsafe开")
         return "".join(parts)
 
-    def start_clicking(self):
+    def start_clicking(self, source='manual'):
         # FR-L01：统一守卫，按钮与 F6 热键（toggle_clicking）都经过此处，避免绕过 UI 禁用
         if not self.input_ok:
             messagebox.showerror("启动已禁用", self.input_reason)
@@ -3439,8 +3677,19 @@ class AutoClicker:
             if hold_ms is None:
                 return
 
+            self._close_end_summary()
+            snapshot = self._confirmation_snapshot(
+                interval, countdown, click_limit, duration_limit, jitter, hold_ms)
+            if not self._confirm_start(snapshot, source):
+                self.log_message("启动已取消：用户在启动确认框选择取消")
+                return
+
             self.is_running = True
             self.click_count = 0
+            self.success_count = 0
+            self.fail_count = 0
+            self.exception_count = 0
+            self._pending_end_summary = False
             self.countdown_cancelled = False
             self._interval_change_event.clear()
             self.startup_countdown = countdown
@@ -3545,24 +3794,9 @@ class AutoClicker:
             pass
 
     def stop_clicking(self, reason=""):
+        was_running = bool(getattr(self, 'is_running', False))
         self.is_running = False
         self.countdown_cancelled = False
-
-        # REQ-004：记录最近一次运行统计快照（供导出）
-        try:
-            runtime = max(0.0, time.time() - getattr(self, 'start_time', time.time()))
-            self.last_run_stats = {
-                'timestamp': datetime.now().isoformat(timespec='seconds'),
-                'click_count': getattr(self, 'click_count', 0),
-                'success_count': getattr(self, 'success_count', 0),
-                'fail_count': getattr(self, 'fail_count', 0),
-                'runtime_seconds': round(runtime, 1),
-                'interval_seconds': self._effective_interval_seconds(),
-                'mode': self.config.get('click_mode', ''),
-                'button': getattr(self, 'click_button', ''),
-            }
-        except Exception:
-            pass
 
         if self.click_thread:
             try:
@@ -3572,6 +3806,27 @@ class AutoClicker:
                     self.click_thread.join(timeout=2)
             except RuntimeError:
                 pass
+
+        # REQ-004 / FR-02：等点击线程收尾后再记录快照，确保成功/失败计数完整
+        try:
+            runtime = max(0.0, time.time() - getattr(self, 'start_time', time.time()))
+            self.last_run_stats = {
+                'timestamp': datetime.now().isoformat(timespec='seconds'),
+                'click_count': getattr(self, 'click_count', 0),
+                'success_count': getattr(self, 'success_count', 0),
+                'fail_count': getattr(self, 'fail_count', 0),
+                'exception_count': getattr(self, 'exception_count', 0),
+                'runtime_seconds': round(runtime, 1),
+                'interval_seconds': self._effective_interval_seconds(),
+                'mode': self.config.get('click_mode', ''),
+                'button': getattr(self, 'click_button', ''),
+                'stop_reason': str(reason or '').strip() or '手动停止',
+            }
+            self._pending_end_summary = bool(
+                was_running and not getattr(self, '_suppress_end_summary', False))
+            self.log_message(_run_report.log_summary_line(self.last_run_stats))
+        except Exception:
+            pass
 
         self.allow_system_sleep()
 
@@ -3609,6 +3864,18 @@ class AutoClicker:
 
         # CX-12：托盘状态区分（已停止）
         self._update_tray_status(False)
+
+        # FR-02：停止后展示运行摘要；退出清理时由 _suppress_end_summary 抑制
+        pending_summary = bool(getattr(self, '_pending_end_summary', False))
+        self._pending_end_summary = False
+        if pending_summary and not getattr(self, '_suppress_end_summary', False):
+            try:
+                self.show_end_summary()
+            except Exception as e:
+                try:
+                    self.log_message("展示运行结束摘要失败: " + str(e))
+                except Exception:
+                    pass
 
     def emergency_stop(self):
         """P0 独立急停（CX-01）：仅作为停止入口，统一走 stop_clicking(reason)"""
@@ -4139,6 +4406,12 @@ class AutoClicker:
         """完全退出应用程序 - 从托盘菜单调用（跨平台）"""
         try:
             self.log_message("开始退出程序：清理线程、托盘与全局热键")
+        except Exception:
+            pass
+        self._suppress_end_summary = True
+        self._pending_end_summary = False
+        try:
+            self._close_end_summary()
         except Exception:
             pass
         self.is_running = False
