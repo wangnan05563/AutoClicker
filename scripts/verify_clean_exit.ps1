@@ -29,6 +29,8 @@ if (Test-Path $baseConfigPath) {
         current_profile = $null
         multi_points = @()
         schedule = [pscustomobject]@{ enabled = $false; start_at = '09:00'; stop_after_min = 0; weekdays = @(1, 2, 3, 4, 5) }
+        onboarding_done = $true
+        onboarding_template = 'safe'
     }
 }
 $config.auto_start = $false
@@ -38,6 +40,12 @@ $config.mouse_move_only = $false
 $config.failsafe_enabled = $false
 $config.startup_countdown = 0
 $config.interval_seconds = 60
+# 隔离配置已视为完成首启，避免 FR-01 向导抢走主窗口标题，干扰启动检测
+if ($config.PSObject.Properties.Name -contains 'onboarding_done') {
+    $config.onboarding_done = $true
+} else {
+    $config | Add-Member -NotePropertyName onboarding_done -NotePropertyValue $true
+}
 $config | ConvertTo-Json -Depth 20 | Set-Content (Join-Path $tempHome '.auto_clicker_config_py3.json') -Encoding UTF8
 
 $beforeProcessIds = @(Get-Process AutoClicker -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)

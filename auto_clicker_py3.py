@@ -55,6 +55,7 @@ from auto_clicker_layers.config import (
     backup_config as _config_backup,
     write_config as _config_write,
 )
+from auto_clicker_layers import onboarding as _onboarding
 
 # 点击抖动使用系统安全随机源，避免可预测的伪随机序列
 _RANDOM = random.SystemRandom()
@@ -1076,6 +1077,8 @@ class AutoClicker:
     
     def save_config_if_running(self):
         """保存配置，如果程序正在运行则保存当前配置"""
+        if getattr(self, '_config_ui_syncing', False):
+            return
         try:
             self.config['interval_seconds'] = int(self.interval_var.get())
             self.config['prevent_sleep'] = self.prevent_sleep_var.get()
@@ -1464,36 +1467,377 @@ class AutoClicker:
         except Exception as e:
             self.log_message("打开日志目录失败: " + str(e))
 
-    # ==================== 6.9.1 引导与预设配置 ====================
-    def _apply_first_run_preset(self):
-        """首次运行：落盘推荐安全预设，并预置一个「推荐安全」配置方案用于引导。"""
+    # ==================== FR-01 首启 3 步向导 ====================
+    def _onboarding_point_area(self):
+        """向导默认目标：当前光标点；不可读时退回主屏中心，避免默认全屏随机点击。"""
         try:
-            # 以当前默认配置（已含安全止血参数）作为基线落盘
-            self.save_config()
-            safe = {
-                'interval_seconds': 10, 'click_mode': 'random', 'prevent_sleep': True,
-                'startup_countdown': 3, 'click_limit': 0, 'duration_limit': 0,
-                'failsafe_enabled': True, 'click_button': 'left', 'hold_ms': 10,
-                'interval_unit': 's', 'jitter_pct': 0, 'use_multi_points': False,
-                'multi_points': [], 'hotkey_start': 'f6', 'hotkey_emergency': 'f8',
-                'autostart': False, 'close_to_tray': True,
+            x, y = get_cursor_pos()
+            return _onboarding.point_area(x, y)
+        except Exception:
+            pass
+        try:
+            return _onboarding.point_area(self.root.winfo_screenwidth() // 2,
+                                          self.root.winfo_screenheight() // 2)
+        except Exception:
+            return {'x': 0, 'y': 0, 'width': 1, 'height': 1}
+
+    def _apply_first_run_preset(self):
+        """首次运行：先把当前配置收敛到「推荐安全」，再启动 3 步向导。"""
+        try:
+            area = self._onboarding_point_area()
+            safe_cfg = _onboarding.safe_config(self.config, click_area=area)
+            self.config = _onboarding.apply_template(
+                self.config, _onboarding.SAFE_ID, click_area=area, mark_done=False)
+            self.config.setdefault('profiles', {})['推荐安全'] = {
+                k: safe_cfg.get(k) for k in (
+                    'interval_seconds', 'click_mode', 'prevent_sleep',
+                    'mouse_follow_enabled', 'mouse_move_speed', 'mouse_move_only',
+                    'startup_countdown', 'click_limit', 'duration_limit',
+                    'failsafe_enabled', 'target_window_keyword', 'click_button',
+                    'hold_ms', 'interval_unit', 'jitter_pct', 'use_multi_points',
+                    'multi_points', 'click_area', 'hotkey_start',
+                    'hotkey_emergency', 'autostart', 'close_to_tray')
             }
-            self.config.setdefault('profiles', {})['推荐安全'] = safe
             self.save_config()
-            self.log_message("首次运行：已写入推荐安全预设与「推荐安全」配置方案")
+            self.log_message("首次运行：已写入推荐安全配置与「推荐安全」方案，进入 3 步向导")
         except Exception:
             pass
 
     def _show_first_run_guidance(self):
+        self.show_onboarding_wizard(force=False)
+
+    def _wizard_target_text(self):
+        area = getattr(self, '_wizard_click_area', None) or self.config.get('click_area')
         try:
-            messagebox.showinfo("欢迎使用 AutoClicker",
-                "首次运行已为你写入推荐安全预设：\n"
-                "• 启动前 3 秒倒计时，避免误触\n"
-                "• F8 / Esc 紧急停止；鼠标移开 20px 自动停（安全停止）\n"
-                "• 可在「安全设置」中开启点击上限 / 时长上限\n\n"
-                "建议在自动点击前，先用「测试点击」确认目标位置。")
+            if int(area.get('width', 1)) <= 1 and int(area.get('height', 1)) <= 1:
+                return "当前目标：点 (%d, %d)" % (int(area['x']), int(area['y']))
+            return "当前目标：区域 %dx%d @ (%d, %d)" % (
+                int(area['width']), int(area['height']),
+                int(area['x']), int(area['y']))
+        except Exception:
+            return "当前目标：未设置"
+
+    def _wizard_refresh_preview(self, event=None):
+        try:
+            template_id = self._wizard_template_var.get()
+            lines = _onboarding.summary_lines(
+                template_id, self.config, getattr(self, '_wizard_click_area', None))
+            self._wizard_preview_var.set("\n".join(lines))
         except Exception:
             pass
+        try:
+            self._wizard_target_var.set(self._wizard_target_text())
+        except Exception:
+            pass
+
+    def _wizard_set_step(self, step):
+        self._wizard_step = max(1, min(3, int(step)))
+        for idx, frame in enumerate(self._wizard_step_frames, start=1):
+            if idx == self._wizard_step:
+                frame.pack(fill=tk.BOTH, expand=True, padx=18, pady=14)
+            else:
+                frame.pack_forget()
+        self._wizard_step_var.set("步骤 %d / 3" % self._wizard_step)
+        try:
+            self._wizard_back_btn.configure(
+                state='normal' if self._wizard_step > 1 else 'disabled')
+            self._wizard_next_btn.configure(
+                text='完成并进入运行台' if self._wizard_step == 3 else '下一步')
+            self._wizard_error_var.set('')
+        except Exception:
+            pass
+        self._wizard_refresh_preview()
+
+    def _wizard_next(self):
+        if self._wizard_step < 3:
+            self._wizard_set_step(self._wizard_step + 1)
+        else:
+            self._finish_onboarding(self._wizard_template_var.get())
+
+    def _wizard_back(self):
+        if self._wizard_step > 1:
+            self._wizard_set_step(self._wizard_step - 1)
+
+    def _wizard_pick_region(self):
+        try:
+            self._wizard_window.withdraw()
+            try:
+                self._wizard_window.grab_release()
+            except Exception:
+                pass
+            if getattr(self, '_region_selector', None) is None:
+                self.root.after(0, self._open_wizard_region_selector)
+        except Exception:
+            self._wizard_error_var.set("打开取点遮罩失败，请稍后重试")
+
+    def _open_wizard_region_selector(self):
+        try:
+            self._region_selector = RegionSelector(self.root, self._on_wizard_region_selected)
+        except Exception as e:
+            self._region_selector = None
+            try:
+                self._wizard_error_var.set("打开取点遮罩失败: %s" % e)
+                self._restore_wizard_window()
+            except Exception:
+                pass
+
+    def _on_wizard_region_selected(self, region):
+        self._region_selector = None
+        try:
+            if region:
+                if region.get('point'):
+                    self._wizard_click_area = _onboarding.point_area(region['x'], region['y'])
+                else:
+                    self._wizard_click_area = {
+                        'x': int(region['x']), 'y': int(region['y']),
+                        'width': int(region['width']), 'height': int(region['height']),
+                    }
+        except Exception:
+            pass
+        self._restore_wizard_window()
+
+    def _restore_wizard_window(self):
+        try:
+            self._wizard_window.deiconify()
+            self._wizard_window.lift()
+            if self.root.winfo_viewable():
+                self._wizard_window.grab_set()
+            self._wizard_refresh_preview()
+        except Exception:
+            pass
+
+    def _wizard_use_cursor(self):
+        self._wizard_click_area = self._onboarding_point_area()
+        self._wizard_refresh_preview()
+
+    def _wizard_save_safe_profile(self, cfg):
+        try:
+            self.config.setdefault('profiles', {})['推荐安全'] = {
+                k: cfg.get(k) for k in (
+                    'interval_seconds', 'click_mode', 'prevent_sleep',
+                    'mouse_follow_enabled', 'mouse_move_speed', 'mouse_move_only',
+                    'startup_countdown', 'click_limit', 'duration_limit',
+                    'failsafe_enabled', 'target_window_keyword', 'click_button',
+                    'hold_ms', 'interval_unit', 'jitter_pct', 'use_multi_points',
+                    'multi_points', 'click_area', 'hotkey_start',
+                    'hotkey_emergency', 'autostart', 'close_to_tray')
+            }
+        except Exception:
+            pass
+
+    def _finish_onboarding(self, template_id, skipped=False):
+        """应用模板并关闭向导；强制重开时“跳过”不覆盖当前参数。"""
+        force = bool(getattr(self, '_wizard_force', False))
+        try:
+            start = self._wizard_hotkey_start_var.get().strip().lower()
+            emergency = self._wizard_hotkey_emergency_var.get().strip().lower()
+            area = getattr(self, '_wizard_click_area', None) or self._onboarding_point_area()
+            if skipped:
+                safe_cfg = _onboarding.safe_config(
+                    self.config, click_area=area,
+                    hotkey_start=start, hotkey_emergency=emergency)
+                self._wizard_save_safe_profile(safe_cfg)
+                if not force:
+                    self.config = safe_cfg
+                else:
+                    self.config['onboarding_done'] = True
+                    self.config['onboarding_template'] = _onboarding.SAFE_ID
+            else:
+                self.config = _onboarding.apply_template(
+                    self.config, template_id, click_area=area,
+                    hotkey_start=start, hotkey_emergency=emergency,
+                    mark_done=True)
+            self.first_run = False
+            self.save_config()
+            self.apply_config_to_ui()
+            self._apply_ui_mode()
+            self._show_page('run')
+            self._close_wizard()
+            self.log_message("首启向导：%s，目标 %s" % (
+                '已跳过并使用推荐安全' if skipped else
+                ('模板 ' + str(_onboarding.get_template(template_id)['name'])),
+                self._wizard_target_text()))
+        except Exception as e:
+            try:
+                self._wizard_error_var.set("应用失败: %s" % e)
+            except Exception:
+                pass
+
+    def _close_wizard(self):
+        try:
+            window = getattr(self, '_wizard_window', None)
+            if window is not None:
+                try:
+                    window.grab_release()
+                except Exception:
+                    pass
+                window.destroy()
+        finally:
+            self._wizard_window = None
+            self._wizard_step_frames = []
+
+    def _onboarding_skip(self):
+        self._finish_onboarding(_onboarding.SAFE_ID, skipped=True)
+
+    def show_onboarding_wizard(self, force=False):
+        """FR-01：选场景 → 取目标 → 确认热键；可跳过，设置页可重开。"""
+        if getattr(self, '_wizard_window', None) is not None:
+            try:
+                self._wizard_window.lift()
+                self._wizard_window.focus_force()
+            except Exception:
+                pass
+            return
+        if not force and not getattr(self, 'first_run', False):
+            return
+        try:
+            pal = self._resolve_palette()
+        except Exception:
+            pal = _theme_resolve_palette('light')
+        self._wizard_force = bool(force)
+        self._wizard_step = 1
+        self._wizard_click_area = dict(self.config.get('click_area') or {})
+        self._wizard_template_var = tk.StringVar(value='keep_online')
+        self._wizard_target_var = tk.StringVar(value=self._wizard_target_text())
+        self._wizard_preview_var = tk.StringVar()
+        self._wizard_step_var = tk.StringVar(value='步骤 1 / 3')
+        self._wizard_error_var = tk.StringVar()
+        self._wizard_hotkey_start_var = tk.StringVar(
+            value=str(self.config.get('hotkey_start', 'f6')).upper())
+        self._wizard_hotkey_emergency_var = tk.StringVar(
+            value=str(self.config.get('hotkey_emergency', 'f8')).upper())
+
+        win = tk.Toplevel(self.root)
+        self._wizard_window = win
+        win.title("首启向导 · AutoClicker")
+        win.geometry("820x680")
+        win.minsize(760, 640)
+        win.configure(bg=pal['bg'])
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", self._onboarding_skip)
+
+        header = tk.Frame(win, bg=pal['primary'], padx=22, pady=14)
+        header.grid(row=0, column=0, sticky='ew')
+        win.grid_rowconfigure(1, weight=1)
+        win.grid_columnconfigure(0, weight=1)
+        tk.Label(header, text="欢迎使用 AutoClicker", bg=pal['primary'],
+                 fg=pal['on_primary'], font=('微软雅黑', 18, 'bold')).pack(anchor=tk.W)
+        tk.Label(header, text="3 步完成首次配置；不设置也能跳过，用推荐安全参数。",
+                 bg=pal['primary'], fg=pal['on_primary'],
+                 font=('微软雅黑', 10)).pack(anchor=tk.W, pady=(4, 0))
+        tk.Label(header, textvariable=self._wizard_step_var, bg=pal['primary'],
+                 fg=pal['on_primary'], font=('微软雅黑', 9, 'bold')).pack(anchor=tk.E)
+
+        host = tk.Frame(win, bg=pal['bg'])
+        host.grid(row=1, column=0, sticky='nsew')
+        self._wizard_step_frames = []
+
+        # 第 1 步：场景
+        step1 = tk.Frame(host, bg=pal['bg'])
+        tk.Label(step1, text="第 1 步：选择使用场景", bg=pal['bg'], fg=pal['text'],
+                 font=('微软雅黑', 13, 'bold')).pack(anchor=tk.W)
+        tk.Label(step1, text="场景只影响间隔、停止条件和防锁屏；随时可在规则页修改。",
+                 bg=pal['bg'], fg=pal['muted'], font=('微软雅黑', 9)).pack(anchor=tk.W, pady=(2, 8))
+        for tpl in _onboarding.TEMPLATES:
+            row = tk.Frame(step1, bg=pal['surface'], highlightthickness=1,
+                           highlightbackground=pal['border'], padx=10, pady=6)
+            row.pack(fill=tk.X, pady=3)
+            tk.Radiobutton(row, text=tpl['name'], variable=self._wizard_template_var,
+                           value=tpl['id'], command=self._wizard_refresh_preview,
+                           bg=pal['surface'], fg=pal['text'], selectcolor=pal['surface'],
+                           activebackground=pal['surface'], activeforeground=pal['text'],
+                           font=('微软雅黑', 10, 'bold'), anchor=tk.W).pack(anchor=tk.W)
+            tk.Label(row, text=tpl['description'], bg=pal['surface'], fg=pal['muted'],
+                     font=('微软雅黑', 9), justify=tk.LEFT,
+                     wraplength=680).pack(anchor=tk.W, padx=(24, 0))
+        preview = tk.LabelFrame(step1, text="模板摘要", bg=pal['surface'], fg=pal['text'],
+                                font=('微软雅黑', 9, 'bold'), padx=10, pady=6)
+        preview.pack(fill=tk.X, pady=(8, 0))
+        tk.Label(preview, textvariable=self._wizard_preview_var, bg=pal['surface'],
+                 fg=pal['text'], justify=tk.LEFT, anchor=tk.W,
+                 font=('微软雅黑', 9)).pack(anchor=tk.W)
+        self._wizard_step_frames.append(step1)
+
+        # 第 2 步：目标
+        step2 = tk.Frame(host, bg=pal['bg'])
+        tk.Label(step2, text="第 2 步：选择点击目标", bg=pal['bg'], fg=pal['text'],
+                 font=('微软雅黑', 13, 'bold')).pack(anchor=tk.W)
+        tk.Label(step2, text="拖拽框选区域，或单击取一个点；也可以直接使用当前鼠标位置。",
+                 bg=pal['bg'], fg=pal['muted'], font=('微软雅黑', 9),
+                 wraplength=690).pack(anchor=tk.W, pady=(2, 8))
+        target_box = tk.Frame(step2, bg=pal['surface'], highlightthickness=1,
+                              highlightbackground=pal['border'], padx=14, pady=14)
+        target_box.pack(fill=tk.X)
+        tk.Label(target_box, textvariable=self._wizard_target_var, bg=pal['surface'],
+                 fg=pal['primary'], font=('微软雅黑', 12, 'bold')).pack(anchor=tk.W)
+        btn_row = tk.Frame(target_box, bg=pal['surface'])
+        btn_row.pack(anchor=tk.W, pady=(10, 0))
+        ttk.Button(btn_row, text="框选区域", command=self._wizard_pick_region).pack(
+            side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="使用当前鼠标位置",
+                   command=self._wizard_use_cursor).pack(side=tk.LEFT)
+        tk.Label(step2, text="提示：选“保持在线”时只会移动鼠标，不会点击；选签到/连点才会执行点击。",
+                 bg=pal['bg'], fg=pal['muted'], font=('微软雅黑', 9),
+                 wraplength=690).pack(anchor=tk.W, pady=(10, 0))
+        self._wizard_step_frames.append(step2)
+
+        # 第 3 步：热键
+        step3 = tk.Frame(host, bg=pal['bg'])
+        tk.Label(step3, text="第 3 步：确认快捷键", bg=pal['bg'], fg=pal['text'],
+                 font=('微软雅黑', 13, 'bold')).pack(anchor=tk.W)
+        tk.Label(step3, text="默认 F6 开始/停止，F8 或 Esc 随时急停。",
+                 bg=pal['bg'], fg=pal['muted'], font=('微软雅黑', 9)).pack(anchor=tk.W, pady=(2, 12))
+        hotkey_box = tk.Frame(step3, bg=pal['surface'], highlightthickness=1,
+                              highlightbackground=pal['border'], padx=16, pady=16)
+        hotkey_box.pack(fill=tk.X)
+        row1 = tk.Frame(hotkey_box, bg=pal['surface'])
+        row1.pack(fill=tk.X, pady=3)
+        tk.Label(row1, text="开始 / 停止：", bg=pal['surface'], fg=pal['text'],
+                 font=('微软雅黑', 10, 'bold'), width=14, anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Combobox(row1, textvariable=self._wizard_hotkey_start_var,
+                     values=('F6', 'F7', 'F9', 'F10', 'F11', 'F12'),
+                     state='readonly', width=10).pack(side=tk.LEFT)
+        row2 = tk.Frame(hotkey_box, bg=pal['surface'])
+        row2.pack(fill=tk.X, pady=3)
+        tk.Label(row2, text="紧急停止：", bg=pal['surface'], fg=pal['text'],
+                 font=('微软雅黑', 10, 'bold'), width=14, anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Combobox(row2, textvariable=self._wizard_hotkey_emergency_var,
+                     values=('F8', 'F9', 'F10', 'ESC'),
+                     state='readonly', width=10).pack(side=tk.LEFT)
+        tk.Label(hotkey_box, text="Esc 始终保留为系统级急停；两个快捷键不能相同。",
+                 bg=pal['surface'], fg=pal['muted'], font=('微软雅黑', 9)).pack(
+                     anchor=tk.W, pady=(10, 0))
+        tk.Label(step3, text="完成后点「完成并进入运行台」，再按 F6 或点底部「启动」开始。",
+                 bg=pal['bg'], fg=pal['muted'], font=('微软雅黑', 9),
+                 wraplength=690).pack(anchor=tk.W, pady=(12, 0))
+        self._wizard_step_frames.append(step3)
+
+        footer = tk.Frame(win, bg=pal['bg'], padx=18, pady=12)
+        footer.grid(row=2, column=0, sticky='ew')
+        ttk.Button(footer, text="跳过（推荐安全）",
+                   command=self._onboarding_skip).pack(side=tk.LEFT)
+        self._wizard_next_btn = ttk.Button(footer, text="下一步", command=self._wizard_next)
+        self._wizard_next_btn.pack(side=tk.RIGHT)
+        self._wizard_back_btn = ttk.Button(footer, text="上一步", command=self._wizard_back)
+        self._wizard_back_btn.pack(side=tk.RIGHT, padx=(0, 8))
+        tk.Label(win, textvariable=self._wizard_error_var, bg=pal['bg'],
+                 fg=pal['danger'], font=('微软雅黑', 9)).grid(
+                     row=3, column=0, sticky='ew', padx=18)
+
+        self._wizard_set_step(1)
+        try:
+            win.update_idletasks()
+            if self.root.winfo_viewable():
+                w = win.winfo_width()
+                h = win.winfo_height()
+                x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - w) // 2)
+                y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - h) // 2)
+                win.geometry("+%d+%d" % (x, y))
+                win.grab_set()
+            win.focus_force()
+        except Exception:
+            pass
+
 
     # ==================== REQ-004 运行统计与导出 ====================
     def export_run_stats(self):
@@ -1681,7 +2025,12 @@ class AutoClicker:
             messagebox.showerror("错误", "导入失败: " + str(e))
 
     def apply_config_to_ui(self):
-        """将 config 参数回填到所有 UI 控件（方案切换 / 迁移后调用）"""
+        """将 config 参数回填到所有 UI 控件（方案切换 / 迁移后调用）
+
+        回填期间挂起输入变量 trace，避免 interval 先写入触发 save_config，
+        把尚未回填的 click_limit/duration_limit 用旧值覆盖掉配置。
+        """
+        self._config_ui_syncing = True
         try:
             self.interval_var.set(str(self.config.get('interval_seconds', 10)))
             self.mode_var.set(self.config.get('click_mode', 'random'))
@@ -1711,6 +2060,8 @@ class AutoClicker:
             self._refresh_multi_point_listbox()
         except Exception as e:
             print("回填 UI 失败: " + str(e))
+        finally:
+            self._config_ui_syncing = False
 
     def on_mouse_speed_changed(self, value):
         """鼠标移动速度改变时的回调"""
@@ -2351,6 +2702,9 @@ class AutoClicker:
             side=tk.LEFT, padx=(0, 6))
         ttk.Button(about_btns, text="复制版本信息", command=self.copy_version_info).pack(
             side=tk.LEFT, padx=(0, 6))
+        ttk.Button(about_btns, text="重跑首启向导",
+                   command=lambda: self.show_onboarding_wizard(force=True)).pack(
+                       side=tk.LEFT, padx=(0, 6))
         ttk.Button(about_btns, text="项目主页", command=self.open_project_home).pack(
             side=tk.LEFT)
 

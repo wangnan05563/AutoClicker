@@ -31,6 +31,8 @@ DEFAULT_CONFIG = {
     'theme_mode': 'light',
     'theme_pack': 'system',
     'ui_mode': 'simple',
+    'onboarding_done': False,
+    'onboarding_template': None,
     'schedule': {'enabled': False, 'start_at': '09:00',
                  'stop_after_min': 0, 'weekdays': [1, 2, 3, 4, 5]},
     'config_version': 2,

@@ -64,4 +64,38 @@ assert app.close_tray_check.winfo_manager() == ''
 assert app.config['interval_seconds'] == 7
 print("GUI_MODE_OK")
 
+# FR-01：三步向导可走通，完成挂机签到模板后参数真实落地
+app.show_onboarding_wizard(force=True)
+root.update_idletasks()
+assert app._wizard_window is not None
+assert app._wizard_step == 1
+app._wizard_next(); root.update_idletasks()
+assert app._wizard_step == 2
+app._wizard_click_area = {'x': 123, 'y': 456, 'width': 1, 'height': 1}
+app._wizard_refresh_preview()
+app._wizard_next(); root.update_idletasks()
+assert app._wizard_step == 3
+app._wizard_hotkey_start_var.set('F6')
+app._wizard_hotkey_emergency_var.set('ESC')
+app._finish_onboarding('checkin')
+root.update_idletasks()
+assert app.config['onboarding_template'] == 'checkin'
+assert app.config['onboarding_done'] is True
+assert app.config['click_limit'] == 1
+assert app.config['click_area'] == {'x': 123, 'y': 456, 'width': 1, 'height': 1}
+assert app.config['hotkey_emergency'] == 'esc'
+assert app._wizard_window is None
+print("GUI_WIZARD_OK")
+
+# FR-01：设置页重开向导后“跳过”只更新推荐安全方案，不覆盖当前参数
+app.config['interval_seconds'] = 321
+app.show_onboarding_wizard(force=True)
+root.update_idletasks()
+app._onboarding_skip()
+root.update_idletasks()
+assert app.config['interval_seconds'] == 321
+assert app.config['click_limit'] == 1
+assert app.config['onboarding_done'] is True
+print("GUI_WIZARD_SKIP_KEEPS_CONFIG_OK")
+
 app.exit_application()
