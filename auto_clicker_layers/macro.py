@@ -258,6 +258,73 @@ def list_macros(directory):
     return entries
 
 
+def rename_macro(path, new_name, directory):
+    """把宏另存为新名称并删除旧文件；返回新路径与宏数据。"""
+    data = load_macro(path)
+    clean_name = sanitize_macro_name(new_name)
+    data = dict(data)
+    data['name'] = clean_name
+    new_path = unique_macro_path(directory, clean_name)
+    saved = save_macro(new_path, data)
+    if os.path.abspath(new_path) != os.path.abspath(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return new_path, saved
+
+
+def delete_macro(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def export_macro(path, target_path):
+    """导出前重新校验并规范化，目标文件可被再次导入。"""
+    return save_macro(target_path, load_macro(path))
+
+
+def import_macro(source_path, directory):
+    """导入 JSON 宏到宏目录；同名时自动追加序号，返回 (路径, 数据)。"""
+    data = load_macro(source_path)
+    target = unique_macro_path(directory, data.get('name') or '未命名宏')
+    return target, save_macro(target, data)
+
+
+def push_recent(recent, path, used_at=None, limit=5):
+    """最近使用列表：同一路径去重并置顶，最多 limit 条。"""
+    limit = max(1, int(limit))
+    clean = []
+    for item in (recent or []):
+        if not isinstance(item, dict):
+            continue
+        item_path = str(item.get('path') or '')
+        if not item_path:
+            continue
+        clean.append({'path': item_path, 'used_at': str(item.get('used_at') or '')})
+    entry = {'path': os.path.abspath(path),
+             'used_at': str(used_at or datetime.now().isoformat(timespec='seconds'))}
+    clean = [item for item in clean if os.path.abspath(item['path']) != entry['path']]
+    clean.insert(0, entry)
+    return clean[:limit]
+
+
+def recent_label(recent, directory=None):
+    for item in (recent or []):
+        try:
+            path = item.get('path', '')
+            name = os.path.splitext(os.path.basename(path))[0]
+            if directory and os.path.abspath(os.path.dirname(path)) != os.path.abspath(directory):
+                continue
+            return '最近使用：%s · %s' % (name, str(item.get('used_at') or '')[:16].replace('T', ' '))
+        except Exception:
+            continue
+    return '最近使用：暂无'
+
+
 def preview_lines(macro, limit=12):
     lines = []
     for index, step in enumerate(macro.get('steps', [])[:limit], 1):

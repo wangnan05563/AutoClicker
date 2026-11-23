@@ -233,5 +233,87 @@ class PlayerTests(unittest.TestCase):
         player.run()
 
 
+class HotkeyBindingTests(unittest.TestCase):
+    """T06149 AC-19：三个宏各自绑定热键，回调独立投递到指定宏路径。"""
+
+    class FakeKeyboard:
+        def __init__(self):
+            self.handlers = {}
+            self.removed = []
+
+        def add_hotkey(self, key, callback):
+            if key in self.handlers:
+                raise RuntimeError('duplicate hotkey ' + key)
+            self.handlers[key] = callback
+
+        def remove_hotkey(self, key):
+            self.removed.append(key)
+            self.handlers.pop(key, None)
+
+    def test_three_macros_bind_independently(self):
+        import queue
+        from unittest import mock
+        import auto_clicker_py3 as app_module
+        tmp = tempfile.mkdtemp(prefix='ac-macro-hotkey-')
+        paths = [LibraryTests._make(self, tmp, '宏%d' % i) for i in range(3)]
+        keys = ['alt+1', 'alt+2', 'alt+3']
+        app = object.__new__(app_module.AutoClicker)
+        app.config = {
+            'hotkey_start': 'f6', 'hotkey_emergency': 'f8',
+            'macro_hotkeys': dict(zip(paths, keys)),
+        }
+        app._hotkey_queue = queue.Queue()
+        app._hk_keys = []
+        fake_kb = self.FakeKeyboard()
+        with mock.patch.object(app_module, '_get_keyboard', return_value=fake_kb):
+            app._register_hotkeys()
+        self.assertEqual(app._hotkey_state['macro_keys'], keys)
+        self.assertFalse(app._hotkey_state['macro_errors'])
+        for key, path in zip(keys, paths):
+            fake_kb.handlers[key]()
+            self.assertEqual(app._hotkey_queue.get_nowait(), ('macro', path))
+
+
+class LibraryTests(unittest.TestCase):
+    def _make(self, directory, name='m1'):
+        data = macro.make_macro(name, [
+            {'type': 'click', 'x': 10, 'y': 20, 'button': 'left', 'hold_ms': 10},
+        ])
+        path = macro.unique_macro_path(directory, name)
+        macro.save_macro(path, data)
+        return path
+
+    def test_rename_and_delete(self):
+        tmp = tempfile.mkdtemp(prefix='ac-macro-lib-')
+        path = self._make(tmp, '旧名')
+        new_path, data = macro.rename_macro(path, '新名', tmp)
+        self.assertFalse(os.path.exists(path))
+        self.assertTrue(os.path.exists(new_path))
+        self.assertEqual(data['name'], '新名')
+        self.assertTrue(macro.delete_macro(new_path))
+        self.assertFalse(os.path.exists(new_path))
+        self.assertFalse(macro.delete_macro(new_path))
+
+    def test_export_import(self):
+        tmp = tempfile.mkdtemp(prefix='ac-macro-lib-')
+        src = self._make(tmp, 'source')
+        out = os.path.join(tempfile.mkdtemp(prefix='ac-macro-out-'), 'export.json')
+        macro.export_macro(src, out)
+        imported, data = macro.import_macro(out, tmp)
+        self.assertTrue(os.path.exists(imported))
+        self.assertEqual(data['name'], 'source')
+
+    def test_recent_push_dedupes_and_caps(self):
+        recent = []
+        for i in range(6):
+            recent = macro.push_recent(recent, '/tmp/m%d.json' % i,
+                                       used_at='2026-11-23T12:0%d:00' % i)
+        self.assertEqual(len(recent), 5)
+        self.assertTrue(recent[0]['path'].endswith('m5.json'))
+        recent = macro.push_recent(recent, '/tmp/m5.json', '2026-11-23T13:00:00')
+        self.assertEqual(len(recent), 5)
+        self.assertIn('2026-11-23 13:00', macro.recent_label(recent))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

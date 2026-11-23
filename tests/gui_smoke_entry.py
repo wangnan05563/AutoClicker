@@ -50,6 +50,32 @@ for page in ('run', 'rules', 'records', 'settings'):
     assert elapsed < 0.1, 'page switch too slow: %s %.3fs' % (page, elapsed)
 print("GUI_SMOKE_OK")
 
+# T06155：运行历史摘要与趋势图可刷新（30 条记录，覆盖 AC-17）
+app.run_history = app_module._history.empty_history()
+for _i in range(30):
+    app.run_history = app_module._history.append_run(
+        app.run_history,
+        {'timestamp': '2026-11-23T09:%02d:00' % _i, 'click_count': 10,
+         'success_count': 9 if _i != 1 else 10, 'fail_count': 1 if _i == 1 else 0,
+         'exception_count': 0, 'runtime_seconds': 2 + _i % 5,
+         'interval_seconds': 1, 'mode': 'single', 'button': 'left',
+         'stop_reason': '手动停止'})
+app.refresh_run_history()
+root.update_idletasks()
+assert '最近 30 次' in app.history_summary_var.get(), app.history_summary_var.get()
+assert len(app.history_canvas.find_all()) >= 6
+print("GUI_HISTORY_OK")
+
+# T06159：三点序列列表 + 路径预览画布可见
+app.config['multi_points'] = [{'x': 100, 'y': 200}, {'x': 300, 'y': 400}, {'x': 500, 'y': 600}]
+app._refresh_multi_point_listbox()
+root.update_idletasks()
+assert app.multi_point_listbox.size() == 3, app.multi_point_listbox.size()
+assert len(app.mp_preview_canvas.find_all()) >= 4
+app.config['multi_points'] = []
+app._refresh_multi_point_listbox()
+print("GUI_POINTS_OK")
+
 # FR-26：状态环、今日统计、会话保持与倒计时小数秒可刷新
 app._show_page('run')
 app.daily_stats = app_module._dashboard.empty_daily_stats()

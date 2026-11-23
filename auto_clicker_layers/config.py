@@ -30,6 +30,8 @@ DEFAULT_CONFIG = {
     'double_click_gap_ms': 30,
     'hotkey_start': 'f6',
     'hotkey_emergency': 'f8',
+    'macro_hotkeys': {},
+    'macro_recent': [],
     'autostart': False,
     'use_multi_points': False,
     'multi_points': [],

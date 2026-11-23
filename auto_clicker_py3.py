@@ -68,6 +68,8 @@ from auto_clicker_layers import run_report as _run_report
 from auto_clicker_layers import diagnostics as _diagnostics
 from auto_clicker_layers import dashboard as _dashboard
 from auto_clicker_layers import macro as _macro
+from auto_clicker_layers import history as _history
+from auto_clicker_layers import multi_point as _multi_point
 from auto_clicker_layers.hotkey import (
     parse_hotkey as _hotkey_parse,
     probe_windows_hotkey as _hotkey_probe,
@@ -396,6 +398,9 @@ class AutoClicker:
         # FR-26：今日统计跨运行保留；只存聚合计数，不含点击坐标/窗口标题。
         self.daily_stats_file = os.path.expanduser("~/.auto_clicker_daily_stats.json")
         self.daily_stats = _dashboard.load(self.daily_stats_file)
+        # T06155：最近 30 次运行摘要、成功率/时长趋势与 CSV 导出。
+        self.run_history_file = os.path.expanduser("~/.auto_clicker_run_history.json")
+        self.run_history = _history.load(self.run_history_file)
         self._daily_run_recorded = False
         self._consecutive_click_failures = 0
         self._last_abnormal_reason = ''
@@ -436,6 +441,12 @@ class AutoClicker:
         self._macro_record_name = ''
         self._macro_pending_play = None
         self._macro_status_kind = 'muted'
+        # T06149：宏库热键绑定与最近使用。绑定值保存在 config['macro_hotkeys']，
+        # 键为宏文件的绝对路径，值为 keyboard 可解析的按键串。
+        self._macro_hotkey_bindings = dict(
+            (getattr(self, 'config', {}) or {}).get('macro_hotkeys') or {})
+        self._macro_recent = list(
+            (getattr(self, 'config', {}) or {}).get('macro_recent') or [])
 
         self.load_config()
         # FR-26：运行台“会话保持”开关与规则页共用同一个变量，必须先于 setup_ui 创建
@@ -444,8 +455,9 @@ class AutoClicker:
         self._init_theme()
         self._init_ui_fonts()
         self.setup_ui()
-        # FR-27：提前建立并销毁一次取点遮罩控件树，摊平首次取点的字体/控件初始化成本
-        prewarm_region_selector(self.root)
+        # FR-27/T06154：取点遮罩预热延后到首屏可见后，避免全屏 Toplevel/Canvas
+        # 在窗口映射前阻塞冷启动；首次取点前仍会完成一次控件树预热。
+        self.root.after(5000, lambda: prewarm_region_selector(self.root))
         self.root.after(30, self._poll_ui_queue)
         # FR-D01 定时计划：Tk 主线程每秒检查一次（休眠期间 after 暂停，唤醒后补算）
         self.root.after(1000, self._schedule_tick)
@@ -566,6 +578,9 @@ class AutoClicker:
             _config_normalize(self.config)
         except Exception:
             pass
+        # T06149：配置加载后同步宏热键与最近使用（__init__ 早于此执行）
+        self._macro_hotkey_bindings = dict(self.config.get('macro_hotkeys') or {})
+        self._macro_recent = list(self.config.get('macro_recent') or [])
 
     # ==================== 6.11.2 DPI 适配 / UI 字体基准 ====================
     def _init_dpi_awareness(self):
@@ -1438,6 +1453,101 @@ class AutoClicker:
                 self.log_message("保存今日统计失败: " + str(e))
             except Exception:
                 pass
+        try:
+            self.run_history = _history.append_run(
+                self.run_history, run or self.last_run_stats)
+            self.run_history = _history.save(self.run_history_file, self.run_history)
+            self.refresh_run_history()
+        except Exception as e:
+            try:
+                self.log_message("保存运行历史失败: " + str(e))
+            except Exception:
+                pass
+
+    def refresh_run_history(self):
+        """T06155：刷新历史摘要与双趋势线（成功率/时长）。"""
+        try:
+            self.run_history = _history.normalize(self.run_history)
+            text = _history.summary_text(self.run_history)
+            if getattr(self, 'history_summary_var', None) is not None:
+                self.history_summary_var.set(text)
+            points = _history.trend_points(self.run_history)
+            self._draw_history_trend(points)
+            if getattr(self, 'history_empty_label', None) is not None:
+                if points:
+                    self.history_empty_label.pack_forget()
+                else:
+                    self.history_empty_label.pack(anchor=tk.W)
+        except Exception as exc:
+            try:
+                self.log_message("刷新运行历史失败：" + str(exc))
+            except Exception:
+                pass
+
+    def _draw_history_trend(self, points):
+        canvas = getattr(self, 'history_canvas', None)
+        if canvas is None:
+            return
+        try:
+            canvas.delete('all')
+            width = max(240, int(canvas.winfo_width() or 720))
+            height = max(60, int(canvas.winfo_height() or 96))
+            pad_l, pad_r, pad_t, pad_b = 34, 12, 10, 18
+            graph_w = max(1, width - pad_l - pad_r)
+            graph_h = max(1, height - pad_t - pad_b)
+            pal = self._current_palette
+            canvas.configure(bg=pal['surface'])
+            canvas.create_line(pad_l, pad_t, pad_l, pad_t + graph_h,
+                               fill=pal['muted'], width=1)
+            canvas.create_line(pad_l, pad_t + graph_h, pad_l + graph_w, pad_t + graph_h,
+                               fill=pal['muted'], width=1)
+            # 两条线各自按本序列最大值归一；图例在顶部，不画额外交互。
+            max_runtime = max([p['runtime'] for p in points] or [1.0]) or 1.0
+            if len(points) <= 1:
+                xs = [pad_l + graph_w / 2]
+            else:
+                xs = [pad_l + i * graph_w / (len(points) - 1) for i in range(len(points))]
+            rate_coords, runtime_coords = [], []
+            for x, point in zip(xs, points):
+                y_rate = pad_t + graph_h - (point['rate'] / 100.0) * graph_h
+                y_time = pad_t + graph_h - (point['runtime'] / max_runtime) * graph_h
+                rate_coords.extend([x, y_rate])
+                runtime_coords.extend([x, y_time])
+            if len(xs) >= 2:
+                canvas.create_line(rate_coords, fill=pal['success'], width=2, smooth=False)
+                canvas.create_line(runtime_coords, fill=pal['primary'], width=2, smooth=False)
+            for x, point in zip(xs, points):
+                y_rate = pad_t + graph_h - (point['rate'] / 100.0) * graph_h
+                color = pal['danger'] if point['abnormal'] else pal['success']
+                canvas.create_oval(x - 2, y_rate - 2, x + 2, y_rate + 2,
+                                   fill=color, outline=color)
+            canvas.create_text(pad_l, pad_t, anchor='sw', text='100%',
+                               fill=pal['muted'], font=('微软雅黑', 8))
+            canvas.create_text(pad_l, pad_t + graph_h, anchor='sw', text='0',
+                               fill=pal['muted'], font=('微软雅黑', 8))
+            canvas.create_text(pad_l + graph_w, pad_t, anchor='se',
+                               text='成功率', fill=pal['success'], font=('微软雅黑', 8))
+            canvas.create_text(pad_l + graph_w, pad_t + 14, anchor='se',
+                               text='时长', fill=pal['primary'], font=('微软雅黑', 8))
+        except Exception:
+            pass
+
+    def export_run_history(self):
+        """T06155：导出最近 30 条为 UTF-8 BOM CSV。"""
+        try:
+            from tkinter import filedialog
+            path = filedialog.asksaveasfilename(
+                title="导出运行历史",
+                defaultextension='.csv',
+                initialfile=_history.default_csv_name(),
+                filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")])
+            if not path:
+                return
+            _history.write_csv(path, self.run_history)
+            self.log_message("运行历史已导出：%s" % path)
+            self.show_operation_message("已导出运行历史：%s" % path, level='success')
+        except Exception as exc:
+            messagebox.showerror("导出运行历史", "导出失败：" + str(exc))
 
     def _mark_run_abnormal(self, reason):
         reason = str(reason or '运行异常').strip()
@@ -1516,6 +1626,17 @@ class AutoClicker:
                 try:
                     self._draw_run_ring()
                     self._refresh_run_metrics()
+                except Exception:
+                    pass
+            # T06155/T06159：趋势图与多点路径预览随主题重绘
+            if getattr(self, 'history_canvas', None) is not None:
+                try:
+                    self.refresh_run_history()
+                except Exception:
+                    pass
+            if getattr(self, 'mp_preview_canvas', None) is not None:
+                try:
+                    self._draw_multi_point_preview()
                 except Exception:
                     pass
             try:
@@ -1790,19 +1911,161 @@ class AutoClicker:
             print("保存关闭行为失败: " + str(e))
 
     # ==================== P1 辅助方法 ====================
-    def _refresh_multi_point_listbox(self):
+    def _refresh_multi_point_listbox(self, selected=None):
         try:
+            points = _multi_point.normalize_points(self.config.get('multi_points', []))
+            self.config['multi_points'] = points
             self.multi_point_listbox.delete(0, tk.END)
-            for p in self.config.get('multi_points', []):
-                self.multi_point_listbox.insert(tk.END, f"({p['x']}, {p['y']})")
+            for index, p in enumerate(points):
+                self.multi_point_listbox.insert(
+                    tk.END, "%02d. (%d, %d)" % (index + 1, p['x'], p['y']))
+            if points:
+                index = min(max(0, int(selected if selected is not None else 0)),
+                            len(points) - 1)
+                self.multi_point_listbox.selection_clear(0, tk.END)
+                self.multi_point_listbox.selection_set(index)
+                self.multi_point_listbox.activate(index)
+            self._draw_multi_point_preview(points)
         except Exception:
             pass
 
-    def _add_point(self, x, y):
+    def _draw_multi_point_preview(self, points=None):
+        canvas = getattr(self, 'mp_preview_canvas', None)
+        if canvas is None:
+            return
         try:
-            self.config.setdefault('multi_points', []).append({'x': int(x), 'y': int(y)})
+            points = _multi_point.normalize_points(
+                self.config.get('multi_points', []) if points is None else points)
+            canvas.delete('all')
+            width = max(240, int(canvas.winfo_width() or 720))
+            height = max(60, int(canvas.winfo_height() or 84))
+            pal = self._current_palette
+            canvas.configure(bg=pal['surface'])
+            canvas.create_rectangle(8, 8, width - 8, height - 8,
+                                    outline=pal['muted'], width=1)
+            if not points:
+                canvas.create_text(width / 2, height / 2,
+                                   text="点位路径预览：暂无点位",
+                                   fill=pal['muted'], font=('微软雅黑', 8))
+                return
+            bounds = self._macro_screen_bounds()
+            positions = _multi_point.preview_positions(
+                points, bounds, width=width, height=height, padding=14)
+            coords = []
+            for x, y, index in positions:
+                coords.extend([x, y])
+            if len(positions) >= 2:
+                canvas.create_line(coords, fill=pal['primary'], width=2,
+                                   arrow=tk.LAST, smooth=False)
+            for x, y, index in positions:
+                canvas.create_oval(x - 4, y - 4, x + 4, y + 4,
+                                   fill=pal['success'], outline=pal['success'])
+                canvas.create_text(x + 7, y - 7, text=str(index + 1),
+                                   fill=pal['fg'], font=('微软雅黑', 8))
+            palette = " → ".join("%d:(%d,%d)" % (i + 1, p['x'], p['y'])
+                                 for i, p in enumerate(points[:6]))
+            if len(points) > 6:
+                palette += " → …"
+            canvas.create_text(10, height - 9, anchor='sw', text=palette,
+                               fill=pal['muted'], font=('微软雅黑', 8))
+        except Exception:
+            pass
+
+    def _mp_drag_start(self, event):
+        try:
+            self._mp_drag_index = self.multi_point_listbox.nearest(event.y)
+        except Exception:
+            self._mp_drag_index = None
+
+    def _mp_drag_motion(self, event):
+        try:
+            source = getattr(self, '_mp_drag_index', None)
+            if source is None:
+                return
+            target = self.multi_point_listbox.nearest(event.y)
+            if target == source:
+                return
+            points = _multi_point.move_point(
+                self.config.get('multi_points', []), source, target)
+            self.config['multi_points'] = points
+            self._mp_drag_index = target
+            self._refresh_multi_point_listbox(selected=target)
+            self.log_message("多点位顺序已调整：%d → %d" % (source + 1, target + 1))
+        except Exception as exc:
+            self.log_message("调整多点位顺序失败：" + str(exc))
+
+    def _mp_drag_drop(self, event):
+        try:
+            if getattr(self, '_mp_drag_index', None) is not None:
+                self.save_config()
+            self._mp_drag_index = None
+        except Exception:
+            pass
+
+    def nudge_multi_point(self, delta):
+        try:
+            sel = self.multi_point_listbox.curselection()
+            if not sel:
+                return
+            source = int(sel[0])
+            target = min(max(0, source + int(delta)),
+                         len(self.config.get('multi_points', [])) - 1)
+            if source == target:
+                return
+            self.config['multi_points'] = _multi_point.move_point(
+                self.config.get('multi_points', []), source, target)
+            self.save_config()
+            self._refresh_multi_point_listbox(selected=target)
+        except Exception as exc:
+            self.log_message("移动多点位失败：" + str(exc))
+
+    def export_multi_points(self):
+        try:
+            from tkinter import filedialog
+            path = filedialog.asksaveasfilename(
+                title="导出多点配置", defaultextension='.json',
+                initialfile='AutoClicker-points.json',
+                filetypes=[("JSON 文件", JSON_FILE_PATTERN), ("所有文件", "*.*")])
+            if not path:
+                return
+            _multi_point.export_file(path, self.config.get('multi_points', []))
+            self.log_message("多点配置已导出：%s" % path)
+            self.show_operation_message("多点配置已导出：%s" % path, level='success')
+        except Exception as exc:
+            messagebox.showerror("导出多点配置", "导出失败：" + str(exc))
+
+    def import_multi_points(self):
+        try:
+            from tkinter import filedialog
+            path = filedialog.askopenfilename(
+                title="导入多点配置",
+                filetypes=[("JSON 文件", JSON_FILE_PATTERN), ("所有文件", "*.*")])
+            if not path:
+                return
+            points = _multi_point.import_file(path)
+            if self.config.get('multi_points') and not messagebox.askyesno(
+                    "导入多点配置", "导入将替换当前 %d 个点位，是否继续？"
+                    % len(self.config.get('multi_points', []))):
+                return
+            self.config['multi_points'] = points
+            self.config['use_multi_points'] = bool(points)
+            try:
+                self.use_multi_points_var.set(bool(points))
+            except Exception:
+                pass
             self.save_config()
             self._refresh_multi_point_listbox()
+            self.log_message("已导入多点配置：%d 个点位（%s）" % (len(points), path))
+        except Exception as exc:
+            messagebox.showerror("导入多点配置", "导入失败：" + str(exc))
+
+    def _add_point(self, x, y):
+        try:
+            points = _multi_point.normalize_points(self.config.get('multi_points', []))
+            points.append(_multi_point.normalize_points([{'x': x, 'y': y}])[0])
+            self.config['multi_points'] = _multi_point.normalize_points(points)
+            self.save_config()
+            self._refresh_multi_point_listbox(selected=len(points) - 1)
             self.log_message(f"已添加多点位：({int(x)}, {int(y)})")
         except Exception as e:
             self.log_message("添加多点位失败: " + str(e))
@@ -3745,13 +4008,25 @@ class AutoClicker:
                         variable=self.use_multi_points_var).pack(anchor=tk.W)
         self.multi_point_listbox = tk.Listbox(p1_card, height=4)
         self.multi_point_listbox.pack(fill=tk.X, pady=(4, 4))
+        self.multi_point_listbox.bind('<Button-1>', self._mp_drag_start)
+        self.multi_point_listbox.bind('<B1-Motion>', self._mp_drag_motion)
+        self.multi_point_listbox.bind('<ButtonRelease-1>', self._mp_drag_drop)
         self._refresh_multi_point_listbox()
+        self.mp_preview_canvas = tk.Canvas(
+            p1_card, height=84, bg=self._color('surface'),
+            highlightthickness=0, relief=tk.FLAT)
+        self.mp_preview_canvas.pack(fill=tk.X, pady=(0, 4))
+        self.root.after(50, self._draw_multi_point_preview)
         mp_btn = ttk.Frame(p1_card)
         mp_btn.pack(fill=tk.X)
         ttk.Button(mp_btn, text="拾取当前光标", command=self.pick_coordinate).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(mp_btn, text="添加(手动)", command=self.add_manual_point).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(mp_btn, text="删除选中", command=self.remove_point).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(mp_btn, text="清空", command=self.clear_points).pack(side=tk.LEFT)
+        ttk.Button(mp_btn, text="清空", command=self.clear_points).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(mp_btn, text="导入配置", command=self.import_multi_points).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(mp_btn, text="导出配置", command=self.export_multi_points).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(mp_btn, text="上移", command=lambda: self.nudge_multi_point(-1)).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(mp_btn, text="下移", command=lambda: self.nudge_multi_point(1)).pack(side=tk.LEFT)
         mp_entry = ttk.Frame(p1_card)
         mp_entry.pack(fill=tk.X, pady=(4, 0))
         ttk.Label(mp_entry, text="X").pack(side=tk.LEFT)
@@ -3820,6 +4095,29 @@ class AutoClicker:
                         command=self.on_autostart_changed).pack(side=tk.LEFT)
         ttk.Button(sys_row, text="打开日志目录", command=self.open_log_dir).pack(side=tk.LEFT, padx=(10, 0))
         ttk.Button(sys_row, text="导出运行统计", command=self.export_run_stats).pack(side=tk.LEFT, padx=(10, 0))
+
+        # ==================== 记录：最近运行历史（T06155） ====================
+        self.history_card = ttk.LabelFrame(
+            self.records_page, text="运行历史（最近 30 次）", padding="10")
+        self.history_card.pack(fill=tk.X, pady=(0, 10))
+        history_head = ttk.Frame(self.history_card)
+        history_head.pack(fill=tk.X)
+        self.history_summary_var = tk.StringVar(value=_history.summary_text(self.run_history))
+        ttk.Label(history_head, textvariable=self.history_summary_var,
+                  font=('微软雅黑', 9, 'bold')).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(history_head, text="导出 CSV", command=self.export_run_history,
+                   width=9).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(history_head, text="刷新", command=self.refresh_run_history,
+                   width=6).pack(side=tk.LEFT, padx=(4, 0))
+        self.history_canvas = tk.Canvas(
+            self.history_card, height=96, bg=self._color('surface'),
+            highlightthickness=0, relief=tk.FLAT)
+        self.history_canvas.pack(fill=tk.X, pady=(6, 0))
+        self.history_empty_label = ttk.Label(
+            self.history_card, text="完成一次运行后，这里显示成功率与时长趋势。",
+            font=('微软雅黑', 8), foreground=self._color('muted'))
+        self.history_empty_label.pack(anchor=tk.W)
+        self.root.after(50, self.refresh_run_history)
 
         # ==================== 记录：录制与回放（FR-13） ====================
         self.macro_card = ttk.LabelFrame(
@@ -3903,6 +4201,32 @@ class AutoClicker:
         ttk.Label(macro_option_row, text="宏文件目录：" + self.macro_dir,
                   font=('微软雅黑', 8), foreground=self._color('muted')).pack(
                       side=tk.LEFT)
+
+        macro_lib_row = ttk.Frame(self.macro_card)
+        self.macro_lib_row = macro_lib_row
+        macro_lib_row.pack(fill=tk.X, pady=(3, 3))
+        ttk.Button(macro_lib_row, text="重命名", width=7,
+                   command=self.rename_macro).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(macro_lib_row, text="删除", width=6,
+                   command=self.delete_macro).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(macro_lib_row, text="导出", width=6,
+                   command=self.export_macro).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(macro_lib_row, text="导入", width=6,
+                   command=self.import_macro).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(macro_lib_row, text="宏热键").pack(side=tk.LEFT)
+        self.macro_hotkey_var = tk.StringVar()
+        self.macro_hotkey_entry = ttk.Entry(
+            macro_lib_row, textvariable=self.macro_hotkey_var, width=12)
+        self.macro_hotkey_entry.pack(side=tk.LEFT, padx=(4, 3))
+        ttk.Button(macro_lib_row, text="绑定", width=6,
+                   command=self.apply_macro_hotkey).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(macro_lib_row, text="解除", width=6,
+                   command=self.clear_macro_hotkey).pack(side=tk.LEFT)
+        self.macro_recent_var = tk.StringVar(
+            value=_macro.recent_label(self._macro_recent, self.macro_dir))
+        ttk.Label(self.macro_card, textvariable=self.macro_recent_var,
+                  font=('微软雅黑', 8), foreground=self._color('muted')).pack(
+                      anchor=tk.W)
 
         self.macro_status_var = tk.StringVar(value="尚未录制或选择宏文件")
         self.macro_status_label = ttk.Label(
@@ -4110,6 +4434,8 @@ class AutoClicker:
             except Exception:
                 pass
         self._hk_keys = []
+        macro_keys = []
+        macro_errors = []
         try:
             kb.add_hotkey(start_k, lambda: self._hotkey_queue.put('toggle'))
             self._hk_keys.append(start_k)
@@ -4117,12 +4443,35 @@ class AutoClicker:
             self._hk_keys.append(emer_k)
             kb.add_hotkey('esc', lambda: self._hotkey_queue.put('emergency'))
             self._hk_keys.append('esc')
+            reserved = {start_k.lower(), emer_k.lower(), 'esc'}
+            for path, key in (self.config.get('macro_hotkeys') or {}).items():
+                try:
+                    normalized = str(key or '').strip().lower()
+                    if not normalized:
+                        continue
+                    if normalized in reserved:
+                        macro_errors.append("%s 与启动/急停热键冲突" % normalized)
+                        continue
+                    if not os.path.isfile(path):
+                        macro_errors.append("宏文件不存在：%s" % os.path.basename(path))
+                        continue
+                    kb.add_hotkey(
+                        normalized,
+                        lambda p=path: self._hotkey_queue.put(('macro', p)))
+                    self._hk_keys.append(normalized)
+                    macro_keys.append(normalized)
+                except Exception as exc:
+                    macro_errors.append("%s：%s" % (str(key), exc))
             self._hotkey_state = {
                 'available': True, 'registered': True,
-                'keys': [start_k, emer_k, 'esc'],
+                'keys': [start_k, emer_k, 'esc'] + macro_keys,
                 'start': start_k, 'emergency': emer_k, 'error': '',
+                'macro_keys': macro_keys, 'macro_errors': macro_errors,
             }
-            print("快捷键已注册：启动=" + start_k + "，紧急停止=" + emer_k + "，Esc")
+            print("快捷键已注册：启动=" + start_k + "，紧急停止=" + emer_k +
+                  "，Esc，宏热键=" + str(len(macro_keys)))
+            if macro_errors:
+                print("部分宏热键未注册：" + "；".join(macro_errors))
         except Exception as e:
             # 部分注册成功时必须回收，避免半注册状态让 F6 或 F8 失效
             for k in list(self._hk_keys):
@@ -4134,6 +4483,7 @@ class AutoClicker:
             self._hotkey_state = {
                 'available': True, 'registered': False, 'keys': [],
                 'start': start_k, 'emergency': emer_k, 'error': str(e),
+                'macro_keys': [], 'macro_errors': macro_errors,
             }
             print("注册快捷键失败: " + str(e))
 
@@ -4142,7 +4492,9 @@ class AutoClicker:
         try:
             while True:
                 action = self._hotkey_queue.get_nowait()
-                if action == 'toggle':
+                if isinstance(action, tuple) and action and action[0] == 'macro':
+                    self._start_macro_by_path(action[1])
+                elif action == 'toggle':
                     self.toggle_clicking()
                 elif action == 'emergency':
                     self.emergency_stop()
@@ -5498,6 +5850,13 @@ class AutoClicker:
             for widget in (self.macro_name_entry, self.macro_speed_spin,
                            self.macro_loop_spin):
                 widget.config(state=tk.NORMAL if idle else tk.DISABLED)
+            lib_row = getattr(self, 'macro_lib_row', None)
+            if lib_row is not None:
+                for child in lib_row.winfo_children():
+                    if isinstance(child, ttk.Button):
+                        child.config(state=tk.NORMAL if idle else tk.DISABLED)
+                    elif isinstance(child, ttk.Entry):
+                        child.config(state=tk.NORMAL if idle else tk.DISABLED)
         except Exception:
             pass
 
@@ -5547,6 +5906,9 @@ class AutoClicker:
         except Exception as exc:
             self._macro_set_status("读取宏目录失败：" + str(exc), 'danger')
             self._macro_set_detail(str(exc))
+        if getattr(self, 'macro_recent_var', None) is not None:
+            self.macro_recent_var.set(
+                _macro.recent_label(self._macro_recent, self.macro_dir))
         self._macro_update_controls()
 
     def on_macro_selected(self, quiet=False):
@@ -5560,6 +5922,9 @@ class AutoClicker:
             steps = len(data['steps'])
             duration = _macro.duration_ms(data)
             self._macro_set_preview(_macro.preview_lines(data, limit=5))
+            if getattr(self, 'macro_hotkey_var', None) is not None:
+                self.macro_hotkey_var.set(self._macro_hotkey_bindings.get(
+                    os.path.abspath(entry['path']), ''))
             if not quiet:
                 self._macro_set_status("已选择宏：%s" % data['name'], 'primary')
             self._macro_set_detail("共 %d 步 · 预计 %s · %s" % (
@@ -5577,6 +5942,206 @@ class AutoClicker:
             self._macro_set_detail(str(exc))
             self._macro_set_preview("")
         self._macro_update_controls()
+
+    def _macro_entry_for_path(self, path):
+        try:
+            target = os.path.abspath(path)
+            for entry in self._macro_entries:
+                if os.path.abspath(entry.get('path', '')) == target:
+                    return entry
+        except Exception:
+            pass
+        return None
+
+    def _select_macro_path(self, path):
+        entry = self._macro_entry_for_path(path)
+        if entry is None:
+            self.refresh_macro_list(select_path=path, quiet=True)
+            entry = self._macro_entry_for_path(path)
+        if entry is None:
+            return False
+        try:
+            index = self._macro_entries.index(entry)
+            self.macro_combo.current(index)
+            self.on_macro_selected(quiet=True)
+            return True
+        except Exception:
+            return False
+
+    def _macro_touch_recent(self, path):
+        try:
+            self._macro_recent = _macro.push_recent(self._macro_recent, path)
+            self.config['macro_recent'] = self._macro_recent
+            self.save_config()
+            if getattr(self, 'macro_recent_var', None) is not None:
+                self.macro_recent_var.set(
+                    _macro.recent_label(self._macro_recent, self.macro_dir))
+        except Exception as exc:
+            self.log_message("记录宏最近使用失败：" + str(exc))
+
+    def _start_macro_by_path(self, path):
+        """宏热键入口：选中指定宏后走与按钮相同的 3 秒倒计时与安全校验。"""
+        if not self._select_macro_path(path):
+            self._macro_set_status("宏热键指向的文件不存在", 'danger')
+            self._macro_set_detail(str(path))
+            self.log_message("宏热键忽略：文件不存在 %s" % path)
+            return
+        self.start_macro_playback()
+
+    def rename_macro(self):
+        entry = self._current_macro_entry()
+        if entry is None:
+            return
+        try:
+            from tkinter import simpledialog
+            old_name = entry.get('name') or os.path.splitext(
+                os.path.basename(entry.get('path', '')))[0]
+            name = simpledialog.askstring(
+                "重命名宏", "输入新的宏名称：", initialvalue=old_name, parent=self.root)
+            if not name:
+                return
+            old_path = entry['path']
+            new_path, data = _macro.rename_macro(old_path, name, self.macro_dir)
+            hotkey = self._macro_hotkey_bindings.pop(
+                os.path.abspath(old_path), None)
+            if hotkey:
+                self._macro_hotkey_bindings[os.path.abspath(new_path)] = hotkey
+            self.config['macro_hotkeys'] = self._macro_hotkey_bindings
+            self._macro_recent = [
+                dict(item, path=new_path)
+                if os.path.abspath(item.get('path', '')) == os.path.abspath(old_path)
+                else item for item in self._macro_recent]
+            self.config['macro_recent'] = self._macro_recent
+            self.save_config()
+            self.refresh_macro_list(select_path=new_path, quiet=True)
+            if hotkey:
+                self._register_hotkeys()
+            self._macro_set_status("已重命名：%s" % data['name'], 'success')
+            self.log_message("宏已重命名：%s → %s" % (old_path, new_path))
+        except _macro.MacroError as exc:
+            self._macro_set_status("重命名失败：" + str(exc), 'danger')
+        except Exception as exc:
+            self._macro_set_status("重命名失败：" + str(exc), 'danger')
+            self.log_message("重命名宏失败：" + str(exc))
+
+    def delete_macro(self):
+        entry = self._current_macro_entry()
+        if entry is None:
+            return
+        try:
+            name = entry.get('name') or os.path.basename(entry['path'])
+            if not messagebox.askyesno("删除宏", "确认删除“%s”？此操作不可恢复。" % name):
+                return
+            path = entry['path']
+            _macro.delete_macro(path)
+            self._macro_hotkey_bindings.pop(os.path.abspath(path), None)
+            self.config['macro_hotkeys'] = self._macro_hotkey_bindings
+            self._macro_recent = [
+                item for item in self._macro_recent
+                if os.path.abspath(item.get('path', '')) != os.path.abspath(path)]
+            self.config['macro_recent'] = self._macro_recent
+            self.save_config()
+            self._register_hotkeys()
+            self.refresh_macro_list(quiet=True)
+            if getattr(self, 'macro_recent_var', None) is not None:
+                self.macro_recent_var.set(
+                    _macro.recent_label(self._macro_recent, self.macro_dir))
+            self._macro_set_status("已删除宏：%s" % name, 'muted')
+            self.log_message("宏已删除：%s" % path)
+        except Exception as exc:
+            self._macro_set_status("删除宏失败：" + str(exc), 'danger')
+            self.log_message("删除宏失败：" + str(exc))
+
+    def export_macro(self):
+        entry = self._current_macro_entry()
+        if entry is None:
+            return
+        try:
+            from tkinter import filedialog
+            path = filedialog.asksaveasfilename(
+                title="导出宏", defaultextension='.json',
+                initialfile=(entry.get('name') or 'macro') + '.json',
+                filetypes=[("JSON 文件", JSON_FILE_PATTERN), ("所有文件", "*.*")])
+            if not path:
+                return
+            _macro.export_macro(entry['path'], path)
+            self._macro_set_status("已导出宏：%s" % os.path.basename(path), 'success')
+            self.log_message("宏已导出：%s" % path)
+        except Exception as exc:
+            self._macro_set_status("导出宏失败：" + str(exc), 'danger')
+
+    def import_macro(self):
+        try:
+            from tkinter import filedialog
+            path = filedialog.askopenfilename(
+                title="导入宏", filetypes=[
+                    ("JSON 文件", JSON_FILE_PATTERN), ("所有文件", "*.*")])
+            if not path:
+                return
+            new_path, data = _macro.import_macro(path, self.macro_dir)
+            self.refresh_macro_list(select_path=new_path, quiet=True)
+            self._macro_set_status("已导入宏：%s" % data['name'], 'success')
+            self.log_message("宏已导入：%s" % new_path)
+        except Exception as exc:
+            messagebox.showerror("导入宏", "导入失败：" + str(exc))
+
+    def apply_macro_hotkey(self):
+        entry = self._current_macro_entry()
+        if entry is None:
+            self._macro_set_status("先选择一个宏，再绑定热键", 'danger')
+            return
+        key = (self.macro_hotkey_var.get() or '').strip().lower()
+        _, _, normalized, parse_error = _hotkey_parse(key)
+        if parse_error:
+            self._macro_set_status("宏热键无效：" + parse_error, 'danger')
+            return
+        reserved = {
+            str(self.config.get('hotkey_start', 'f6')).lower(),
+            str(self.config.get('hotkey_emergency', 'f8')).lower(), 'esc',
+        }
+        for bound_path, bound_key in self._macro_hotkey_bindings.items():
+            if (str(bound_key).lower() == normalized
+                    and os.path.abspath(bound_path) != os.path.abspath(entry['path'])):
+                self._macro_set_status(
+                    "热键 %s 已绑定给另一个宏，请先解除" % normalized, 'danger')
+                return
+        if normalized in reserved:
+            self._macro_set_status(
+                "热键 %s 已被启动/急停占用，不能绑定给宏" % normalized, 'danger')
+            return
+        old = dict(self._macro_hotkey_bindings)
+        self._macro_hotkey_bindings[os.path.abspath(entry['path'])] = normalized
+        self.config['macro_hotkeys'] = self._macro_hotkey_bindings
+        self.save_config()
+        self._register_hotkeys()
+        state = getattr(self, '_hotkey_state', {}) or {}
+        macro_errors = state.get('macro_errors') or []
+        if macro_errors:
+            self._macro_hotkey_bindings = old
+            self.config['macro_hotkeys'] = old
+            self.save_config()
+            self._register_hotkeys()
+            self._macro_set_status(
+                "绑定失败：%s" % '; '.join(macro_errors), 'danger')
+            return
+        self._macro_set_status("已绑定宏热键：%s = %s" % (
+            entry.get('name') or os.path.basename(entry['path']), normalized), 'success')
+        self.log_message("宏热键已绑定：%s → %s" % (normalized, entry['path']))
+
+    def clear_macro_hotkey(self):
+        entry = self._current_macro_entry()
+        if entry is None:
+            return
+        key = os.path.abspath(entry['path'])
+        if key not in self._macro_hotkey_bindings:
+            self._macro_set_status("当前宏未绑定热键", 'muted')
+            return
+        self._macro_hotkey_bindings.pop(key, None)
+        self.config['macro_hotkeys'] = self._macro_hotkey_bindings
+        self.save_config()
+        self._register_hotkeys()
+        self.macro_hotkey_var.set('')
+        self._macro_set_status("宏热键已解除", 'muted')
 
     def open_macro_dir(self):
         try:
@@ -5954,6 +6519,7 @@ class AutoClicker:
             return
         self._macro_last_macro = data
         self._macro_last_path = entry['path']
+        self._macro_touch_recent(entry['path'])
         self._macro_pending_play = (data, entry['path'], speed, loop)
         self._macro_play_bounds = data.get('screen') or self._macro_screen_bounds()
         self._macro_play_countdown_active = True
