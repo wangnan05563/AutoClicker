@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$ExePath = (Join-Path $PSScriptRoot '..\release\dist\AutoClicker\AutoClicker.exe'),
     [int]$StartupTimeoutSeconds = 180,
     [int]$ExitTimeoutSeconds = 30

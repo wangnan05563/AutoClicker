@@ -59,6 +59,7 @@ from auto_clicker_layers import onboarding as _onboarding
 from auto_clicker_layers import run_report as _run_report
 from auto_clicker_layers import diagnostics as _diagnostics
 from auto_clicker_layers import dashboard as _dashboard
+from auto_clicker_layers import macro as _macro
 
 # 点击抖动使用系统安全随机源，避免可预测的伪随机序列
 _RANDOM = random.SystemRandom()
@@ -382,6 +383,39 @@ class AutoClicker:
         self._ring_progress = 0.0
         self._ring_headline = '已停止'
         self._ring_subtext = '等待开始'
+
+        # FR-13：宏文件与录制/回放运行态。录制只保存离散点击/按键/延时，
+        # 不记录鼠标连续轨迹；文件放用户目录，避免安装目录只读。
+        self.macro_dir = os.path.expanduser(
+            os.environ.get('AUTOCLICKER_MACRO_DIR') or '~/.auto_clicker_macros')
+        self._macro_entries = []
+        self._macro_recorder = None
+        self._macro_capture = None
+        self._macro_recording = False
+        self._macro_record_after_id = None
+        self._macro_record_countdown_active = False
+        self._macro_record_countdown_left = 0
+        self._macro_record_started_at = 0.0
+        self._macro_record_tick_id = None
+        self._macro_player = None
+        self._macro_play_thread = None
+        self._macro_playing = False
+        self._macro_play_after_id = None
+        self._macro_play_countdown_active = False
+        self._macro_play_countdown_left = 0
+        self._macro_play_token = 0
+        self._macro_play_bounds = None
+        self._macro_play_started_at = 0.0
+        self._macro_play_total_steps = 0
+        self._macro_play_loop = 1
+        self._macro_record_tray_active = False
+        self._macro_key_lock = threading.Lock()
+        self._macro_pressed_keys = set()
+        self._macro_last_macro = None
+        self._macro_last_path = ''
+        self._macro_record_name = ''
+        self._macro_pending_play = None
+        self._macro_status_kind = 'muted'
 
         self.load_config()
         # FR-26：运行台“会话保持”开关与规则页共用同一个变量，必须先于 setup_ui 创建
@@ -1412,6 +1446,19 @@ class AutoClicker:
             if getattr(self, 'log_text', None):
                 try:
                     self.log_text.configure(bg=pal['surface'], fg=pal['fg'])
+                except Exception:
+                    pass
+            # FR-13：宏预览与状态色随主题刷新
+            if getattr(self, 'macro_preview', None):
+                try:
+                    self.macro_preview.configure(bg=pal['surface'], fg=pal['fg'])
+                except Exception:
+                    pass
+            if getattr(self, 'macro_status_label', None):
+                try:
+                    self._macro_set_status(
+                        self.macro_status_var.get(),
+                        getattr(self, '_macro_status_kind', 'muted'))
                 except Exception:
                     pass
             # FR-03：诊断卡片状态色与详情窗口随主题刷新
@@ -3648,6 +3695,107 @@ class AutoClicker:
         ttk.Button(sys_row, text="打开日志目录", command=self.open_log_dir).pack(side=tk.LEFT, padx=(10, 0))
         ttk.Button(sys_row, text="导出运行统计", command=self.export_run_stats).pack(side=tk.LEFT, padx=(10, 0))
 
+        # ==================== 记录：录制与回放（FR-13） ====================
+        self.macro_card = ttk.LabelFrame(
+            self.records_page, text="录制与回放（FR-13）", padding="10")
+        self.macro_card.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(
+            self.macro_card,
+            text="只记录点击、按键与延时，不记录鼠标连续轨迹；录制/回放期间请先停止自动点击。"
+                 "Esc / F8 可随时急停，录制结束自动保存为可读 JSON。",
+            font=('微软雅黑', 8), foreground=self._color('muted'),
+            wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, fill=tk.X)
+
+        macro_record_row = ttk.Frame(self.macro_card)
+        macro_record_row.pack(fill=tk.X, pady=(8, 3))
+        ttk.Label(macro_record_row, text="宏名称").pack(side=tk.LEFT)
+        self.macro_name_var = tk.StringVar(
+            value=_macro.sanitize_macro_name(
+                'macro-' + datetime.now().strftime('%Y%m%d-%H%M%S')))
+        self.macro_name_entry = ttk.Entry(
+            macro_record_row, textvariable=self.macro_name_var, width=20)
+        self.macro_name_entry.pack(side=tk.LEFT, padx=(4, 8))
+        self.macro_record_btn = ttk.Button(
+            macro_record_row, text="开始录制（3 秒）", width=13,
+            command=self.start_macro_recording)
+        self.macro_record_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self.macro_record_pause_btn = ttk.Button(
+            macro_record_row, text="暂停", width=6,
+            command=self.toggle_macro_recording_pause, state=tk.DISABLED)
+        self.macro_record_pause_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self.macro_record_stop_btn = ttk.Button(
+            macro_record_row, text="停止并保存", width=11,
+            command=lambda: self.stop_macro_recording(
+                save=True, reason='手动停止录制'),
+            state=tk.DISABLED)
+        self.macro_record_stop_btn.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(macro_record_row, text="打开宏目录", width=11,
+                   command=self.open_macro_dir).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(macro_record_row, text="诊断", width=6,
+                   command=self.show_diagnostics_window).pack(side=tk.LEFT)
+
+        macro_play_row = ttk.Frame(self.macro_card)
+        macro_play_row.pack(fill=tk.X, pady=(3, 3))
+        ttk.Label(macro_play_row, text="宏文件").pack(side=tk.LEFT)
+        self.macro_combo = ttk.Combobox(
+            macro_play_row, state='readonly', width=23, values=[])
+        self.macro_combo.pack(side=tk.LEFT, padx=(4, 4))
+        self.macro_combo.bind('<<ComboboxSelected>>',
+                              lambda event: self.on_macro_selected())
+        ttk.Button(macro_play_row, text="刷新", width=5,
+                   command=self.refresh_macro_list).pack(side=tk.LEFT, padx=(0, 6))
+        self.macro_play_btn = ttk.Button(
+            macro_play_row, text="回放（3 秒）", width=12,
+            command=self.start_macro_playback)
+        self.macro_play_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self.macro_play_pause_btn = ttk.Button(
+            macro_play_row, text="暂停回放", width=9,
+            command=self.toggle_macro_playback_pause, state=tk.DISABLED)
+        self.macro_play_pause_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self.macro_play_stop_btn = ttk.Button(
+            macro_play_row, text="停止回放", width=9,
+            command=lambda: self.stop_macro_playback(
+                reason='手动停止回放'), state=tk.DISABLED)
+        self.macro_play_stop_btn.pack(side=tk.LEFT)
+
+        macro_option_row = ttk.Frame(self.macro_card)
+        macro_option_row.pack(fill=tk.X, pady=(3, 5))
+        ttk.Label(macro_option_row, text="速度").pack(side=tk.LEFT)
+        self.macro_speed_var = tk.StringVar(value='1.0')
+        self.macro_speed_spin = ttk.Spinbox(
+            macro_option_row, from_=0.5, to=2.0, increment=0.5,
+            width=5, textvariable=self.macro_speed_var)
+        self.macro_speed_spin.pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Label(macro_option_row, text="x（0.5–2.0）").pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(macro_option_row, text="循环").pack(side=tk.LEFT)
+        self.macro_loop_var = tk.StringVar(value='1')
+        self.macro_loop_spin = ttk.Spinbox(
+            macro_option_row, from_=1, to=99, increment=1,
+            width=4, textvariable=self.macro_loop_var)
+        self.macro_loop_spin.pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Label(macro_option_row, text="次").pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(macro_option_row, text="宏文件目录：" + self.macro_dir,
+                  font=('微软雅黑', 8), foreground=self._color('muted')).pack(
+                      side=tk.LEFT)
+
+        self.macro_status_var = tk.StringVar(value="尚未录制或选择宏文件")
+        self.macro_status_label = ttk.Label(
+            self.macro_card, textvariable=self.macro_status_var,
+            font=('微软雅黑', 9, 'bold'), foreground=self._color('muted'))
+        self.macro_status_label.pack(anchor=tk.W, pady=(2, 1))
+        self.macro_detail_var = tk.StringVar(value="")
+        self.macro_detail_label = ttk.Label(
+            self.macro_card, textvariable=self.macro_detail_var,
+            font=('微软雅黑', 8), foreground=self._color('muted'),
+            wraplength=760, justify=tk.LEFT)
+        self.macro_detail_label.pack(anchor=tk.W, fill=tk.X, pady=(0, 4))
+
+        self.macro_preview = tk.Text(
+            self.macro_card, height=5, state=tk.DISABLED,
+            font=('Consolas', 8), bg=self._color('surface'), fg=self._color('fg'),
+            relief=tk.FLAT, padx=5, pady=3, highlightthickness=0)
+        self.macro_preview.pack(fill=tk.X)
+
         # ==================== 日志区域 ====================
         self.log_card = ttk.LabelFrame(self.records_page, text="运行日志", padding="10")
         self.log_card.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
@@ -3789,6 +3937,8 @@ class AutoClicker:
 
         # 更新状态标签引用
         self.status_label = self.status_text_label
+        self._macro_update_controls()
+        self.refresh_macro_list()
         self._apply_ui_mode()
         self._show_page('run')
         
@@ -4542,6 +4692,11 @@ class AutoClicker:
         if not self.input_ok:
             messagebox.showerror("启动已禁用", self.input_reason)
             return
+        # FR-13：录制/回放占用真实输入时，不允许自动点击同时启动。
+        if self._macro_ui_busy():
+            self.show_operation_message(
+                "录制或回放宏正在进行，请先停止后再启动自动点击。", level='operation')
+            return
         try:
             interval = self._read_interval()
             if interval is None:
@@ -4768,9 +4923,16 @@ class AutoClicker:
                     pass
 
     def emergency_stop(self):
-        """P0 独立急停（CX-01）：仅作为停止入口，统一走 stop_clicking(reason)"""
+        """P0 独立急停（CX-01）：停止自动点击；FR-13 录制/回放同样走这里。"""
+        reason = "用户按下紧急停止键 (F8/Esc)"
+        if self._macro_record_countdown_active or self._macro_recording:
+            self.stop_macro_recording(save=True, reason=reason)
+            return
+        if self._macro_play_countdown_active or self._macro_playing:
+            self.stop_macro_playback(reason=reason)
+            return
         if self.is_running:
-            self.stop_clicking(reason="用户按下紧急停止键 (F8/Esc)")
+            self.stop_clicking(reason=reason)
             
     def toggle_clicking(self):
         if self.is_running:
@@ -4892,6 +5054,799 @@ class AutoClicker:
         except Exception:
             pass
 
+    # ==================== FR-13 录制与回放 ====================
+    def _macro_ui_busy(self):
+        """录制倒计时、录制中、回放倒计时或回放线程任一存在即视为占用。"""
+        thread = getattr(self, '_macro_play_thread', None)
+        return bool(
+            self._macro_recording
+            or self._macro_record_countdown_active
+            or self._macro_playing
+            or self._macro_play_countdown_active
+            or (thread is not None and thread.is_alive()))
+
+    def _macro_set_status(self, text, kind='muted'):
+        try:
+            self._macro_status_kind = kind
+            colors = {
+                'primary': self._color('primary'),
+                'success': self._color('success'),
+                'warning': self._color('warning'),
+                'danger': self._color('danger'),
+                'muted': self._color('muted'),
+            }
+            self.macro_status_var.set(text)
+            self.macro_status_label.config(foreground=colors.get(kind, colors['muted']))
+        except Exception:
+            pass
+
+    def _macro_set_detail(self, text):
+        try:
+            self.macro_detail_var.set(str(text or ''))
+        except Exception:
+            pass
+
+    def _macro_set_preview(self, text):
+        try:
+            self.macro_preview.config(state=tk.NORMAL)
+            self.macro_preview.delete('1.0', tk.END)
+            if text:
+                self.macro_preview.insert('1.0', text)
+            self.macro_preview.config(state=tk.DISABLED)
+        except Exception:
+            pass
+
+    def _macro_update_controls(self):
+        """按录制/回放/自动点击状态统一启停按钮，避免入口互相踩踏。"""
+        try:
+            busy = self._macro_ui_busy()
+            active = busy or bool(getattr(self, 'is_running', False))
+            idle = not active
+            self.macro_record_btn.config(
+                state=tk.NORMAL if idle else tk.DISABLED)
+            self.macro_record_pause_btn.config(
+                state=tk.NORMAL if self._macro_recording else tk.DISABLED,
+                text="继续" if getattr(self._macro_recorder, 'paused', False) else "暂停")
+            self.macro_record_stop_btn.config(
+                state=tk.NORMAL if (self._macro_recording
+                                   or self._macro_record_countdown_active) else tk.DISABLED,
+                text="停止并保存" if self._macro_recording else "取消倒计时")
+            self.macro_combo.config(state='readonly' if idle else 'disabled')
+            self.macro_play_btn.config(
+                state=tk.NORMAL if (idle and self._macro_entries) else tk.DISABLED)
+            self.macro_play_pause_btn.config(
+                state=tk.NORMAL if self._macro_playing else tk.DISABLED,
+                text="继续回放" if getattr(self._macro_player, 'paused', False) else "暂停回放")
+            self.macro_play_stop_btn.config(
+                state=tk.NORMAL if (self._macro_playing
+                                   or self._macro_play_countdown_active) else tk.DISABLED)
+            for widget in (self.macro_name_entry, self.macro_speed_spin,
+                           self.macro_loop_spin):
+                widget.config(state=tk.NORMAL if idle else tk.DISABLED)
+        except Exception:
+            pass
+
+    def _current_macro_entry(self):
+        try:
+            values = list(self.macro_combo['values'])
+            if not values or not self._macro_entries:
+                return None
+            index = int(self.macro_combo.current())
+            if index < 0 or index >= len(self._macro_entries):
+                return None
+            return self._macro_entries[index]
+        except Exception:
+            return None
+
+    def _macro_entry_label(self, entry):
+        name = entry.get('name') or os.path.basename(entry.get('path', ''))
+        return name if entry.get('valid') else name + ' [损坏]'
+
+    def refresh_macro_list(self, select_path=None, quiet=False):
+        """重新扫描宏目录；坏文件保留在列表中，便于行内看到错误原因。"""
+        try:
+            os.makedirs(self.macro_dir, exist_ok=True)
+            self._macro_entries = _macro.list_macros(self.macro_dir)
+            labels = [self._macro_entry_label(entry) for entry in self._macro_entries]
+            self.macro_combo['values'] = labels
+            target = select_path or self._macro_last_path
+            select_index = -1
+            for index, entry in enumerate(self._macro_entries):
+                if target and os.path.abspath(entry['path']) == os.path.abspath(target):
+                    select_index = index
+                    break
+            if select_index < 0 and self._macro_entries:
+                select_index = 0
+            if select_index >= 0:
+                self.macro_combo.current(select_index)
+                self.on_macro_selected(quiet=quiet)
+            else:
+                self.macro_combo.set('')
+                self._macro_last_macro = None
+                self._macro_last_path = ''
+                self._macro_set_preview('')
+                if not quiet:
+                    self._macro_set_status("宏目录中还没有宏文件，先录制一个。", 'muted')
+                    self._macro_set_detail(
+                        "宏目录：" + self.macro_dir + "；文件可手工编辑后重新回放。")
+        except Exception as exc:
+            self._macro_set_status("读取宏目录失败：" + str(exc), 'danger')
+            self._macro_set_detail(str(exc))
+        self._macro_update_controls()
+
+    def on_macro_selected(self, quiet=False):
+        entry = self._current_macro_entry()
+        if entry is None:
+            return
+        self._macro_last_path = entry.get('path', '')
+        try:
+            data = _macro.load_macro(entry['path'])
+            self._macro_last_macro = data
+            steps = len(data['steps'])
+            duration = _macro.duration_ms(data)
+            self._macro_set_preview(_macro.preview_lines(data, limit=5))
+            if not quiet:
+                self._macro_set_status("已选择宏：%s" % data['name'], 'primary')
+            self._macro_set_detail("共 %d 步 · 预计 %s · %s" % (
+                steps, _macro.format_duration(duration), entry['path']))
+        except _macro.MacroError as exc:
+            self._macro_last_macro = None
+            self._macro_set_status("宏文件损坏，无法回放", 'danger')
+            self._macro_set_detail("行内诊断：%s；可点“诊断”查看环境检查。" % exc)
+            self._macro_set_preview("")
+            if not quiet:
+                self.log_message("宏文件损坏：%s（%s）" % (entry['path'], exc))
+        except Exception as exc:
+            self._macro_last_macro = None
+            self._macro_set_status("宏文件读取失败", 'danger')
+            self._macro_set_detail(str(exc))
+            self._macro_set_preview("")
+        self._macro_update_controls()
+
+    def open_macro_dir(self):
+        try:
+            os.makedirs(self.macro_dir, exist_ok=True)
+            if IS_WINDOWS:
+                os.startfile(self.macro_dir)
+            elif IS_LINUX:
+                import subprocess
+                subprocess.Popen(['xdg-open', self.macro_dir])
+            else:
+                messagebox.showinfo("宏目录", self.macro_dir)
+        except Exception as exc:
+            self._macro_set_status("打开宏目录失败：" + str(exc), 'danger')
+            self._macro_set_detail(str(exc))
+
+    def _macro_read_speed(self):
+        try:
+            value = float(self.macro_speed_var.get())
+            if value < _macro.MIN_SPEED or value > _macro.MAX_SPEED:
+                raise ValueError
+            return value
+        except (TypeError, ValueError):
+            self._macro_set_status(
+                "速度必须在 0.5–2.0 之间（每档 0.5x）。", 'danger')
+            self._macro_set_detail("修改“速度”后再点回放；不会启动任何输入。")
+            return None
+
+    def _macro_read_loop(self):
+        try:
+            value = int(self.macro_loop_var.get())
+            if value < 1 or value > _macro.MAX_LOOP_COUNT:
+                raise ValueError
+            return value
+        except (TypeError, ValueError):
+            self._macro_set_status(
+                "循环次数必须在 1–99 之间。", 'danger')
+            self._macro_set_detail("修改“循环”后再点回放；不会启动任何输入。")
+            return None
+
+    def _macro_screen_bounds(self):
+        """当前虚拟屏范围；Windows 多显示器用 SM_*VIRTUALSCREEN，其他平台退回 Tk。"""
+        try:
+            if IS_WINDOWS and HAS_WIN32API:
+                return {
+                    'left': int(win32api.GetSystemMetrics(76)),
+                    'top': int(win32api.GetSystemMetrics(77)),
+                    'width': int(win32api.GetSystemMetrics(78)),
+                    'height': int(win32api.GetSystemMetrics(79)),
+                }
+        except Exception:
+            pass
+        try:
+            return {
+                'left': int(self.root.winfo_vrootx()),
+                'top': int(self.root.winfo_vrooty()),
+                'width': max(1, int(self.root.winfo_vrootwidth())),
+                'height': max(1, int(self.root.winfo_vrootheight())),
+            }
+        except Exception:
+            return {'left': 0, 'top': 0, 'width': 1280, 'height': 720}
+
+    def _macro_ignore_hwnd(self):
+        """录制时忽略 AutoClicker 自身窗口上的点击，避免把操作界面录进去。"""
+        if not (IS_WINDOWS and HAS_WIN32GUI):
+            return None
+        try:
+            hwnd = int(self.root.winfo_id())
+            return int(win32gui.GetAncestor(hwnd, 2)) or hwnd
+        except Exception:
+            try:
+                return int(self.root.winfo_id())
+            except Exception:
+                return None
+
+    def start_macro_recording(self):
+        if self._macro_ui_busy():
+            self._macro_set_status("已有录制或回放正在进行。", 'danger')
+            self._macro_set_detail("先停止当前录制/回放，再开始新的录制。")
+            return
+        if getattr(self, 'is_running', False):
+            self._macro_set_status("自动点击运行中，不能开始录制。", 'danger')
+            self._macro_set_detail("请先按 F6 或“停止”结束自动点击，再录制宏。")
+            return
+        name = self.macro_name_var.get().strip()
+        if not name:
+            name = 'macro-' + datetime.now().strftime('%Y%m%d-%H%M%S')
+            self.macro_name_var.set(name)
+        self._macro_record_name = _macro.sanitize_macro_name(name)
+        self._macro_record_countdown_active = True
+        self._macro_record_countdown_left = 3
+        self._macro_set_status("3 秒后开始录制，请切换到目标窗口…", 'warning')
+        self._macro_set_detail("只记录点击/按键/延时，不记录鼠标轨迹；Esc/F8 停止并保存。")
+        self._macro_set_preview("")
+        self._do_set_status("录制倒计时", self._color('danger'))
+        self.log_message("宏录制：3 秒倒计时开始（只记录离散动作）")
+        self._macro_update_controls()
+        self._macro_record_countdown_tick()
+
+    def _macro_record_countdown_tick(self):
+        if not self._macro_record_countdown_active:
+            return
+        try:
+            if self._macro_record_countdown_left > 0:
+                self._macro_set_status(
+                    "录制倒计时 %d 秒…" % self._macro_record_countdown_left, 'warning')
+                self._do_set_status(
+                    "录制倒计时 %d" % self._macro_record_countdown_left,
+                    self._color('danger'))
+                self._macro_record_countdown_left -= 1
+                self._macro_record_after_id = self.root.after(
+                    1000, self._macro_record_countdown_tick)
+                return
+            self._macro_record_after_id = None
+            self._macro_record_countdown_active = False
+            self._begin_macro_recording()
+        except Exception as exc:
+            self._macro_record_countdown_active = False
+            self._macro_set_status("开始录制失败：" + str(exc), 'danger')
+            self._macro_set_detail(str(exc))
+            self._do_set_status("已停止", self._color('muted'))
+            self._macro_update_controls()
+
+    def _begin_macro_recording(self):
+        try:
+            from auto_clicker_layers.input_capture import InputCapture
+            screen = self._macro_screen_bounds()
+            self._macro_recorder = _macro.MacroRecorder(
+                self._macro_record_name, screen=screen)
+            self._macro_recorder.start()
+            self._macro_recording = True
+            self._macro_record_started_at = time.monotonic()
+            self._macro_capture = InputCapture(
+                self._on_macro_input_event,
+                excluded_keys=[
+                    self.config.get('hotkey_start', 'f6'),
+                    self.config.get('hotkey_emergency', 'f8'),
+                ],
+                ignore_hwnd=self._macro_ignore_hwnd(),
+            )
+            capture_ok = self._macro_capture.start()
+            self._macro_set_status("录制中：0 步", 'danger')
+            detail = "只记录点击/按键/延时；Esc/F8 停止并保存。"
+            if not capture_ok and self._macro_capture.error:
+                detail += " 键盘监听不可用：" + self._macro_capture.error
+                self.log_message("宏录制：键盘监听不可用，鼠标动作仍会记录（%s）" % (
+                    self._macro_capture.error))
+            self._macro_set_detail(detail)
+            self._do_set_status("录制中", self._color('danger'))
+            self._set_tray_recording(True)
+            self._macro_update_controls()
+            self._macro_record_tick()
+            self.log_message("宏录制已开始：%s（鼠标 20ms 轮询 + 键盘 hook）" % (
+                self._macro_recorder.name))
+        except Exception as exc:
+            self._macro_recording = False
+            self._macro_recorder = None
+            self._macro_capture = None
+            self._macro_set_status("开始录制失败：" + str(exc), 'danger')
+            self._macro_set_detail(str(exc))
+            self._do_set_status("已停止", self._color('muted'))
+            self.log_message("宏录制启动失败：" + str(exc))
+            self._macro_update_controls()
+
+    def _macro_record_tick(self):
+        recorder = self._macro_recorder
+        if not self._macro_recording or recorder is None:
+            return
+        try:
+            if recorder.should_stop:
+                self.stop_macro_recording(
+                    save=True, reason='达到最大步数 %d' % _macro.MAX_STEPS)
+                return
+            elapsed = time.monotonic() - self._macro_record_started_at
+            if recorder.paused:
+                self._macro_set_status(
+                    "录制已暂停：%d 步" % recorder.step_count, 'warning')
+            else:
+                self._macro_set_status(
+                    "录制中：%d 步" % recorder.step_count, 'danger')
+            detail = "已录 %s；只记录点击/按键/延时；Esc/F8 停止并保存。" % (
+                _macro.format_duration(int(elapsed * 1000)))
+            if getattr(self._macro_capture, 'error', ''):
+                detail += " 键盘监听不可用。"
+            if getattr(self._macro_capture, 'mouse_error', ''):
+                detail += " " + self._macro_capture.mouse_error + "。"
+            self._macro_set_detail(detail)
+            self._macro_record_tick_id = self.root.after(500, self._macro_record_tick)
+        except Exception:
+            pass
+
+    def toggle_macro_recording_pause(self):
+        recorder = self._macro_recorder
+        if not self._macro_recording or recorder is None:
+            return
+        try:
+            if recorder.paused:
+                recorder.resume()
+                self._macro_set_status("录制中：%d 步" % recorder.step_count, 'danger')
+                self.log_message("宏录制已继续")
+            else:
+                recorder.pause()
+                self._macro_set_status(
+                    "录制已暂停：%d 步" % recorder.step_count, 'warning')
+                self.log_message("宏录制已暂停")
+            self._macro_update_controls()
+        except Exception as exc:
+            self._macro_set_status("暂停/继续失败：" + str(exc), 'danger')
+            self._macro_set_detail(str(exc))
+
+    def stop_macro_recording(self, save=True, reason=''):
+        """结束录制；save=True 且已有动作时保存为 JSON。"""
+        if self._macro_record_countdown_active:
+            self._macro_record_countdown_active = False
+            if self._macro_record_after_id is not None:
+                try:
+                    self.root.after_cancel(self._macro_record_after_id)
+                except Exception:
+                    pass
+                self._macro_record_after_id = None
+            self._macro_set_status("录制已取消（尚未开始）", 'muted')
+            self._macro_set_detail("没有创建宏文件；可重新点“开始录制”。")
+            self._do_set_status("已停止", self._color('muted'))
+            self._macro_update_controls()
+            return
+        if not self._macro_recording:
+            return
+        recorder = self._macro_recorder
+        self._macro_recording = False
+        if self._macro_record_tick_id is not None:
+            try:
+                self.root.after_cancel(self._macro_record_tick_id)
+            except Exception:
+                pass
+            self._macro_record_tick_id = None
+        if self._macro_capture is not None:
+            try:
+                self._macro_capture.stop()
+            except Exception:
+                pass
+            self._macro_capture = None
+        self._macro_recorder = None
+        self._set_tray_recording(False)
+        self._do_set_status("已停止", self._color('muted'))
+        if reason:
+            self.log_message("宏录制结束（原因：%s）" % reason)
+        try:
+            if recorder is None or recorder.step_count <= 0:
+                self._macro_set_status("没有录到动作，未保存", 'warning')
+                self._macro_set_detail("只记录点击/按键/延时；请确认没有点在 AutoClicker 自身窗口上。")
+                self._macro_update_controls()
+                return
+            if not save:
+                self._macro_set_status("录制已丢弃（未保存）", 'muted')
+                self._macro_set_detail("如需保留，请重新录制并点“停止并保存”。")
+                self._macro_update_controls()
+                return
+            data = recorder.snapshot()
+            path = _macro.unique_macro_path(self.macro_dir, data['name'])
+            saved = _macro.save_macro(path, data)
+            self._macro_last_macro = saved
+            self._macro_last_path = path
+            self.macro_name_var.set(saved['name'])
+            filename = os.path.basename(path)
+            self.refresh_macro_list(select_path=path, quiet=True)
+            self._macro_set_status("已保存：%s" % filename, 'success')
+            self._macro_set_detail("共 %d 步 · 预计 %s · %s" % (
+                len(saved['steps']), _macro.format_duration(_macro.duration_ms(saved)), path))
+            self._macro_set_preview(_macro.preview_lines(saved, limit=5))
+            self.log_message("宏已保存：%s（%d 步）" % (path, len(saved['steps'])))
+        except _macro.MacroError as exc:
+            self._macro_set_status("保存宏失败：" + str(exc), 'danger')
+            self._macro_set_detail("行内诊断：%s；可点“诊断”查看环境检查。" % exc)
+            self.log_message("宏保存失败：" + str(exc))
+        except Exception as exc:
+            self._macro_set_status("保存宏失败：" + str(exc), 'danger')
+            self._macro_set_detail(str(exc))
+            self.log_message("宏保存失败：" + str(exc))
+        self._macro_update_controls()
+
+    def _on_macro_input_event(self, event):
+        """采集线程回调：只碰线程安全缓冲，不直接访问 Tk。"""
+        if not self._macro_recording or self._macro_recorder is None:
+            return
+        try:
+            recorder = self._macro_recorder
+            if event.get('type') == 'click':
+                ok = recorder.add_click(
+                    event.get('x', 0), event.get('y', 0),
+                    event.get('button', 'left'), event.get('hold_ms', 0))
+            elif event.get('type') == 'key':
+                ok = recorder.add_key(
+                    event.get('key', ''), event.get('action', 'press'))
+            else:
+                return
+            if not ok and recorder.should_stop:
+                self._ui(self.stop_macro_recording, True,
+                         '达到最大步数 %d' % _macro.MAX_STEPS)
+        except Exception:
+            pass
+
+    def _record_tray_icon_path(self):
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+            path = os.path.join(self.log_dir, 'tray_record.ico')
+            if os.path.exists(path):
+                return path
+            from PIL import Image, ImageDraw
+            img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img)
+            draw.ellipse((4, 4, 60, 60), fill='#d92b2b', outline='#8f1111', width=3)
+            draw.rectangle((22, 22, 42, 42), fill='#ffffff')
+            img.save(path, format='ICO', sizes=[(16, 16), (32, 32), (48, 48), (64, 64)])
+            return path
+        except Exception:
+            return None
+
+    def _set_tray_recording(self, recording):
+        """录制期间把托盘图标换成红色圆点；失败不影响录制本身。"""
+        self._macro_record_tray_active = bool(recording)
+        try:
+            if IS_WINDOWS and HAS_WIN32GUI and getattr(self, 'tray_icon_created', False):
+                if recording:
+                    path = self._record_tray_icon_path()
+                    if path:
+                        hicon = win32gui.LoadImage(
+                            None, path, win32con.IMAGE_ICON, 32, 32,
+                            win32con.LR_LOADFROMFILE | win32con.LR_DEFAULTSIZE)
+                        if hicon:
+                            new_nid = self.tray_nid[:4] + (
+                                hicon, "AutoClicker - 录制中")
+                            win32gui.Shell_NotifyIcon(win32gui.NIM_MODIFY, new_nid)
+                            self.tray_nid = new_nid
+                else:
+                    self._refresh_tray_icon()
+                    self._update_tray_status(bool(getattr(self, 'is_running', False)))
+            elif IS_LINUX and getattr(self, 'tray_icon', None) is not None:
+                if recording:
+                    path = self._record_tray_icon_path()
+                    if path:
+                        from PIL import Image
+                        self.tray_icon.icon = Image.open(path)
+                    self.tray_icon.title = "AutoClicker - 录制中"
+                else:
+                    self.tray_icon.title = "AutoClicker - 已停止"
+        except Exception:
+            pass
+
+    def start_macro_playback(self):
+        if self._macro_ui_busy():
+            self._macro_set_status("已有录制或回放正在进行。", 'danger')
+            self._macro_set_detail("先停止当前录制/回放，再开始回放。")
+            return
+        if getattr(self, 'is_running', False):
+            self._macro_set_status("自动点击运行中，不能回放宏。", 'danger')
+            self._macro_set_detail("请先按 F6 或“停止”结束自动点击，再回放宏。")
+            return
+        entry = self._current_macro_entry()
+        if entry is None:
+            self.refresh_macro_list()
+            self._macro_set_status("没有可回放的宏文件。", 'danger')
+            self._macro_set_detail("先录制并保存一个宏，或点“刷新”重新扫描宏目录。")
+            return
+        try:
+            data = _macro.load_macro(entry['path'])
+        except _macro.MacroError as exc:
+            self._macro_set_status("宏文件损坏，无法回放", 'danger')
+            self._macro_set_detail("行内诊断：%s；可点“诊断”查看环境检查。" % exc)
+            self.log_message("宏回放拒绝：文件损坏 %s" % exc)
+            return
+        speed = self._macro_read_speed()
+        if speed is None:
+            return
+        loop = self._macro_read_loop()
+        if loop is None:
+            return
+        self._macro_last_macro = data
+        self._macro_last_path = entry['path']
+        self._macro_pending_play = (data, entry['path'], speed, loop)
+        self._macro_play_bounds = data.get('screen') or self._macro_screen_bounds()
+        self._macro_play_countdown_active = True
+        self._macro_play_countdown_left = 3
+        self._macro_set_status("3 秒后开始回放，请切换到目标窗口…", 'warning')
+        self._macro_set_detail("共 %d 步 · 速度 %.1fx · 循环 %d 次；Esc/F8 随时停止。" % (
+            len(data['steps']), speed, loop))
+        self._do_set_status("回放倒计时", self._color('warning'))
+        self.log_message("宏回放：3 秒倒计时（%s，%.1fx，%d 循环）" % (
+            entry['path'], speed, loop))
+        self._macro_update_controls()
+        self._macro_play_countdown_tick()
+
+    def _macro_play_countdown_tick(self):
+        if not self._macro_play_countdown_active:
+            return
+        try:
+            if self._macro_play_countdown_left > 0:
+                self._macro_set_status(
+                    "回放倒计时 %d 秒…" % self._macro_play_countdown_left, 'warning')
+                self._do_set_status(
+                    "回放倒计时 %d" % self._macro_play_countdown_left,
+                    self._color('warning'))
+                self._macro_play_countdown_left -= 1
+                self._macro_play_after_id = self.root.after(
+                    1000, self._macro_play_countdown_tick)
+                return
+            self._macro_play_after_id = None
+            self._macro_play_countdown_active = False
+            self._begin_macro_playback()
+        except Exception as exc:
+            self._macro_play_countdown_active = False
+            self._macro_playing = False
+            self._macro_player = None
+            self._macro_set_status("开始回放失败：" + str(exc), 'danger')
+            self._macro_set_detail(str(exc))
+            self._do_set_status("已停止", self._color('muted'))
+            self._macro_update_controls()
+
+    def _begin_macro_playback(self):
+        pending = self._macro_pending_play
+        self._macro_pending_play = None
+        if pending is None:
+            self._macro_set_status("回放计划已取消。", 'muted')
+            self._macro_update_controls()
+            return
+        data, path, speed, loop = pending
+        try:
+            self._macro_play_token += 1
+            token = self._macro_play_token
+            self._macro_play_started_at = time.monotonic()
+            self._macro_play_total_steps = len(data['steps'])
+            self._macro_play_loop = loop
+            self._macro_playing = True
+            self._macro_player = _macro.MacroPlayer(
+                data, self._macro_execute_step, speed=speed, loop_count=loop,
+                on_progress=lambda loop_index, step_index, total:
+                    self._macro_playback_on_progress(
+                        token, loop_index, step_index, total))
+            self._macro_play_thread = threading.Thread(
+                target=self._macro_playback_worker,
+                args=(self._macro_player, token),
+                name='macro-player', daemon=True)
+            self._macro_set_status("回放中…", 'primary')
+            self._macro_set_detail("0/%d 步 · 循环 1/%d；Esc/F8 随时停止。" % (
+                self._macro_play_total_steps, loop))
+            self._do_set_status("回放中", self._color('primary'))
+            self._macro_update_controls()
+            self._macro_play_thread.start()
+            self.log_message("宏回放开始：%s" % path)
+        except Exception as exc:
+            self._macro_playing = False
+            self._macro_player = None
+            self._macro_play_thread = None
+            self._macro_set_status("开始回放失败：" + str(exc), 'danger')
+            self._macro_set_detail(str(exc))
+            self._do_set_status("已停止", self._color('muted'))
+            self.log_message("宏回放启动失败：" + str(exc))
+            self._macro_update_controls()
+
+    def _macro_playback_on_progress(self, token, loop_index, step_index, total):
+        """播放线程回调：按比例降频投递 UI，避免长宏塞满主线程队列。"""
+        if step_index % 5 == 0 or step_index + 1 >= total:
+            self._ui(self._macro_playback_progress, token, loop_index, step_index, total)
+
+    def _macro_playback_progress(self, token, loop_index, step_index, total):
+        if token != self._macro_play_token or not self._macro_playing:
+            return
+        try:
+            self._macro_set_status(
+                "回放中：%d/%d 步 · 循环 %d/%d" % (
+                    step_index + 1, total, loop_index + 1, self._macro_play_loop),
+                'primary')
+            self._macro_set_detail(
+                "Esc/F8 可随时停止；停止后会自动释放按下的按键。")
+        except Exception:
+            pass
+
+    def _macro_execute_step(self, step):
+        """回放线程执行单步；失败抛 MacroError，由工人线程转成行内错误。"""
+        if not self._macro_playing:
+            raise _macro.MacroError("回放已停止")
+        step_type = step.get('type')
+        if step_type in ('move', 'click'):
+            x = int(step.get('x', 0))
+            y = int(step.get('y', 0))
+            bounds = self._macro_play_bounds or self._macro_screen_bounds()
+            for label, rect in (('录制屏幕', bounds), ('当前屏幕', self._macro_screen_bounds())):
+                if not self._macro_point_in_bounds(x, y, rect):
+                    raise _macro.MacroError(
+                        "坐标越界：(%d, %d) 超出%s %dx%d" % (
+                            x, y, label, rect['width'], rect['height']))
+            if step_type == 'move':
+                if not move_mouse(x, y):
+                    raise _macro.MacroError("移动鼠标失败：(%d, %d)" % (x, y))
+                return
+            if not click_mouse(x, y, step.get('button', 'left'), step.get('hold_ms', 0)):
+                raise _macro.MacroError("点击失败：(%d, %d)" % (x, y))
+            return
+        if step_type == 'key':
+            kb = _get_keyboard()
+            if kb is None:
+                raise _macro.MacroError("键盘模块不可用，无法回放按键")
+            key = str(step.get('key', ''))
+            action = step.get('action', 'press')
+            try:
+                if action == 'down':
+                    kb.press(key)
+                    with self._macro_key_lock:
+                        self._macro_pressed_keys.add(key)
+                elif action == 'up':
+                    kb.release(key)
+                    with self._macro_key_lock:
+                        self._macro_pressed_keys.discard(key)
+                else:
+                    kb.press_and_release(key)
+            except Exception as exc:
+                raise _macro.MacroError("按键回放失败（%s %s）：%s" % (key, action, exc))
+            return
+
+    @staticmethod
+    def _macro_point_in_bounds(x, y, rect):
+        try:
+            return (rect['left'] <= x < rect['left'] + rect['width']
+                    and rect['top'] <= y < rect['top'] + rect['height'])
+        except Exception:
+            return True
+
+    def _release_macro_keys(self):
+        with self._macro_key_lock:
+            keys = list(self._macro_pressed_keys)
+            self._macro_pressed_keys.clear()
+        if not keys:
+            return
+        kb = _get_keyboard()
+        if kb is None:
+            return
+        for key in keys:
+            try:
+                kb.release(key)
+            except Exception:
+                pass
+
+    def _macro_playback_worker(self, player, token):
+        status = 'stopped'
+        error = ''
+        try:
+            status = player.run()
+        except _macro.MacroError as exc:
+            error = str(exc)
+        except Exception as exc:
+            error = "回放异常：%s" % exc
+        finally:
+            self._release_macro_keys()
+        self._ui(self._macro_playback_done, token, status, error)
+
+    def _macro_playback_done(self, token, status, error):
+        if token != self._macro_play_token:
+            return
+        self._macro_playing = False
+        self._macro_player = None
+        self._macro_play_thread = None
+        self._macro_pending_play = None
+        self._do_set_status("已停止", self._color('muted'))
+        if error:
+            self._macro_set_status("回放失败：" + error, 'danger')
+            self._macro_set_detail("行内诊断：%s；可点“诊断”查看环境检查。" % error)
+            self.log_message("宏回放失败：" + error)
+            try:
+                self.show_operation_message(
+                    "宏回放失败：" + error + "；已停止并释放按键。", level='operation')
+            except Exception:
+                pass
+        elif status == 'finished':
+            elapsed = time.monotonic() - self._macro_play_started_at
+            self._macro_set_status(
+                "回放完成：%d 步 × %d 循环" % (
+                    self._macro_play_total_steps, self._macro_play_loop), 'success')
+            self._macro_set_detail("用时 %s；可按原顺序重复回放，或修改 JSON 后刷新。" % (
+                _macro.format_duration(int(elapsed * 1000))))
+            self.log_message("宏回放完成：%d 步 × %d 循环，用时 %.2fs" % (
+                self._macro_play_total_steps, self._macro_play_loop, elapsed))
+        else:
+            self._macro_set_status("回放已停止", 'warning')
+            self._macro_set_detail("已停止并释放按下的按键；可重新选择宏回放。")
+        self._macro_update_controls()
+
+    def stop_macro_playback(self, reason=''):
+        countdown = self._macro_play_countdown_active
+        playing = self._macro_playing
+        self._macro_play_countdown_active = False
+        self._macro_play_token += 1
+        if self._macro_play_after_id is not None:
+            try:
+                self.root.after_cancel(self._macro_play_after_id)
+            except Exception:
+                pass
+            self._macro_play_after_id = None
+        self._macro_pending_play = None
+        player = self._macro_player
+        thread = self._macro_play_thread
+        self._macro_playing = False
+        self._macro_player = None
+        if player is not None:
+            try:
+                player.stop()
+            except Exception:
+                pass
+        if thread is not None and thread.is_alive() \
+                and threading.current_thread() is not thread:
+            try:
+                thread.join(timeout=1.5)
+            except Exception:
+                pass
+        self._macro_play_thread = None
+        self._release_macro_keys()
+        self._do_set_status("已停止", self._color('muted'))
+        if countdown:
+            self._macro_set_status("回放倒计时已取消", 'muted')
+            self._macro_set_detail("没有执行任何输入；可重新点“回放”。")
+        elif playing:
+            self._macro_set_status("回放已停止", 'warning')
+            self._macro_set_detail(
+                "已停止并释放按下的按键%s。" % (
+                    "（原因：" + reason + "）" if reason else ""))
+            if reason:
+                self.log_message("宏回放停止（原因：%s）" % reason)
+        self._macro_update_controls()
+
+    def toggle_macro_playback_pause(self):
+        player = self._macro_player
+        if not self._macro_playing or player is None:
+            return
+        try:
+            player.toggle_pause()
+            if player.paused:
+                self._macro_set_status("回放已暂停", 'warning')
+                self._macro_set_detail("暂停在当前步；点“继续回放”恢复。")
+                self.log_message("宏回放已暂停")
+            else:
+                self._macro_set_status("回放中…", 'primary')
+                self._macro_set_detail("已恢复；Esc/F8 随时停止。")
+                self.log_message("宏回放已继续")
+            self._macro_update_controls()
+        except Exception as exc:
+            self._macro_set_status("回放暂停/继续失败：" + str(exc), 'danger')
+            self._macro_set_detail(str(exc))
+
     def _append_log_ui(self, log_entry, level):
         """主线程写入日志控件；后台线程统一通过 _ui() 投递到主线程。"""
         try:
@@ -4955,6 +5910,9 @@ class AutoClicker:
                 self._create_windows_tray_icon()
                 if getattr(self, 'tray_icon_created', False):
                     self._update_tray_status(False)
+                    # 托盘晚于录制初始化时补上红色图标
+                    if self._macro_recording:
+                        self._set_tray_recording(True)
             # Linux 系统托盘
             elif IS_LINUX and HAS_PYSTRAY and HAS_PIL:
                 self._create_linux_tray_icon()
@@ -5236,6 +6194,14 @@ class AutoClicker:
     def _shutdown_runtime(self):
         """停止托盘、点击线程、保活与全局热键；任何一步失败都不得阻断退出。"""
         self.is_running = False
+        # FR-13：退出时先收尾录制/回放，避免全局 hook 或按下的按键遗留。
+        try:
+            if self._macro_record_countdown_active or self._macro_recording:
+                self.stop_macro_recording(save=True, reason='程序退出')
+            if self._macro_play_countdown_active or self._macro_playing:
+                self.stop_macro_playback(reason='程序退出')
+        except Exception:
+            pass
         try:
             self._stop_runtime_tick()
         except Exception:
