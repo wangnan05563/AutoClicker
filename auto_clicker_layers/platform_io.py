@@ -217,13 +217,13 @@ def _ydotool_move(x, y):
     return False
 
 
-def _ydotool_click(x, y, button='left', hold_ms=0):
+def _ydotool_click(x, y, button='left', hold_ms=0, double_gap_ms=30):
     if not _ydotool_move(x, y):
         return False
     code = _YDOTOOL_BUTTONS.get(button, _YDOTOOL_BUTTONS['left'])
     if button == 'double':
         first = _ydotool_run(['click', code])
-        time.sleep(0.03)
+        time.sleep(max(0.001, double_gap_ms / 1000.0))
         second = _ydotool_run(['click', code])
         return first and second
     if hold_ms > 0:
@@ -283,13 +283,13 @@ def _windows_click_button(x, y, button, hold_ms):
         return False
 
 
-def windows_click(x, y, button='left', hold_ms=0):
+def windows_click(x, y, button='left', hold_ms=0, double_gap_ms=30):
     if not HAS_WIN32API:
         return False
     try:
         if button == 'double':
             _windows_click_button(x, y, 'left', hold_ms)
-            time.sleep(0.03)
+            time.sleep(max(0.001, double_gap_ms / 1000.0))
             _windows_click_button(x, y, 'left', hold_ms)
             return True
         return _windows_click_button(x, y, button, hold_ms)
@@ -325,15 +325,15 @@ def linux_move_mouse(x, y):
         return False
 
 
-def linux_click(x, y, button='left', hold_ms=0):
+def linux_click(x, y, button='left', hold_ms=0, double_gap_ms=30):
     import shutil
     if _is_wayland_session() and shutil.which('ydotool'):
-        if _ydotool_click(x, y, button, hold_ms):
+        if _ydotool_click(x, y, button, hold_ms, double_gap_ms):
             return True
         print("Wayland 点击失败：ydotool 不可用，请确认 ydotoold 已启动")
         return False
     if not HAS_X11:
-        return _pyautogui_click(x, y, button)
+        return _pyautogui_click(x, y, button, double_gap_ms if button == 'double' else None)
     try:
         d = display.Display()
         linux_move_mouse(x, y)
@@ -353,7 +353,7 @@ def linux_click(x, y, button='left', hold_ms=0):
         if button == 'double':
             release()
             d.sync()
-            time.sleep(0.03)
+            time.sleep(max(0.001, double_gap_ms / 1000.0))
             press()
             if hold_ms > 0:
                 time.sleep(hold_ms / 1000.0)
@@ -363,17 +363,21 @@ def linux_click(x, y, button='left', hold_ms=0):
         return True
     except Exception as e:
         print(f"Linux点击失败：{e}")
-        return _pyautogui_click(x, y, button)
+        return _pyautogui_click(x, y, button, double_gap_ms if button == 'double' else None)
 
 
-def _pyautogui_click(x, y, button):
+def _pyautogui_click(x, y, button, interval_ms=None):
     pg = _get_pyautogui()
     if pg is None:
         return False
     try:
+        kwargs = {}
+        if interval_ms is not None:
+            kwargs['interval'] = max(0.001, interval_ms / 1000.0)
         pg.click(x, y,
                   button={'left': 'left', 'right': 'right', 'middle': 'middle'}.get(button, 'left'),
-                  clicks=2 if button == 'double' else 1)
+                  clicks=2 if button == 'double' else 1,
+                  **kwargs)
         return True
     except Exception:
         return False
@@ -420,9 +424,9 @@ def move_mouse(x, y):
     return True
 
 
-def click_mouse(x, y, button='left', hold_ms=0):
+def click_mouse(x, y, button='left', hold_ms=0, double_gap_ms=30):
     if IS_WINDOWS:
-        return windows_click(x, y, button, hold_ms)
+        return windows_click(x, y, button, hold_ms, double_gap_ms)
     elif IS_LINUX:
-        return linux_click(x, y, button, hold_ms)
-    return _pyautogui_click(x, y, button)
+        return linux_click(x, y, button, hold_ms, double_gap_ms)
+    return _pyautogui_click(x, y, button, double_gap_ms if button == 'double' else None)

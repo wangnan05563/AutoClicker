@@ -24,6 +24,13 @@ from auto_clicker_layers.engine import (
     effective_interval_seconds as _engine_effective_interval_seconds,
     jittered_wait as _engine_jittered_wait,
     validate_interval as _engine_validate_interval,
+    INTERVAL_UNITS as _engine_INTERVAL_UNITS,
+    validate_interval_for_unit as _engine_validate_interval_for_unit,
+    validate_cps_range as _engine_validate_cps_range,
+    validate_duty as _engine_validate_duty,
+    validate_double_gap as _engine_validate_double_gap,
+    cps_interval_seconds as _engine_cps_interval_seconds,
+    duty_hold_ms as _engine_duty_hold_ms,
     validate_countdown as _engine_validate_countdown,
     validate_click_limit as _engine_validate_click_limit,
     validate_duration_limit as _engine_validate_duration_limit,
@@ -1561,6 +1568,15 @@ class AutoClicker:
                 self.config['failsafe_enabled'] = self.failsafe_var.get()
                 self.config['target_window_keyword'] = self.target_window_var.get().strip()
                 self.config['close_to_tray'] = self.close_to_tray_var.get()
+            if hasattr(self, 'use_cps_var'):
+                self.config['rhythm_mode'] = 'cps' if self.use_cps_var.get() else 'interval'
+                for key, var in (('cps_min', self.cps_min_var), ('cps_max', self.cps_max_var),
+                                 ('duty_pct', self.duty_pct_var),
+                                 ('double_click_gap_ms', self.double_gap_var)):
+                    try:
+                        self.config[key] = int(var.get() or 0)
+                    except (ValueError, tk.TclError):
+                        pass
             # FR-D01：定时计划输入一并持久化（非法值保留上一次有效配置）
             if hasattr(self, 'schedule_start_var'):
                 sched = dict(self.config.get('schedule') or {})
@@ -2296,6 +2312,8 @@ class AutoClicker:
                     'startup_countdown', 'click_limit', 'duration_limit',
                     'failsafe_enabled', 'target_window_keyword', 'click_button',
                     'hold_ms', 'interval_unit', 'jitter_pct', 'use_multi_points',
+                    'rhythm_mode', 'cps_min', 'cps_max', 'duty_pct',
+                    'double_click_gap_ms',
                     'multi_points', 'click_area', 'hotkey_start',
                     'hotkey_emergency', 'autostart', 'close_to_tray')
             }
@@ -2420,6 +2438,8 @@ class AutoClicker:
                     'startup_countdown', 'click_limit', 'duration_limit',
                     'failsafe_enabled', 'target_window_keyword', 'click_button',
                     'hold_ms', 'interval_unit', 'jitter_pct', 'use_multi_points',
+                    'rhythm_mode', 'cps_min', 'cps_max', 'duty_pct',
+                    'double_click_gap_ms',
                     'multi_points', 'click_area', 'hotkey_start',
                     'hotkey_emergency', 'autostart', 'close_to_tray')
             }
@@ -2642,12 +2662,19 @@ class AutoClicker:
 
     # ==================== FR-02 启动确认 + 结束摘要 ====================
     def _confirmation_snapshot(self, interval, countdown, click_limit,
-                               duration_limit, jitter, hold_ms):
+                               duration_limit, jitter, hold_ms,
+                               rhythm_mode='interval', cps_range=(None, None),
+                               duty_pct=0, double_gap_ms=30):
         """用当前控件值拼出确认快照，确保确认框与实际启动参数一致。"""
         snapshot = dict(self.config or {})
         snapshot.update({
             'interval_seconds': interval,
             'interval_unit': self.interval_unit_var.get(),
+            'rhythm_mode': rhythm_mode,
+            'cps_min': cps_range[0] if cps_range else None,
+            'cps_max': cps_range[1] if cps_range else None,
+            'duty_pct': duty_pct,
+            'double_click_gap_ms': double_gap_ms,
             'click_mode': self.mode_var.get(),
             'click_button': self.click_button_var.get(),
             'hold_ms': hold_ms,
@@ -2971,6 +2998,7 @@ class AutoClicker:
                 'duration_limit', 'failsafe_enabled', 'target_window_keyword',
                 'click_button', 'hold_ms',
                 'interval_unit', 'jitter_pct', 'use_multi_points', 'multi_points', 'click_area',
+                'rhythm_mode', 'cps_min', 'cps_max', 'duty_pct', 'double_click_gap_ms',
                 'hotkey_start', 'hotkey_emergency', 'autostart', 'close_to_tray']
         snap = {k: self.config.get(k) for k in keys}
         self.config.setdefault('profiles', {})[name] = snap
@@ -3057,6 +3085,11 @@ class AutoClicker:
             self.hold_ms_var.set(str(self.config.get('hold_ms', 10)))
             self.interval_unit_var.set(self.config.get('interval_unit', 's'))
             self.jitter_var.set(str(self.config.get('jitter_pct', 0)))
+            self.use_cps_var.set(self.config.get('rhythm_mode', 'interval') == 'cps')
+            self.cps_min_var.set(str(self.config.get('cps_min', 10)))
+            self.cps_max_var.set(str(self.config.get('cps_max', 50)))
+            self.duty_pct_var.set(str(self.config.get('duty_pct', 0)))
+            self.double_gap_var.set(str(self.config.get('double_click_gap_ms', 30)))
             self.use_multi_points_var.set(self.config.get('use_multi_points', False))
             self.autostart_var.set(self.config.get('autostart', False))
             if getattr(self, 'confirm_start_var', None) is not None:
@@ -3609,10 +3642,29 @@ class AutoClicker:
         self.interval_unit_var = tk.StringVar(value=self.config.get('interval_unit', 's'))
         self.interval_unit_var.trace_add('write', self._on_interval_hot_update)
         ttk.Combobox(row2, textvariable=self.interval_unit_var, width=8,
-                     values=['s', 'ms'], state='readonly').pack(side=tk.LEFT, padx=(5, 15))
+                     values=['ms', 's', 'min', 'h'], state='readonly').pack(side=tk.LEFT, padx=(5, 15))
         ttk.Label(row2, text="随机抖动(%)", font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
         self.jitter_var = tk.StringVar(value=str(self.config.get('jitter_pct', 0)))
         ttk.Entry(row2, textvariable=self.jitter_var, width=8, justify='center').pack(side=tk.LEFT, padx=(5, 0))
+
+        # FR-15：随机 CPS / 占空比 / 双击间隔（高级）
+        row2b = ttk.Frame(p1_card)
+        row2b.pack(fill=tk.X, pady=(0, 6))
+        self.use_cps_var = tk.BooleanVar(value=self.config.get('rhythm_mode', 'interval') == 'cps')
+        ttk.Checkbutton(row2b, text="随机 CPS", variable=self.use_cps_var).pack(side=tk.LEFT)
+        ttk.Label(row2b, text="最小", font=('微软雅黑', 9)).pack(side=tk.LEFT, padx=(8, 0))
+        self.cps_min_var = tk.StringVar(value=str(self.config.get('cps_min', 10)))
+        ttk.Entry(row2b, textvariable=self.cps_min_var, width=6, justify='center').pack(side=tk.LEFT, padx=(3, 8))
+        ttk.Label(row2b, text="最大", font=('微软雅黑', 9)).pack(side=tk.LEFT)
+        self.cps_max_var = tk.StringVar(value=str(self.config.get('cps_max', 50)))
+        ttk.Entry(row2b, textvariable=self.cps_max_var, width=6, justify='center').pack(side=tk.LEFT, padx=(3, 10))
+        ttk.Label(row2b, text="占空比(%)", font=('微软雅黑', 9)).pack(side=tk.LEFT)
+        self.duty_pct_var = tk.StringVar(value=str(self.config.get('duty_pct', 0)))
+        ttk.Entry(row2b, textvariable=self.duty_pct_var, width=6, justify='center').pack(side=tk.LEFT, padx=(3, 8))
+        ttk.Label(row2b, text="双击间隔(ms)", font=('微软雅黑', 9)).pack(side=tk.LEFT)
+        self.double_gap_var = tk.StringVar(value=str(self.config.get('double_click_gap_ms', 30)))
+        ttk.Entry(row2b, textvariable=self.double_gap_var, width=6, justify='center').pack(side=tk.LEFT, padx=(3, 0))
+
 
         mp_frame = ttk.Frame(p1_card)
         mp_frame.pack(fill=tk.X, pady=(4, 0))
@@ -4400,14 +4452,15 @@ class AutoClicker:
         try:
             value = int(self.interval_var.get().strip())
             unit = self.interval_unit_var.get()
-            if value < 0 or unit not in ('s', 'ms'):
+            if value < 0 or unit not in _engine_INTERVAL_UNITS:
                 return
             self.interval_unit = unit
-            self.interval_seconds_cache = value / 1000.0 if unit == 'ms' else float(value)
+            self.interval_seconds_cache = _engine_effective_interval_seconds(value, unit)
             self.config['interval_seconds'] = value
             self.config['interval_unit'] = unit
             self._interval_change_event.set()
-            self.log_message("运行参数热更新：间隔=" + str(value) + ("毫秒" if unit == 'ms' else "秒"))
+            unit_text = {'ms': '毫秒', 's': '秒', 'min': '分钟', 'h': '小时'}.get(unit, unit)
+            self.log_message("运行参数热更新：间隔=" + str(value) + unit_text)
         except (ValueError, tk.TclError):
             pass
 
@@ -4469,18 +4522,22 @@ class AutoClicker:
         except Exception as e:
             self.log_message(f"鼠标跟随失败: {e}")
 
-    def _click_once_at(self, x, y):
+    def _click_once_at(self, x, y, hold_ms=None):
         """执行一次点击（或仅移动），并刷新计数显示。"""
         if getattr(self, 'mouse_move_only_cache', False):
             self.log_message(f"仅移动到位置 ({x}, {y})，未执行点击")
             return
-        # FN-01/FN-02：支持按键类型与按住时长
-        ok = click_mouse(x, y, button=self.click_button, hold_ms=self.hold_ms)
+        # FN-01/FN-02：支持按键类型与按住时长；FR-15 支持可配双击间隔
+        effective_hold = self.hold_ms if hold_ms is None else max(0, int(hold_ms))
+        gap = int(getattr(self, 'double_gap_cache', 30))
+        ok = click_mouse(x, y, button=self.click_button, hold_ms=effective_hold,
+                         double_gap_ms=gap)
         final_ok = bool(ok)
         if ok:
             self.log_message(f"在位置 ({x}, {y}) 执行点击[按键={self.click_button}]")
         else:
-            final_ok = bool(_pyautogui_click(x, y, self.click_button))
+            final_ok = bool(_pyautogui_click(x, y, self.click_button,
+                                             gap if self.click_button == 'double' else None))
             if final_ok:
                 self.log_message(f"使用pyautogui在位置 ({x}, {y}) 执行点击")
             else:
@@ -4538,10 +4595,18 @@ class AutoClicker:
         return False
 
     def _wait_exact(self, seconds):
-        """高精度等待：短间隔用 sleep + 自旋补齐，避免 Windows 定时器粒度造成漂移。"""
+        """高精度等待：≤50ms 纯自旋，避免 Windows 定时器粒度把 20ms 拖成 60ms+。"""
         if seconds <= 0:
             return self.is_running
         deadline = time.perf_counter() + seconds
+        if seconds <= 0.05:
+            while self.is_running:
+                if self._interval_change_event.is_set():
+                    self._interval_change_event.clear()
+                    return True
+                if time.perf_counter() >= deadline:
+                    break
+            return self.is_running
         while self.is_running:
             if self._interval_change_event.is_set():
                 self._interval_change_event.clear()
@@ -4559,16 +4624,22 @@ class AutoClicker:
         # 多点位序列模式（FN-03）
         points = self.multi_points if self.use_multi_points else None
         point_idx = 0
-        last_click_at = None
+        last_click_at = time.perf_counter()
         lead_est = 0.001  # 等待结束到点击动作之间的预估开销，按实测自适应
         while self.is_running:
             try:
                 base = self._effective_interval_seconds()
+                if getattr(self, 'rhythm_mode', 'interval') == 'cps':
+                    base = _engine_cps_interval_seconds(
+                        getattr(self, 'cps_min_cache', 10),
+                        getattr(self, 'cps_max_cache', 50),
+                        _RANDOM)
                 if getattr(self, 'prevent_sleep_cache', False):
                     self.prevent_system_sleep()
 
-                # 安全：鼠标位移 failsafe 基线（CX-01）
-                failsafe_base = get_cursor_pos() if self.failsafe_enabled else None
+                # 安全：鼠标位移 failsafe 基线（CX-01 / T05824）
+                failsafe_base = (getattr(self, '_failsafe_base', None)
+                                 if getattr(self, '_failsafe_armed', False) else None)
 
                 # 等待一个间隔（含随机抖动），期间可响应停止（CX-07）
                 # 短间隔按“上次点击时刻 + 间隔”排程，补偿点击/校验开销，避免累积漂移。
@@ -4582,7 +4653,7 @@ class AutoClicker:
                         break
 
                 # 安全：运行中若开启 failsafe 且鼠标被移动 >20px，立即急停（CX-01）
-                if self.failsafe_enabled and self.is_running and self._failsafe_triggered(failsafe_base):
+                if self.failsafe_enabled and self.is_running and self._failsafe_armed and self._failsafe_triggered(failsafe_base):
                     self.stop_clicking(reason="鼠标位移触发安全停止 (failsafe)")
                     return
 
@@ -4594,7 +4665,14 @@ class AutoClicker:
                 x, y, point_idx = self._next_click_point(points, point_idx)
                 self._move_before_click(x, y)
                 click_at = time.perf_counter()
-                self._click_once_at(x, y)
+                hold_override = None
+                if getattr(self, 'duty_pct_cache', 0):
+                    hold_override = _engine_duty_hold_ms(base, self.duty_pct_cache)
+                self._click_once_at(x, y, hold_ms=hold_override)
+                # T05824：程序自身移动/点击完成后刷新基线，仅捕获用户之后的位移
+                if self.failsafe_enabled:
+                    self._failsafe_base = get_cursor_pos()
+                    self._failsafe_armed = True
                 last_click_at = click_at
                 if scheduled_target is not None:
                     excess = click_at - scheduled_target
@@ -4614,7 +4692,36 @@ class AutoClicker:
                 
     def _read_interval(self):
         """读取并校验点击间隔，非法时行内红字提示并返回 None。"""
-        value, error = _engine_validate_interval(self.interval_var.get())
+        unit_var = getattr(self, 'interval_unit_var', None)
+        unit = unit_var.get() if unit_var is not None else 's'
+        value, error = _engine_validate_interval_for_unit(self.interval_var.get(), unit)
+        if error:
+            self.show_field_error(error)
+            return None
+        self.clear_field_error()
+        return value
+
+    def _read_cps_range(self):
+        """FR-15：读取并校验随机 CPS 范围。"""
+        value, error = _engine_validate_cps_range(self.cps_min_var.get(), self.cps_max_var.get())
+        if error:
+            self.show_field_error(error)
+            return None
+        self.clear_field_error()
+        return value
+
+    def _read_duty_pct(self):
+        """FR-15：读取占空比（0=关闭，10–90%）。"""
+        value, error = _engine_validate_duty(self.duty_pct_var.get())
+        if error:
+            self.show_field_error(error)
+            return None
+        self.clear_field_error()
+        return value
+
+    def _read_double_gap(self):
+        """FR-15：读取双击间隔（1–500ms）。"""
+        value, error = _engine_validate_double_gap(self.double_gap_var.get())
         if error:
             self.show_field_error(error)
             return None
@@ -4668,13 +4775,20 @@ class AutoClicker:
 
     def _startup_summary(self, interval, countdown, click_limit, duration_limit, jitter, hold_ms):
         """拼装启动日志摘要（把可选片段从主流程中拆出，降低认知复杂度）。"""
-        unit_text = "毫秒" if self.interval_unit == 'ms' else "秒"
+        unit_text = {'ms': '毫秒', 's': '秒', 'min': '分钟', 'h': '小时'}.get(
+            getattr(self, 'interval_unit', 's'), '秒')
         parts = [
             "启动配置: 模式=" + str(self.config['click_mode']) + ", 间隔=" + str(interval) + unit_text,
             ", 按键=" + str(self.click_button) + ", 按住=" + str(hold_ms) + "ms",
         ]
         if jitter:
             parts.append(f", 抖动={jitter}%")
+        if getattr(self, 'rhythm_mode', 'interval') == 'cps':
+            parts.append(", 随机CPS=%s-%s" % (self.cps_min_cache, self.cps_max_cache))
+        if getattr(self, 'duty_pct_cache', 0):
+            parts.append(", 占空比=%s%%" % self.duty_pct_cache)
+        if self.click_button == 'double':
+            parts.append(", 双击间隔=%sms" % getattr(self, 'double_gap_cache', 30))
         if self.use_multi_points:
             parts.append(", 多点位")
         if countdown:
@@ -4716,10 +4830,23 @@ class AutoClicker:
             hold_ms = self._read_hold_ms()
             if hold_ms is None:
                 return
+            use_cps = bool(self.use_cps_var.get())
+            cps_range = self._read_cps_range() if use_cps else (None, None)
+            if use_cps and cps_range is None:
+                return
+            duty_pct = self._read_duty_pct()
+            if duty_pct is None:
+                return
+            double_gap_ms = self._read_double_gap()
+            if double_gap_ms is None:
+                return
 
             self._close_end_summary()
             snapshot = self._confirmation_snapshot(
-                interval, countdown, click_limit, duration_limit, jitter, hold_ms)
+                interval, countdown, click_limit, duration_limit, jitter, hold_ms,
+                rhythm_mode='cps' if use_cps else 'interval',
+                cps_range=cps_range, duty_pct=duty_pct,
+                double_gap_ms=double_gap_ms)
             if not self._confirm_start(snapshot, source):
                 self.log_message("启动已取消：用户在启动确认框选择取消")
                 return
@@ -4739,10 +4866,18 @@ class AutoClicker:
             self.click_limit = click_limit
             self.duration_limit = duration_limit
             self.failsafe_enabled = self.failsafe_var.get()
+            # T05824：首次点击前不启用位移基线，避免用户点“开始”后自然移开鼠标被误判
+            self._failsafe_armed = False
+            self._failsafe_base = get_cursor_pos() if self.failsafe_enabled else None
             self.start_time = time.time()
             # P1 状态（FN-01 / FN-02 / CX-07 / FN-03 / CX-11）
             self.interval_unit = self.interval_unit_var.get()
             self.jitter_pct = jitter
+            self.rhythm_mode = 'cps' if use_cps else 'interval'
+            self.cps_min_cache = cps_range[0] if cps_range else None
+            self.cps_max_cache = cps_range[1] if cps_range else None
+            self.duty_pct_cache = duty_pct
+            self.double_gap_cache = double_gap_ms
             self.click_button = self.click_button_var.get()
             self.hold_ms = hold_ms
             self.use_multi_points = self.use_multi_points_var.get()
@@ -4773,6 +4908,12 @@ class AutoClicker:
             # P1 持久化（FN-01 / FN-02 / CX-07 / FN-03 / CX-11）
             self.config['interval_unit'] = self.interval_unit
             self.config['jitter_pct'] = self.jitter_pct
+            self.config['rhythm_mode'] = self.rhythm_mode
+            if cps_range and cps_range[0] is not None:
+                self.config['cps_min'] = cps_range[0]
+                self.config['cps_max'] = cps_range[1]
+            self.config['duty_pct'] = self.duty_pct_cache
+            self.config['double_click_gap_ms'] = self.double_gap_cache
             self.config['click_button'] = self.click_button
             self.config['hold_ms'] = self.hold_ms
             self.config['use_multi_points'] = self.use_multi_points

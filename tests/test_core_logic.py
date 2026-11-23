@@ -206,7 +206,7 @@ class ValidationTests(unittest.TestCase):
         self.obj.show_field_error.assert_called_once()
 
     def test_read_interval_too_large(self):
-        self.obj.interval_var = FakeVar('3601')
+        self.obj.interval_var = FakeVar('86401')
         self.obj.show_field_error = mock.Mock()
         self.assertIsNone(self.obj._read_interval())
         self.obj.show_field_error.assert_called_once()
@@ -373,11 +373,27 @@ class ClickLoopTests(unittest.TestCase):
     def test_failsafe_stops_before_click(self):
         obj = self._base_obj()
         obj.failsafe_enabled = True
-        with mock.patch.object(app_module, 'get_cursor_pos', side_effect=[(0, 0), (100, 100)]):
+        obj._failsafe_armed = True
+        obj._failsafe_base = (0, 0)
+        with mock.patch.object(app_module, 'get_cursor_pos', side_effect=[(100, 100), (0, 0)]):
             obj.click_loop()
         self.assertFalse(obj.is_running)
         obj.stop_clicking.assert_called_once()
         self.assertIn('failsafe', obj.stop_clicking.call_args.kwargs['reason'])
+
+    def test_first_click_before_failsafe_arming_ignores_initial_move(self):
+        """T05824：首次点击前用户移开鼠标不应误触 failsafe。"""
+        obj = self._base_obj()
+        obj.failsafe_enabled = True
+        obj._failsafe_armed = False
+        obj._failsafe_base = (0, 0)
+        with mock.patch.object(app_module, 'get_cursor_pos', return_value=(300, 300)), \
+                mock.patch.object(app_module, 'click_mouse', return_value=True):
+            obj.click_loop()
+        self.assertEqual(obj.click_count, 1)
+        self.assertTrue(obj._failsafe_armed)
+        self.assertEqual(obj._failsafe_base, (300, 300))
+        self.assertNotIn('failsafe', obj.stop_clicking.call_args.kwargs['reason'])
 
 
 class ClickCountTests(unittest.TestCase):

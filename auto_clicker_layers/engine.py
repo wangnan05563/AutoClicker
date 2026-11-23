@@ -8,6 +8,9 @@ from datetime import datetime, timedelta
 
 
 MAX_INTERVAL = 3600
+MAX_INTERVAL_BY_UNIT = {'ms': 86_400_000, 's': 86_400, 'min': 1_440, 'h': 24}
+INTERVAL_UNITS = ('ms', 's', 'min', 'h')
+MAX_CPS = 200
 WEEKDAY_LABELS = {'每天': [1, 2, 3, 4, 5, 6, 7], '工作日': [1, 2, 3, 4, 5], '周末': [6, 7]}
 
 
@@ -36,6 +39,10 @@ def effective_interval_seconds(value, unit):
         val = 0.0
     if unit == 'ms':
         return val / 1000.0
+    if unit == 'min':
+        return val * 60.0
+    if unit == 'h':
+        return val * 3600.0
     return val
 
 
@@ -67,12 +74,94 @@ def validate_interval(raw):
     return value, None
 
 
+def validate_interval_for_unit(raw, unit):
+    """按单位校验间隔，允许 1ms–24h；保留旧 validate_interval 的秒级口径。"""
+    if unit not in INTERVAL_UNITS:
+        return None, '间隔单位必须为 ms/s/min/h'
+    value = _int_value(raw)
+    if value is None:
+        return None, '点击间隔必须为整数'
+    max_value = MAX_INTERVAL_BY_UNIT[unit]
+    if value < 1:
+        return None, '点击间隔必须 >= 1'
+    if value > max_value:
+        return None, '点击间隔必须 <= %d %s' % (max_value, unit)
+    return value, None
+
+
+def validate_cps(raw):
+    """单点 CPS 校验：1–200。"""
+    value = _int_value(raw)
+    if value is None:
+        return None, 'CPS 必须为整数'
+    if value < 1 or value > MAX_CPS:
+        return None, 'CPS 必须在 1-%d 之间' % MAX_CPS
+    return value, None
+
+
+def validate_cps_range(min_raw, max_raw):
+    """随机 CPS 范围校验：1 ≤ min ≤ max ≤ 200。"""
+    lo, err = validate_cps(min_raw)
+    if err:
+        return None, err
+    hi, err = validate_cps(max_raw)
+    if err:
+        return None, err
+    if lo > hi:
+        return None, '最小 CPS 不能大于最大 CPS'
+    return (lo, hi), None
+
+
+def cps_interval_seconds(min_cps, max_cps, rng=None):
+    """按 [min,max] CPS 取一次间隔秒数；非法范围回退 1 CPS。"""
+    try:
+        lo = max(1, int(min_cps))
+        hi = max(lo, int(max_cps))
+    except (TypeError, ValueError):
+        lo = hi = 1
+    if rng is not None and hi > lo:
+        cps = rng.uniform(lo, hi)
+    else:
+        cps = (lo + hi) / 2.0
+    return 1.0 / max(1.0, float(cps))
+
+
+def validate_duty(raw):
+    """占空比校验：0 表示不启用；启用时必须在 10–90%。"""
+    value = _int_value(raw)
+    if value is None:
+        return None, '占空比必须为整数'
+    if value == 0:
+        return 0, None
+    if value < 10 or value > 90:
+        return None, '占空比必须为 0（关闭）或 10-90%'
+    return value, None
+
+
+def duty_hold_ms(interval_seconds, duty_pct):
+    """按占空比换算按住毫秒数；未启用返回 None，最短 1ms、最长 5000ms。"""
+    if not duty_pct or duty_pct <= 0 or interval_seconds <= 0:
+        return None
+    hold = interval_seconds * 1000.0 * duty_pct / 100.0
+    return int(max(1, min(5000, round(hold))))
+
+
 def validate_countdown(raw):
     value = _int_value(raw)
     if value is None:
         return None, '启动倒计时必须为整数'
     if value < 0 or value > 5:
         return None, '启动倒计时必须在 0-5 秒之间'
+    return value, None
+
+
+def validate_double_gap(raw):
+    """双击间隔（两次按下之间）校验：1–500ms。"""
+    value = _int_value(raw)
+    if value is None:
+        return None, '双击间隔必须为整数'
+    if value < 1 or value > 500:
+        return None, '双击间隔必须在 1-500ms 之间'
     return value, None
 
 

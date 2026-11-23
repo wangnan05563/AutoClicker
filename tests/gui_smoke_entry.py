@@ -32,6 +32,14 @@ root.update()
 assert root.title() == app_module.WINDOW_TITLE, root.title()
 assert app.start_btn is not None
 assert app.test_btn is not None
+# FR-15：高级节奏控件存在且默认值可读
+for _name in ('use_cps_var', 'cps_min_var', 'cps_max_var', 'duty_pct_var', 'double_gap_var'):
+    assert hasattr(app, _name), _name
+assert app.cps_min_var.get() == '10'
+assert app.cps_max_var.get() == '50'
+assert app.duty_pct_var.get() == '0'
+assert app.double_gap_var.get() == '30'
+print("GUI_FR15_CONTROLS_OK")
 for page in ('run', 'rules', 'records', 'settings'):
     assert page in app._page_frames, page
     t0 = time.perf_counter()

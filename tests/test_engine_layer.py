@@ -48,6 +48,40 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine.validate_interval('3601'), (None, '点击间隔必须 <= 3600'))
         self.assertEqual(engine.validate_interval('x'), (None, '点击间隔必须为整数'))
 
+    def test_interval_units_cover_ms_min_hour(self):
+        self.assertEqual(engine.validate_interval_for_unit('1', 'ms'), (1, None))
+        self.assertEqual(engine.validate_interval_for_unit('1440', 'min'), (1440, None))
+        self.assertEqual(engine.validate_interval_for_unit('24', 'h'), (24, None))
+        self.assertEqual(engine.validate_interval_for_unit('25', 'h'),
+                         (None, '点击间隔必须 <= 24 h'))
+        self.assertEqual(engine.validate_interval_for_unit('2', 'day')[0], None)
+        self.assertAlmostEqual(engine.effective_interval_seconds(1, 'ms'), 0.001)
+        self.assertEqual(engine.effective_interval_seconds(2, 'min'), 120.0)
+        self.assertEqual(engine.effective_interval_seconds(1, 'h'), 3600.0)
+
+    def test_cps_range_and_interval(self):
+        self.assertEqual(engine.validate_cps('200'), (200, None))
+        self.assertEqual(engine.validate_cps('0')[0], None)
+        self.assertEqual(engine.validate_cps('201')[0], None)
+        self.assertEqual(engine.validate_cps_range('10', '50'), ((10, 50), None))
+        self.assertEqual(engine.validate_cps_range('50', '10')[0], None)
+        self.assertAlmostEqual(engine.cps_interval_seconds(10, 50), 1 / 30.0)
+        self.assertEqual(engine.cps_interval_seconds(1, 1), 1.0)
+        self.assertEqual(engine.cps_interval_seconds(200, 200), 0.005)
+
+    def test_duty_and_double_gap(self):
+        self.assertEqual(engine.validate_duty('0'), (0, None))
+        self.assertEqual(engine.validate_duty('50'), (50, None))
+        self.assertEqual(engine.validate_duty('5')[0], None)
+        self.assertEqual(engine.validate_duty('95')[0], None)
+        self.assertEqual(engine.duty_hold_ms(0.1, 50), 50)
+        self.assertIsNone(engine.duty_hold_ms(0.1, 0))
+        self.assertEqual(engine.duty_hold_ms(10, 90), 5000)
+        self.assertEqual(engine.validate_double_gap('1'), (1, None))
+        self.assertEqual(engine.validate_double_gap('500'), (500, None))
+        self.assertEqual(engine.validate_double_gap('0')[0], None)
+        self.assertEqual(engine.validate_double_gap('501')[0], None)
+
     def test_validate_countdown(self):
         self.assertEqual(engine.validate_countdown('0'), (0, None))
         self.assertEqual(engine.validate_countdown('5'), (5, None))
