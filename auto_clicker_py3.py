@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 # NFR-09 引擎层（纯逻辑、无 tkinter）：本文件保留 UI/平台编排，纯计算下沉到 auto_clicker_layers.engine
 from auto_clicker_layers.engine import (
     target_window_matches,
+    PauseGate as _engine_PauseGate,
     effective_interval_seconds as _engine_effective_interval_seconds,
     jittered_wait as _engine_jittered_wait,
     validate_interval as _engine_validate_interval,
@@ -67,6 +68,10 @@ from auto_clicker_layers import run_report as _run_report
 from auto_clicker_layers import diagnostics as _diagnostics
 from auto_clicker_layers import dashboard as _dashboard
 from auto_clicker_layers import macro as _macro
+from auto_clicker_layers.hotkey import (
+    parse_hotkey as _hotkey_parse,
+    probe_windows_hotkey as _hotkey_probe,
+)
 
 # 点击抖动使用系统安全随机源，避免可预测的伪随机序列
 _RANDOM = random.SystemRandom()
@@ -343,6 +348,14 @@ class AutoClicker:
         self.jitter_pct = 0
         self.use_multi_points = False
         self.multi_points = []
+        # T06150：运行中暂停/继续闸门；暂停不计点击、不重置计数
+        self.is_paused = False
+        self._pause_gate = _engine_PauseGate()
+        # T06153：会话保持状态（生效/拦截/未启用）与拦截原因
+        self.session_keep_state = '未启用'
+        self.session_keep_reason = ''
+        # T06152：托盘 Tooltip 上次文本，避免每秒无意义刷新
+        self._tray_tip_text = ''
         # FR-D01 定时计划状态：Tk after 每秒检查；休眠唤醒后按单调时钟间隔补算
         self._schedule_last_occurrence = None
         self._schedule_active_occurrence = None
@@ -781,6 +794,7 @@ class AutoClicker:
         button_colors = (
             ('start_btn', 'success'),
             ('stop_btn', 'danger'),
+            ('pause_btn', 'warning'),
             ('test_btn', 'primary'),
             ('set_area_btn', 'muted'),
         )
@@ -1218,6 +1232,9 @@ class AutoClicker:
         elif state == 'abnormal':
             self.run_state_detail_var.set(
                 "点击线程仍在继续，可按 F8/Esc 停止" if self.is_running else "请查看诊断")
+        elif state == 'paused':
+            self.run_state_detail_var.set(
+                "已暂停 · 计数保留 %d 次；继续后从下一周期执行" % getattr(self, 'click_count', 0))
         elif state == 'countdown':
             # 倒计时由 _set_run_countdown 逐 100ms 刷新，避免这里覆盖小数秒
             pass
@@ -1260,6 +1277,15 @@ class AutoClicker:
                 self.run_state_detail_var.set(
                     "点击线程仍在继续，可按 F8/Esc 停止"
                     if self.is_running else "请查看诊断")
+            except Exception:
+                pass
+        elif text == '已暂停':
+            self._ring_state = 'paused'
+            self._ring_headline = '已暂停'
+            self._ring_subtext = '计数保留'
+            self._ring_progress = 1.0
+            try:
+                self.run_state_detail_var.set("继续后从下一周期执行")
             except Exception:
                 pass
         elif text == '已停止':
@@ -1719,6 +1745,7 @@ class AutoClicker:
                 self.stop_keepalive()
                 self.allow_system_sleep()
                 self.log_message("已禁用防止系统锁屏")
+            self._refresh_session_keep()
         except Exception as e:
             print(MSG_SAVE_CONFIG_FAILED + str(e))
         try:
@@ -1823,6 +1850,15 @@ class AutoClicker:
         self._refresh_multi_point_listbox()
         self.log_message("已清空多点位列表")
 
+    def restore_default_hotkeys(self):
+        """T06151：恢复默认 F6/F8，重新走冲突探测后注册。"""
+        try:
+            self.hotkey_start_var.set('f6')
+            self.hotkey_emergency_var.set('f8')
+            self.on_hotkey_apply()
+        except Exception as exc:
+            messagebox.showerror("恢复默认热键", str(exc))
+
     def on_hotkey_apply(self):
         """CX-08：校验冲突并重新注册热键"""
         try:
@@ -1837,6 +1873,21 @@ class AutoClicker:
             if start_k == 'esc' or emer_k == 'esc':
                 messagebox.showerror("冲突", "Esc 为保留紧急停止键，不可用作启动/停止键")
                 return
+            # T06151：系统占用探测；冲突时保留原值、不写配置
+            for label, key in (("启动/停止键", start_k), ("紧急停止键", emer_k)):
+                _, _, _, parse_error = _hotkey_parse(key)
+                if parse_error:
+                    messagebox.showerror("热键无效", "%s：%s" % (label, parse_error))
+                    return
+                occupied, reason = _hotkey_probe(key)
+                if occupied:
+                    messagebox.showerror(
+                        "热键冲突",
+                        "%s %s 已被其他程序占用。\n%s\n\n已保留原热键；可换一个组合或恢复默认 F6/F8。"
+                        % (label, key, reason))
+                    self.log_message("热键冲突：%s %s（%s）" % (label, key, reason))
+                    self.refresh_diagnostics()
+                    return
             self.config['hotkey_start'] = start_k
             self.config['hotkey_emergency'] = emer_k
             self.save_config()
@@ -3237,6 +3288,10 @@ class AutoClicker:
                                           font=('微软雅黑', 9),
                                           foreground=self._color('primary'))
         self.sb_runtime_label.pack(side=tk.LEFT)
+        self.sb_session_label = ttk.Label(status_strip, text="会话保持: 未启用",
+                                          font=('微软雅黑', 8),
+                                          foreground=self._color('muted'))
+        self.sb_session_label.pack(side=tk.RIGHT, padx=(8, 0))
 
         # FR-L01 / 6.12.1：Wayland 降级横幅（可关闭；纯文本，保持 UI-02 零 emoji）
         if not self.input_ok:
@@ -3311,6 +3366,11 @@ class AutoClicker:
             session_box, text="关", variable=self.prevent_sleep_var,
             command=self.on_prevent_sleep_changed)
         self.run_session_check.pack(anchor=tk.W, pady=(2, 0))
+        self.run_session_state_var = tk.StringVar(value="未启用")
+        self.run_session_state_label = ttk.Label(
+            session_box, textvariable=self.run_session_state_var,
+            font=('微软雅黑', 8), foreground=self._color('muted'))
+        self.run_session_state_label.pack(anchor=tk.W)
 
         ttk.Separator(dashboard_right, orient='horizontal').pack(fill=tk.X, pady=(2, 8))
         self.run_last_label = ttk.Label(
@@ -3361,6 +3421,18 @@ class AutoClicker:
                                   padx=12, pady=7, cursor='hand2',
                                   relief=tk.FLAT, bd=0)
         self.start_btn.pack(side=tk.LEFT, padx=(0, 8), fill=tk.X, expand=True)
+
+        # T06150：暂停/继续（暂停保留计数，继续后从下一周期开始）
+        self.pause_btn = tk.Button(main_control_frame, text=" 暂停",
+                                   command=self.toggle_pause,
+                                   font=('微软雅黑', 12, 'bold'),
+                                   bg=self._color('warning'), fg=self._color('on_warning'),
+                                   activebackground=self._shade(self._color('warning')),
+                                   activeforeground=self._color('on_warning'),
+                                   padx=12, pady=7, cursor='hand2',
+                                   relief=tk.FLAT, bd=0, state=tk.DISABLED,
+                                   takefocus=True)
+        self.pause_btn.pack(side=tk.LEFT, padx=(0, 8), fill=tk.X, expand=True)
 
         self.stop_btn = tk.Button(main_control_frame, text=" 停止",
                                  command=self.stop_clicking,
@@ -3580,7 +3652,7 @@ class AutoClicker:
         self.target_container = ttk.Frame(safety_card)
         self.target_container.pack(fill=tk.X, pady=(0, 8))
         target_container = self.target_container
-        ttk.Label(target_container, text="目标窗口关键字(留空=不校验)",
+        ttk.Label(target_container, text="目标窗口(标题/进程/类名, |分隔)",
                  font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
         self.target_window_var = tk.StringVar(value=str(self.config.get('target_window_keyword', '')))
         ttk.Entry(target_container, textvariable=self.target_window_var,
@@ -3703,6 +3775,8 @@ class AutoClicker:
         self.hotkey_emergency_var = tk.StringVar(value=self.config.get('hotkey_emergency', 'f8'))
         ttk.Entry(hk_row, textvariable=self.hotkey_emergency_var, width=8).pack(side=tk.LEFT, padx=(5, 10))
         ttk.Button(hk_row, text="应用热键", command=self.on_hotkey_apply).pack(side=tk.LEFT)
+        ttk.Button(hk_row, text="恢复默认", width=8,
+                   command=self.restore_default_hotkeys).pack(side=tk.LEFT, padx=(4, 0))
 
         # FR-D01 定时计划（每日 HH:MM 启动 / 运行 N 分钟后停止 / 工作日）
         sched_cfg = self.config.get('schedule') or {}
@@ -4196,15 +4270,19 @@ class AutoClicker:
         if now - last < 1.0:
             return
         self._prevent_sleep_last_at = now
+        ok = False
+        reason = ''
         try:
             if IS_WINDOWS:
                 import ctypes
                 ES_CONTINUOUS = 0x80000000
                 ES_SYSTEM_REQUIRED = 0x00000001
                 ES_DISPLAY_REQUIRED = 0x00000002
-                ctypes.windll.kernel32.SetThreadExecutionState(
+                ok = bool(ctypes.windll.kernel32.SetThreadExecutionState(
                     ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
-                )
+                ))
+                if not ok:
+                    reason = 'Windows 拒绝会话保持请求（可能被组策略拦截）'
                 print("已设置Windows防休眠")
             elif IS_LINUX:
                 try:
@@ -4212,6 +4290,7 @@ class AutoClicker:
                     subprocess.Popen(['xdg-screensaver', 'suspend'], 
                                    stdout=subprocess.PIPE, 
                                    stderr=subprocess.PIPE)
+                    ok = True
                 except Exception:
                     try:
                         import subprocess
@@ -4221,17 +4300,52 @@ class AutoClicker:
                         subprocess.Popen(['xset', '-dpms'], 
                                        stdout=subprocess.PIPE, 
                                        stderr=subprocess.PIPE)
-                    except Exception:
-                        pass
+                        ok = True
+                    except Exception as exc:
+                        reason = 'X11 会话保持命令不可用：%s' % exc
                 print("已设置Linux防休眠")
             elif IS_MACOS:
                 import subprocess
                 subprocess.run(["caffeinate", "-u", "-t", "1"], check=False,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                ok = True
                 print("已设置macOS防休眠")
         except Exception as e:
+            reason = str(e)
             print(f"防止系统休眠失败: {e}")
-                
+        self._set_session_keep_state(ok, reason)
+
+    def _set_session_keep_state(self, ok, reason=''):
+        """记录会话保持结果；后台线程结果经 UI 队列回主线程展示。"""
+        self.session_keep_state = '生效' if ok else '拦截'
+        self.session_keep_reason = str(reason or '')
+        if threading.current_thread() is not threading.main_thread():
+            try:
+                self._ui(self._refresh_session_keep)
+            except Exception:
+                pass
+            return
+        self._refresh_session_keep()
+
+    def _refresh_session_keep(self):
+        """T06153：状态条展示会话保持生效/拦截/未启用与拦截原因。"""
+        if not hasattr(self, 'sb_session_label'):
+            return
+        if not self.prevent_sleep_var.get():
+            state, color, text = '未启用', self._color('muted'), '会话保持: 未启用'
+        elif self.session_keep_state == '拦截':
+            short = self.session_keep_reason[:28]
+            state, color = '拦截', self._color('danger')
+            text = '会话保持: 拦截' + (('（%s）' % short) if short else '')
+        else:
+            state, color, text = '生效', self._color('success'), '会话保持: 生效'
+        try:
+            self.sb_session_label.config(text=text, foreground=color)
+            self.run_session_state_var.set(state)
+            self.run_session_state_label.config(foreground=color)
+        except Exception:
+            pass
+
     # ==================== 后台防锁屏保活（独立于点击运行） ====================
     def start_keepalive(self):
         """启动后台防锁屏保活线程。
@@ -4251,6 +4365,12 @@ class AutoClicker:
         self.keepalive_running.set()
         self.keepalive_thread = threading.Thread(target=self._keepalive_loop, daemon=True)
         self.keepalive_thread.start()
+        self.session_keep_state = '生效'
+        self.session_keep_reason = ''
+        try:
+            self._refresh_session_keep()
+        except Exception:
+            pass
         self.log_message("已启动后台防锁屏保活（每 %d 秒保活一次）" % KEEPALIVE_INTERVAL)
 
     def stop_keepalive(self):
@@ -4296,6 +4416,12 @@ class AutoClicker:
         if getattr(self, 'keepalive_running', None) and self.keepalive_running.is_set():
             return
         restore_system_settings()
+        self.session_keep_state = '未启用'
+        self.session_keep_reason = ''
+        if threading.current_thread() is threading.main_thread():
+            self._refresh_session_keep()
+        else:
+            self._ui(self._refresh_session_keep)
 
     # ==================== 线程安全的 UI 更新辅助方法 ====================
     def _ui(self, fn, *args, **kwargs):
@@ -4369,6 +4495,7 @@ class AutoClicker:
                     ss = elapsed % 60
                     self.sb_runtime_label.config(text="运行时长: %02d:%02d" % (mm, ss))
                     self._update_run_detail()
+                    self._update_tray_tooltip()
                 except Exception:
                     pass
                 self._runtime_after_id = self.root.after(1000, _tick)
@@ -4573,8 +4700,8 @@ class AutoClicker:
     def _target_window_ok(self):
         if not getattr(self, 'target_window_cache', ''):
             return True
-        title, proc = get_foreground_window_info()
-        return target_window_matches(self.target_window_cache, title, proc)
+        title, proc, klass = get_foreground_window_info()
+        return target_window_matches(self.target_window_cache, title, proc, klass)
 
     def _pause_for_target_window(self):
         """FR-E03：前台窗口不匹配时暂停点击，切回目标窗口后自动恢复。"""
@@ -4628,6 +4755,12 @@ class AutoClicker:
         lead_est = 0.001  # 等待结束到点击动作之间的预估开销，按实测自适应
         while self.is_running:
             try:
+                # T06150：暂停闸门；继续后从下一周期重新计时，不补点
+                gate = getattr(self, '_pause_gate', None)
+                if gate is not None and gate.paused():
+                    if not gate.wait_until_resumed(lambda: self.is_running):
+                        break
+                    last_click_at = time.perf_counter()
                 base = self._effective_interval_seconds()
                 if getattr(self, 'rhythm_mode', 'interval') == 'cps':
                     base = _engine_cps_interval_seconds(
@@ -4651,6 +4784,12 @@ class AutoClicker:
                 else:
                     if not self._wait_interval(base):
                         break
+
+                # 等待期间进入暂停：不执行本次点击，回到循环顶部等待恢复
+                gate = getattr(self, '_pause_gate', None)
+                if gate is not None and gate.paused():
+                    last_click_at = time.perf_counter()
+                    continue
 
                 # 安全：运行中若开启 failsafe 且鼠标被移动 >20px，立即急停（CX-01）
                 if self.failsafe_enabled and self.is_running and self._failsafe_armed and self._failsafe_triggered(failsafe_base):
@@ -4933,6 +5072,9 @@ class AutoClicker:
             # 更新按钮状态（倒计时期间停止按钮即作为取消键）
             self.start_btn.config(state=tk.DISABLED)
             self.stop_btn.config(state=tk.NORMAL)
+            self.pause_btn.config(state=tk.NORMAL, text=" 暂停")
+            self.is_paused = False
+            self._pause_gate.resume()
             # FR-A03：运行中允许修改间隔，由 trace 热更新到点击线程缓存
             self.interval_entry.config(state=tk.NORMAL)
 
@@ -4947,40 +5089,80 @@ class AutoClicker:
             self.log_message(f"启动失败: {e}")
             messagebox.showerror("错误", f"启动失败: {e}")
             
-    def _update_tray_status(self, running):
-        """CX-12：托盘状态区分（运行/停止），同步托盘菜单与 Windows 提示气泡"""
+    def _tray_status_text(self):
+        """T06152：托盘 Tooltip 显示状态、剩余约束与当前档案。"""
+        profile = str(self.config.get('current_profile') or '').strip() or '默认'
+        if not self.is_running:
+            state = '已停止'
+        elif self.is_paused:
+            state = '已暂停'
+        else:
+            state = '运行中'
+        parts = ["AutoClicker - " + state]
+        if self.is_running:
+            if getattr(self, 'click_limit', 0):
+                parts.append("剩余 %d 次" % max(0, self.click_limit - getattr(self, 'click_count', 0)))
+            if getattr(self, 'duration_limit', 0):
+                left = max(0, int(self.duration_limit * 60 - (time.time() - self.start_time)))
+                parts.append("剩余 %02d:%02d" % (left // 60, left % 60))
+        parts.append("档案:" + profile[:20])
+        return " | ".join(parts)
+
+    def _update_tray_tooltip(self):
+        text = self._tray_status_text()
+        if text == self._tray_tip_text:
+            return
+        self._tray_tip_text = text
         try:
-            # Windows 托盘提示气泡（szTip）随运行状态变化
             if IS_WINDOWS and getattr(self, 'tray_icon_created', False) and hasattr(self, 'tray_nid'):
+                new_nid = self.tray_nid[:5] + (text[:127],)
+                win32gui.Shell_NotifyIcon(win32gui.NIM_MODIFY, new_nid)
+                self.tray_nid = new_nid
+            elif getattr(self, 'tray_icon', None) is not None:
                 try:
-                    tip = "AutoClicker - 运行中" if running else "AutoClicker - 已停止"
-                    new_nid = self.tray_nid[:5] + (tip,)
-                    win32gui.Shell_NotifyIcon(win32gui.NIM_MODIFY, new_nid)
-                    self.tray_nid = new_nid
+                    self.tray_icon.title = text
                 except Exception:
                     pass
-            # 托盘右键菜单顶部插入动态“停止/启动”项，区分当前状态
+        except Exception:
+            pass
+
+    def _update_tray_status(self, running):
+        """T06152：托盘区分运行/暂停/停止，菜单提供暂停、继续与停止。"""
+        try:
+            self._update_tray_tooltip()
             menu = getattr(self, 'tray_menu', None)
             if menu is not None:
+                count = int(getattr(self, '_tray_dynamic_count', 0) or 0)
                 try:
-                    # 先删掉上一次的动态项及其分隔符，避免每次启停多一条分隔线
-                    if getattr(self, '_tray_dynamic_present', False):
-                        menu.delete(0, 1)
+                    if count:
+                        menu.delete(0, count - 1)
                 except Exception:
                     pass
+                inserted = 0
                 if running:
-                    menu.insert_command(0, label="停止点击", command=self.emergency_stop)
+                    if self.is_paused:
+                        menu.insert_command(0, label="继续点击", command=self.resume_clicking)
+                    else:
+                        menu.insert_command(0, label="暂停点击", command=self.pause_clicking)
+                    menu.insert_command(1, label="停止点击", command=self.emergency_stop)
+                    inserted = 2
                 else:
                     menu.insert_command(0, label="启动点击", command=self.start_clicking)
-                menu.insert_separator(1)
-                self._tray_dynamic_present = True
+                    inserted = 1
+                menu.insert_separator(inserted)
+                self._tray_dynamic_count = inserted + 1
         except Exception:
             pass
 
     def stop_clicking(self, reason=""):
         was_running = bool(getattr(self, 'is_running', False))
         self.is_running = False
+        self.is_paused = False
         self.countdown_cancelled = False
+        try:
+            self._pause_gate.resume()
+        except Exception:
+            pass
 
         if self.click_thread:
             try:
@@ -5046,6 +5228,10 @@ class AutoClicker:
         # FR-L01：Wayland 降级下停止后不得把启动按钮误恢复为可用
         self.start_btn.config(state=tk.NORMAL if self.input_ok else tk.DISABLED)
         self.stop_btn.config(state=tk.DISABLED)
+        try:
+            self.pause_btn.config(state=tk.DISABLED, text=" 暂停")
+        except Exception:
+            pass
         self.interval_entry.config(state=tk.NORMAL)
 
         # CX-12：托盘状态区分（已停止）
@@ -5080,7 +5266,55 @@ class AutoClicker:
             self.stop_clicking()
         else:
             self.start_clicking()
-            
+
+    # ==================== T06150 暂停 / 继续 ====================
+    def pause_clicking(self):
+        """暂停点击：保留计数与运行时长，点击线程进入闸门等待。"""
+        if not self.is_running or self.is_paused:
+            return False
+        self.is_paused = True
+        self._pause_gate.pause()
+        self._apply_pause_ui()
+        self.log_message("自动点击已暂停（计数保留，继续后从下一周期执行）")
+        return True
+
+    def resume_clicking(self):
+        """继续点击：清空暂停闸门；点击循环从下一周期重新计时。"""
+        if not self.is_running or not self.is_paused:
+            return False
+        self.is_paused = False
+        self._pause_gate.resume()
+        self._apply_pause_ui()
+        self.log_message("自动点击已继续")
+        return True
+
+    def toggle_pause(self):
+        if not self.is_running:
+            return False
+        return self.resume_clicking() if self.is_paused else self.pause_clicking()
+
+    def _apply_pause_ui(self):
+        """主线程刷新暂停相关按钮与状态环。"""
+        paused = bool(self.is_paused)
+        try:
+            self.pause_btn.config(text=" 继续" if paused else " 暂停",
+                                  state=tk.NORMAL if self.is_running else tk.DISABLED)
+        except Exception:
+            pass
+        if paused:
+            self._do_set_status("已暂停", self._color('warning'))
+            self._set_run_ring(
+                'paused', '已暂停', '计数保留',
+                detail="已暂停 · 计数保留 %d 次；继续后从下一周期执行" % self.click_count)
+        elif self.is_running:
+            self._do_set_status("运行中", self._color('success'))
+            self._set_run_ring('running', '运行中', '正在执行',
+                               detail='点击线程运行中')
+        try:
+            self._update_tray_status(True)
+        except Exception:
+            pass
+
     def test_click(self):
         # FR-L01：测试点击同样是真实模拟输入，Wayland 下先给出原因，避免"点了没反应"
         if not self.input_ok:
@@ -6035,7 +6269,7 @@ class AutoClicker:
         """设置系统托盘图标和菜单（跨平台）"""
         try:
             # 创建原生托盘菜单（使用tkinter Menu）
-            self._tray_dynamic_present = False
+            self._tray_dynamic_count = 0
             self.tray_menu = tk.Menu(self.root, tearoff=0,
                                      bg=self._color('surface'), fg=self._color('fg'))
             self.tray_menu.add_command(label="显示窗口", command=self.show_from_tray)

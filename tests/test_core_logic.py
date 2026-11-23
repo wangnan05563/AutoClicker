@@ -395,6 +395,20 @@ class ClickLoopTests(unittest.TestCase):
         self.assertEqual(obj._failsafe_base, (300, 300))
         self.assertNotIn('failsafe', obj.stop_clicking.call_args.kwargs['reason'])
 
+    def test_pause_gate_delays_first_click_until_resumed(self):
+        """T06150：暂停期间不点击，恢复后才执行且计数保留。"""
+        obj = self._base_obj()
+        obj._pause_gate = app_module._engine_PauseGate()
+        obj._pause_gate.pause()
+        import threading
+        threading.Timer(0.10, obj._pause_gate.resume).start()
+        started = time.perf_counter()
+        with mock.patch.object(app_module, 'click_mouse', return_value=True):
+            obj.click_loop()
+        elapsed = time.perf_counter() - started
+        self.assertEqual(obj.click_count, 1)
+        self.assertGreaterEqual(elapsed, 0.08)
+
 
 class ClickCountTests(unittest.TestCase):
     def _obj(self):

@@ -28,6 +28,28 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(engine.target_window_matches(' Excel ', '报价 Excel', 'EXCEL.EXE'))
         self.assertTrue(engine.target_window_matches('excel', '无关', 'excel.exe'))
         self.assertFalse(engine.target_window_matches('excel', '记事本', 'notepad.exe'))
+        # T06158：类名匹配与 | 多候选
+        self.assertTrue(engine.target_window_matches(
+            'Chrome_WidgetWin_1', '标题', '', 'Chrome_WidgetWin_1'))
+        self.assertTrue(engine.target_window_matches('notepad.exe|chrome', 'Chrome', '', ''))
+        self.assertFalse(engine.target_window_matches(
+            'notepad2|chrome', '记事本', 'notepad.exe', ''))
+
+    def test_pause_gate_blocks_until_resumed(self):
+        """T06150：暂停期间阻塞、恢复后放行；停止时立即返回 False。"""
+        import threading
+        import time
+        gate = engine.PauseGate()
+        self.assertTrue(gate.wait_until_resumed(lambda: True))
+        gate.pause()
+        self.assertTrue(gate.paused())
+        threading.Timer(0.08, gate.resume).start()
+        start = time.perf_counter()
+        self.assertTrue(gate.wait_until_resumed(lambda: True))
+        self.assertGreaterEqual(time.perf_counter() - start, 0.05)
+        self.assertFalse(gate.paused())
+        gate.pause()
+        self.assertFalse(gate.wait_until_resumed(lambda: False))
 
     def test_interval_conversion(self):
         self.assertEqual(engine.effective_interval_seconds(10, 's'), 10.0)

@@ -5,6 +5,7 @@
 UI 层只做取值、错误展示与状态机编排。
 """
 from datetime import datetime, timedelta
+import threading
 
 
 MAX_INTERVAL = 3600
@@ -14,6 +15,37 @@ MAX_CPS = 200
 WEEKDAY_LABELS = {'每天': [1, 2, 3, 4, 5, 6, 7], '工作日': [1, 2, 3, 4, 5], '周末': [6, 7]}
 
 
+class PauseGate:
+    """可复用暂停闸门：暂停期间不消耗点击计数，继续后重新排下一周期。"""
+
+    def __init__(self):
+        self._paused = threading.Event()
+
+    def pause(self):
+        self._paused.set()
+
+    def resume(self):
+        self._paused.clear()
+
+    def toggle(self):
+        if self._paused.is_set():
+            self.resume()
+        else:
+            self.pause()
+        return self._paused.is_set()
+
+    def paused(self):
+        return self._paused.is_set()
+
+    def wait_until_resumed(self, should_continue, poll_seconds=0.02):
+        """暂停时短轮询等待；返回 False 表示外部已要求停止。"""
+        while self._paused.is_set():
+            if not should_continue():
+                return False
+            self._paused.wait(poll_seconds)
+        return should_continue()
+
+
 def normalize_region(x1, y1, x2, y2):
     """把任意方向拖拽的矩形归一化为 (left, top, right, bottom)。"""
     left, right = sorted((int(x1), int(x2)))
@@ -21,12 +53,18 @@ def normalize_region(x1, y1, x2, y2):
     return left, top, right, bottom
 
 
-def target_window_matches(keyword, title, process_name=''):
-    """FR-E03：目标窗口关键字匹配（标题或进程名，大小写不敏感）。空关键字=不校验。"""
+def target_window_matches(keyword, title, process_name='', class_name=''):
+    """FR-E03/T06158：目标窗口关键字匹配（标题/进程/类名，大小写不敏感）。
+
+    ``|`` 分隔多个候选关键字，任一命中即可；空关键字=不校验。
+    """
     key = (keyword or '').strip().lower()
     if not key:
         return True
-    return key in (title or '').lower() or key in (process_name or '').lower()
+    fields = ((title or '').lower(), (process_name or '').lower(),
+              (class_name or '').lower())
+    return any(part and any(part in field for field in fields)
+               for part in (item.strip() for item in key.split('|')))
 
 
 def effective_interval_seconds(value, unit):

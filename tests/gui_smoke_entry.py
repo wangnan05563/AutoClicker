@@ -94,6 +94,58 @@ app._do_set_status('已停止', app._color('muted'))
 app.refresh_run_dashboard()
 print("GUI_DASHBOARD_OK")
 
+# T06150：暂停保留计数，继续恢复运行态；Tray/状态条同步
+assert app.pause_btn.winfo_manager() == 'pack'
+assert str(app.pause_btn.cget('state')) == 'disabled'
+app.is_running = True
+app.click_count = 7
+assert app.pause_clicking() is True
+root.update_idletasks()
+assert app.is_paused is True
+assert app.click_count == 7
+assert '继续' in app.pause_btn.cget('text')
+assert app.status_text_label.cget('text') == '已暂停'
+assert app._ring_state == 'paused'
+assert '计数保留 7 次' in app.run_state_detail_var.get()
+assert app.resume_clicking() is True
+root.update_idletasks()
+assert app.is_paused is False
+assert '暂停' in app.pause_btn.cget('text')
+assert app.status_text_label.cget('text') == '运行中'
+app.is_running = False
+app._do_set_status('已停止', app._color('muted'))
+print("GUI_PAUSE_OK")
+
+# T06152：托盘 Tooltip 展示状态/剩余/档案，暂停态可辨识
+app.is_running = True
+app.is_paused = True
+app.click_limit = 10
+app.click_count = 3
+app.config['current_profile'] = '办公'
+app._update_tray_tooltip()
+assert '已暂停' in app._tray_tip_text
+assert '剩余 7 次' in app._tray_tip_text
+assert '档案:办公' in app._tray_tip_text
+app.is_running = False
+app.is_paused = False
+app.click_limit = 0
+app.click_count = 0
+print("GUI_TRAY_OK")
+
+# T06153：会话保持状态条三态可刷新
+app.prevent_sleep_var.set(False)
+app._refresh_session_keep()
+assert '未启用' in app.sb_session_label.cget('text')
+app.prevent_sleep_var.set(True)
+app.session_keep_state = '拦截'
+app.session_keep_reason = '组策略拒绝'
+app._refresh_session_keep()
+assert '拦截' in app.sb_session_label.cget('text')
+assert '组策略拒绝' in app.sb_session_label.cget('text')
+app.prevent_sleep_var.set(False)
+app._refresh_session_keep()
+print("GUI_SESSION_OK")
+
 # FR-25：Simple 隐藏高级卡片/记录页入口，Advanced 恢复且不重置参数
 assert app.config.get('ui_mode') == 'simple', app.config.get('ui_mode')
 assert app.p1_card.winfo_manager() == ''

@@ -61,7 +61,7 @@ MOUSEEVENTF_MIDDLEUP = 0x0040
 
 
 def get_foreground_window_info():
-    """返回当前前台窗口 (title, process_name)；不支持的平台返回 ('','')。"""
+    """返回当前前台窗口 (title, process_name, class_name)；不支持的平台返回空串。"""
     if IS_WINDOWS:
         try:
             import ctypes
@@ -69,9 +69,11 @@ def get_foreground_window_info():
             u = ctypes.windll.user32
             hwnd = u.GetForegroundWindow()
             if not hwnd:
-                return '', ''
+                return '', '', ''
             buf = ctypes.create_unicode_buffer(512)
             u.GetWindowTextW(hwnd, buf, 512)
+            cls_buf = ctypes.create_unicode_buffer(256)
+            u.GetClassNameW(hwnd, cls_buf, 256)
             pid = wintypes.DWORD()
             u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             proc = ''
@@ -86,17 +88,17 @@ def get_foreground_window_info():
                     k32.CloseHandle(handle)
             except Exception:
                 pass
-            return buf.value or '', proc or ''
+            return buf.value or '', proc or '', cls_buf.value or ''
         except Exception:
-            return '', ''
+            return '', '', ''
     if IS_LINUX:
         try:
             import subprocess
             out = subprocess.run(['xdotool', 'getactivewindow', 'getwindowname'],
                                  capture_output=True, text=True, timeout=2)
-            return (out.stdout or '').strip(), ''
+            return (out.stdout or '').strip(), '', ''
         except Exception:
-            return '', ''
+            return '', '', ''
     if IS_MACOS:
         try:
             import subprocess
@@ -104,10 +106,10 @@ def get_foreground_window_info():
                 ['osascript', '-e',
                  'tell application "System Events" to get name of first application process whose frontmost is true'],
                 capture_output=True, text=True, timeout=2)
-            return '', (out.stdout or '').strip()
+            return '', (out.stdout or '').strip(), ''
         except Exception:
-            return '', ''
-    return '', ''
+            return '', '', ''
+    return '', '', ''
 
 
 def restore_system_settings():
