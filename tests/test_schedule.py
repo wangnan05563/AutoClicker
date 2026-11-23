@@ -18,6 +18,7 @@ class ScheduleTests(unittest.TestCase):
         self.app.is_running = False
         self.app._schedule_last_occurrence = None
         self.app._schedule_active_occurrence = None
+        self.app._schedule_active_end = None
         self.app.logs = []
         self.app.log_message = lambda text: self.app.logs.append(str(text))
         self.app.start_clicking = lambda source='manual': setattr(self.app, 'is_running', True)
@@ -55,6 +56,38 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(m.AutoClicker._label_to_weekdays('工作日'), [1, 2, 3, 4, 5])
         self.assertEqual(m.AutoClicker._label_to_weekdays('周末'), [6, 7])
         self.assertEqual(m.AutoClicker._weekdays_to_label([1, 2, 3, 4, 5]), '工作日')
+
+    def test_three_periods_run_and_stop_each_window(self):
+        self.app.config['schedule'] = {
+            'enabled': True, 'start_at': '09:00', 'stop_after_min': 30,
+            'weekdays': [1, 2, 3, 4, 5],
+            'periods': [
+                {'start_at': '09:00', 'stop_after_min': 30},
+                {'start_at': '13:00', 'stop_after_min': 30},
+                {'start_at': '18:00', 'stop_after_min': 30},
+            ],
+        }
+        self.assertEqual(self.app._schedule_check(datetime(2026, 11, 16, 9, 0), False), 'started')
+        self.assertEqual(self.app._schedule_check(datetime(2026, 11, 16, 9, 30), True), 'stopped')
+        self.assertEqual(self.app._schedule_check(datetime(2026, 11, 16, 13, 0), False), 'started')
+        self.assertEqual(self.app._schedule_check(datetime(2026, 11, 16, 13, 31), True), 'stopped')
+        self.assertEqual(self.app._schedule_check(datetime(2026, 11, 16, 18, 0), False), 'started')
+
+    def test_weekend_catchup_triggers_once(self):
+        self.app.config['schedule'] = {
+            'enabled': True, 'start_at': '09:00', 'stop_after_min': 30,
+            'weekdays': [1, 2, 3, 4, 5],
+            'periods': [
+                {'start_at': '09:00', 'stop_after_min': 30},
+                {'start_at': '13:00', 'stop_after_min': 30},
+                {'start_at': '18:00', 'stop_after_min': 30},
+            ],
+        }
+        self.assertEqual(self.app._schedule_check(datetime(2026, 11, 20, 18, 0), False), 'started')
+        self.app.is_running = False
+        self.assertEqual(self.app._schedule_check(datetime(2026, 11, 21, 9, 0), False), 'noop')
+        self.assertEqual(self.app._schedule_check(datetime(2026, 11, 23, 9, 5), False), 'started')
+        self.assertEqual(self.app._schedule_check(datetime(2026, 11, 23, 9, 6), False), 'noop')
 
 
 if __name__ == '__main__':

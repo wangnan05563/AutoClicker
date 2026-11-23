@@ -50,6 +50,43 @@ for page in ('run', 'rules', 'records', 'settings'):
     assert elapsed < 0.1, 'page switch too slow: %s %.3fs' % (page, elapsed)
 print("GUI_SMOKE_OK")
 
+# T06160/T06161：非法输入行内红字、不弹模态；主按钮可被 Tab 聚焦
+app.interval_var.set('abc')
+app.interval_unit_var.set('s')
+assert app._read_interval() is None
+root.update_idletasks()
+assert '间隔' in app.field_error_label.cget('text'), app.field_error_label.cget('text')
+app.interval_var.set('7')
+assert app._read_interval() == 7
+assert app.field_error_label.cget('text') == ''
+app.schedule_periods_var.set('09:00')
+app.on_schedule_apply()
+root.update_idletasks()
+assert '定时计划参数无效' in app.field_error_label.cget('text')
+assert app.schedule_periods_entry.cget('style') == 'Error.TEntry'
+app.schedule_periods_var.set('09:00-30;13:00-30;18:00-0')
+app.on_schedule_apply()
+root.update_idletasks()
+assert len(app.config['schedule']['periods']) == 3
+assert app.field_error_label.cget('text') == ''
+print("GUI_FORM_STATES_OK")
+
+# T06161：主操作按钮进入 Tab 序
+assert str(app.start_btn.cget('takefocus')) not in ('0', 'False', '')
+assert str(app.pause_btn.cget('takefocus')) not in ('0', 'False', '')
+print("GUI_KEYBOARD_OK")
+
+# T06162：低对比度强调色自动调深，重置后恢复主题色
+app.accent_var.set('#AAAAAA')
+app.on_accent_apply()
+root.update_idletasks()
+assert app.config['accent_color'] != '#AAAAAA'
+assert app.config['accent_color'].startswith('#')
+assert '自动调深' in app.accent_hint_var.get(), app.accent_hint_var.get()
+app.on_accent_reset()
+assert app.config['accent_color'] == ''
+print("GUI_ACCENT_OK")
+
 # T06155：运行历史摘要与趋势图可刷新（30 条记录，覆盖 AC-17）
 app.run_history = app_module._history.empty_history()
 for _i in range(30):

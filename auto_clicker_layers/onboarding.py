@@ -16,7 +16,7 @@ TEMPLATES = (
     {
         'id': 'keep_online',
         'name': '保持在线',
-        'icon': '💻',
+        'icon': 'laptop',
         'description': '每 60 秒轻微移动鼠标，不执行点击；适合远程会话/在线状态保持。',
         'patch': {
             'interval_seconds': 60,
@@ -33,7 +33,7 @@ TEMPLATES = (
     {
         'id': 'checkin',
         'name': '挂机签到',
-        'icon': '✅',
+        'icon': 'check',
         'description': '启动后点击目标 1 次即停止；适合每日签到、领奖、打卡按钮。',
         'patch': {
             'interval_seconds': 300,
@@ -50,7 +50,7 @@ TEMPLATES = (
     {
         'id': 'button_repeat',
         'name': '固定按钮连点',
-        'icon': '🔁',
+        'icon': 'repeat',
         'description': '每 1 秒点击同一目标，不设次数上限；适合游戏/工具按钮连续操作。',
         'patch': {
             'interval_seconds': 1,
@@ -67,7 +67,7 @@ TEMPLATES = (
     {
         'id': 'custom',
         'name': '自定义',
-        'icon': '⚙️',
+        'icon': 'gear',
         'description': '保留当前参数，只把界面切到简单模式，稍后可在规则页调整。',
         'patch': {
             'interval_seconds': 10,
@@ -87,7 +87,7 @@ SAFE_ID = 'safe'
 SAFE_TEMPLATE = {
     'id': SAFE_ID,
     'name': '推荐安全',
-    'icon': '🛡️',
+    'icon': 'shield',
     'description': '10 秒一次、3 秒倒计时、鼠标位移急停、防锁屏，适合第一次试用。',
     'patch': {
         'interval_seconds': 10,

@@ -164,6 +164,25 @@ class EngineTests(unittest.TestCase):
                          '11-23 09:00')
         self.assertEqual(engine.schedule_next_text(datetime(2026, 11, 16, 9, 0), (9, 0), []), '--')
 
+    def test_multi_periods_text_and_latest(self):
+        periods = engine.periods_from_text('09:00-30;13:00-30;18:00-0')
+        self.assertEqual(len(periods), 3)
+        self.assertEqual(periods[0]['start'], (9, 0))
+        self.assertEqual(engine.periods_to_text(periods), '09:00-30;13:00-30;18:00-0')
+        latest = engine.schedule_latest_period(datetime(2026, 11, 20, 18, 5), periods)
+        self.assertEqual(latest['occurrence'], datetime(2026, 11, 20, 18, 0))
+        latest_sat = engine.schedule_latest_period(datetime(2026, 11, 21, 9, 0), periods)
+        self.assertEqual(latest_sat['occurrence'], datetime(2026, 11, 20, 18, 0))
+        self.assertGreater(datetime(2026, 11, 21, 9, 0),
+                           engine.schedule_grace_end(latest_sat['occurrence'],
+                                                     latest_sat['stop_after_min']))
+        self.assertEqual(engine.schedule_next_period_text(
+            datetime(2026, 11, 21, 10, 0), periods), '11-23 09:00')
+        with self.assertRaises(ValueError):
+            engine.periods_from_text('09:00')
+        with self.assertRaises(ValueError):
+            engine.periods_from_text('09:00-9999')
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -295,3 +295,120 @@ def schedule_next_text(now, start, days):
         if occ.isoweekday() in days and occ > now:
             return occ.strftime('%m-%d %H:%M')
     return '--'
+
+
+# ==================== 周计划多时段（T06157） ====================
+MAX_SCHEDULE_PERIODS = 8
+
+
+def periods_from_text(text, default_days=None):
+    """把 ``09:00-30;13:00-45`` 解析为多时段列表；空串返回 []。"""
+    raw = str(text or '').replace('；', ';').replace('，', ';').strip()
+    if not raw:
+        return []
+    periods = []
+    for token in raw.split(';'):
+        token = token.strip()
+        if not token:
+            continue
+        if '-' not in token:
+            raise ValueError('时段格式需为 HH:MM-分钟，收到：%s' % token)
+        start_text, stop_text = token.split('-', 1)
+        start = parse_schedule_start(start_text)
+        try:
+            stop_min = int(str(stop_text).strip() or 0)
+        except ValueError:
+            raise ValueError('运行分钟需为整数，收到：%s' % token)
+        if stop_min < 0 or stop_min > 1440:
+            raise ValueError('运行分钟需在 0–1440，收到：%s' % token)
+        periods.append({'start_at': '%02d:%02d' % start,
+                        'stop_after_min': stop_min,
+                        'weekdays': list(default_days or [1, 2, 3, 4, 5])})
+    return normalize_schedule_periods(periods)
+
+
+def periods_to_text(periods):
+    parts = []
+    for item in normalize_schedule_periods(periods):
+        start = item['start']
+        parts.append('%02d:%02d-%d' % (start[0], start[1], item['stop_after_min']))
+    return ';'.join(parts)
+
+
+def normalize_schedule_periods(periods, fallback=None):
+    """规范化多时段；无效项抛 ValueError，全部无效时回落到 fallback/单时段。"""
+    if periods is None:
+        periods = []
+    if isinstance(periods, dict):
+        periods = [periods]
+    if not isinstance(periods, (list, tuple)):
+        raise ValueError('多时段需为列表')
+    normalized = []
+    for item in periods:
+        if not isinstance(item, dict):
+            raise ValueError('多时段项需为对象')
+        raw_start = item.get('start_at', item.get('start', '09:00'))
+        if isinstance(raw_start, (list, tuple)) and len(raw_start) == 2:
+            start = (int(raw_start[0]), int(raw_start[1]))
+            if not (0 <= start[0] <= 23 and 0 <= start[1] <= 59):
+                raise ValueError('时间需在 00:00–23:59')
+        else:
+            start = parse_schedule_start(raw_start)
+        try:
+            stop_min = int(item.get('stop_after_min', item.get('stop', 0)) or 0)
+        except (TypeError, ValueError):
+            raise ValueError('运行分钟需为整数')
+        if stop_min < 0 or stop_min > 1440:
+            raise ValueError('运行分钟需在 0–1440')
+        days = item.get('weekdays', (fallback or {}).get('weekdays') if isinstance(fallback, dict) else None)
+        if days is None:
+            days = (fallback or {}).get('weekdays') if isinstance(fallback, dict) else [1, 2, 3, 4, 5]
+        try:
+            days = sorted(set(int(d) for d in days if 1 <= int(d) <= 7))
+        except (TypeError, ValueError):
+            days = [1, 2, 3, 4, 5]
+        if not days:
+            days = [1, 2, 3, 4, 5]
+        normalized.append({'start': start, 'stop_after_min': stop_min, 'weekdays': days})
+    if not normalized and isinstance(fallback, dict):
+        start = fallback.get('start', (9, 0))
+        if not (isinstance(start, (list, tuple)) and len(start) == 2):
+            start = parse_schedule_start(start)
+        legacy_days = fallback.get('weekdays', [1, 2, 3, 4, 5])
+        normalized = [{
+            'start': (int(start[0]), int(start[1])),
+            'stop_after_min': max(0, int(fallback.get('stop_after_min', 0) or 0)),
+            'weekdays': sorted(set(int(d) for d in legacy_days if 1 <= int(d) <= 7)) or [1, 2, 3, 4, 5],
+        }]
+    if len(normalized) > MAX_SCHEDULE_PERIODS:
+        raise ValueError('多时段最多 %d 段' % MAX_SCHEDULE_PERIODS)
+    return sorted(normalized, key=lambda p: p['start'])
+
+
+def schedule_latest_period(now, periods):
+    """返回 <= now 的最近一个时段 {occurrence, stop_after_min}；跨零点看前一天。"""
+    latest = None
+    for period in normalize_schedule_periods(periods):
+        hh, mm = period['start']
+        base = datetime.combine(now.date(), datetime.min.time()).replace(hour=hh, minute=mm)
+        for delta in (-1, 0):
+            occ = base + timedelta(days=delta)
+            if occ.isoweekday() in period['weekdays'] and occ <= now:
+                if latest is None or occ > latest['occurrence']:
+                    latest = dict(occurrence=occ, stop_after_min=period['stop_after_min'])
+    return latest
+
+
+def schedule_next_period_text(now, periods):
+    """返回下一段生效时段的 ``MM-dd HH:MM``；8 天内无则 ``--``。"""
+    best = None
+    for period in normalize_schedule_periods(periods):
+        hh, mm = period['start']
+        base = datetime.combine(now.date(), datetime.min.time()).replace(hour=hh, minute=mm)
+        for delta in range(0, 8):
+            occ = base + timedelta(days=delta)
+            if occ.isoweekday() in period['weekdays'] and occ > now:
+                if best is None or occ < best:
+                    best = occ
+                break
+    return best.strftime('%m-%d %H:%M') if best else '--'

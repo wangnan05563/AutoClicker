@@ -43,6 +43,11 @@ from auto_clicker_layers.engine import (
     schedule_occurrence as _engine_schedule_occurrence,
     schedule_grace_end as _engine_schedule_grace_end,
     schedule_next_text as _engine_schedule_next_text,
+    normalize_schedule_periods as _engine_normalize_periods,
+    periods_from_text as _engine_periods_from_text,
+    periods_to_text as _engine_periods_to_text,
+    schedule_latest_period as _engine_schedule_latest_period,
+    schedule_next_period_text as _engine_schedule_next_period_text,
 )
 from auto_clicker_layers.theme import (
     THEMES as _THEME_PALETTES,
@@ -55,6 +60,8 @@ from auto_clicker_layers.theme import (
     validate_theme_pack as _theme_validate_pack,
 )
 from auto_clicker_layers.version import APP_VERSION, BUILD_ID
+from auto_clicker_layers import design_tokens as _design_tokens
+from auto_clicker_layers import accent as _accent
 from auto_clicker_layers.config import (
     clone_defaults as _config_clone_defaults,
     read_config as _config_read,
@@ -455,6 +462,7 @@ class AutoClicker:
         self._init_theme()
         self._init_ui_fonts()
         self.setup_ui()
+        self._setup_keyboard_nav()
         # FR-27/T06154：取点遮罩预热延后到首屏可见后，避免全屏 Toplevel/Canvas
         # 在窗口映射前阻塞冷启动；首次取点前仍会完成一次控件树预热。
         self.root.after(5000, lambda: prewarm_region_selector(self.root))
@@ -611,7 +619,11 @@ class AutoClicker:
         「标签小、下拉/按钮巨大」的字号割裂，并撑爆按钮导致文字裁切。
         """
         from tkinter import font as tkfont
-        family, size = '微软雅黑', 9
+        family, size = '微软雅黑', _design_tokens.BASE_FONT_PT
+        try:
+            family = _design_tokens.resolve_font_family(tkfont.families(self.root)) or family
+        except Exception:
+            pass
         self.ui_font_size = size
         self.ui_font = (family, size)
         font_str = '%s %d' % (family, size)
@@ -692,6 +704,17 @@ class AutoClicker:
                 d.ellipse([size*0.18, size*0.18, size*0.82, size*0.82], outline=c, width=2)
                 d.line([(size*0.5, size*0.5), (size*0.5, size*0.30)], fill=c, width=2)
                 d.line([(size*0.5, size*0.5), (size*0.68, size*0.5)], fill=c, width=2)
+            elif name == 'check':
+                d.line([(size*0.18, size*0.52), (size*0.42, size*0.76),
+                        (size*0.84, size*0.28)], fill=c, width=2)
+            elif name == 'repeat':
+                d.arc([size*0.18, size*0.22, size*0.82, size*0.78], 200, 340, fill=c, width=2)
+                d.arc([size*0.18, size*0.22, size*0.82, size*0.78], 20, 160, fill=c, width=2)
+                d.line([(size*0.18, size*0.50), (size*0.30, size*0.38),
+                        (size*0.22, size*0.28)], fill=c, width=2)
+            elif name == 'laptop':
+                d.rectangle([size*0.22, size*0.24, size*0.78, size*0.66], outline=c, width=2)
+                d.line([(size*0.14, size*0.78), (size*0.86, size*0.78)], fill=c, width=2)
             else:
                 return None
             return ImageTk.PhotoImage(img)
@@ -736,8 +759,15 @@ class AutoClicker:
         return _theme_system_is_dark()
 
     def _resolve_palette(self):
-        return _theme_resolve_palette(getattr(self, 'theme_mode', 'light'), self.THEMES,
-                                      self._system_is_dark)
+        pal = dict(_theme_resolve_palette(getattr(self, 'theme_mode', 'light'), self.THEMES,
+                                         self._system_is_dark))
+        accent = str((getattr(self, 'config', {}) or {}).get('accent_color') or '').strip()
+        if accent:
+            try:
+                pal = _accent.apply_to_palette(pal, accent)
+            except ValueError:
+                pass
+        return pal
 
     def _current_theme_display_name(self):
         if self.theme_mode == 'system':
@@ -820,8 +850,8 @@ class AutoClicker:
                 btn.configure(bg=pal[key], activebackground=self._shade(pal[key]),
                               fg=on_key, activeforeground=on_key)
         icon_specs = (
-            ('start_btn', '_icon_play', 'play', 18, 'success'),
-            ('stop_btn', '_icon_stop', 'stop', 18, 'danger'),
+            ('start_btn', '_icon_play', 'play', 20, 'success'),
+            ('stop_btn', '_icon_stop', 'stop', 20, 'danger'),
             ('test_btn', '_icon_target', 'target', 16, 'primary'),
         )
         if not getattr(self, '_icons_ready', False):
@@ -841,6 +871,40 @@ class AutoClicker:
             return
         self._icons_ready = True
         self._recolor_action_buttons(self._current_palette)
+
+    def _setup_keyboard_nav(self):
+        """T06161：主操作按钮纳入 Tab 序，Enter 激活当前焦点按钮。"""
+        for attr in ('start_btn', 'pause_btn', 'stop_btn', 'test_btn', 'set_area_btn'):
+            widget = getattr(self, attr, None)
+            if widget is None:
+                continue
+            try:
+                widget.configure(takefocus=True)
+            except Exception:
+                pass
+        try:
+            self.root.bind('<Return>', self._on_keyboard_activate, add='+')
+        except Exception:
+            pass
+
+    def _on_keyboard_activate(self, event=None):
+        """焦点在按钮上时 Enter=点击；输入框/下拉框中不拦截 Enter。"""
+        try:
+            focus = self.root.focus_get()
+            if focus is None:
+                return None
+            if isinstance(focus, (tk.Entry, tk.Text, ttk.Entry, ttk.Combobox)):
+                return None
+            state = str(focus.cget('state')) if 'state' in focus.keys() else ''
+            if state == 'disabled':
+                return None
+            invoke = getattr(focus, 'invoke', None)
+            if callable(invoke):
+                invoke()
+                return 'break'
+        except Exception:
+            pass
+        return None
 
     def _apply_ttk_theme_styles(self, pal):
         """TH-01/TH-02：把语义调色板落到 ttk 全局样式，深色主题不能只改变量。
@@ -903,16 +967,25 @@ class AutoClicker:
                     style.configure(name, **opts)
                 except Exception:
                     pass
+            try:
+                style.configure('Error.TEntry', fieldbackground=pal['surface_alt'],
+                                foreground=pal['danger'], bordercolor=pal['danger'],
+                                insertcolor=pal['danger'])
+            except Exception:
+                pass
             for name, opts in (
                 ('TCombobox', {'fieldbackground': [('readonly', pal['surface'])],
                                'foreground': [('readonly', pal['fg'])],
                                'background': [('readonly', pal['surface'])],
                                'arrowcolor': [('readonly', pal['fg'])]}),
-                ('TEntry', {'fieldbackground': [('disabled', pal['surface'])]}),
+                ('TEntry', {'bordercolor': [('focus', pal['focus'])],
+                            'fieldbackground': [('disabled', pal['surface'])]}),
                 ('TCheckbutton', {'background': [('active', pal['bg'])],
                                   'foreground': [('active', pal['fg'])]}),
                 ('TButton', {'background': [('active', pal['bg'])],
-                             'foreground': [('active', pal['fg'])]}),
+                             'foreground': [('active', pal['fg'])],
+                             'bordercolor': [('focus', pal['focus']),
+                                             ('active', pal['focus'])]}),
             ):
                 try:
                     style.map(name, **opts)
@@ -1672,6 +1745,36 @@ class AutoClicker:
         mode = getattr(self, '_theme_name_map', {}).get(self.theme_var.get(), 'light')
         self.on_theme_change(mode)
 
+    def on_accent_apply(self):
+        """T06162：强调色写入；低对比度自动调深，仍不达标则拒绝。"""
+        raw = (self.accent_var.get() or '').strip()
+        if not raw:
+            self.on_accent_reset()
+            return
+        try:
+            base = _theme_resolve_palette(self.theme_mode, self.THEMES, self._system_is_dark)
+            pal = _accent.apply_to_palette(base, raw)
+        except ValueError as exc:
+            self.accent_hint_var.set('输入无效：%s' % exc)
+            return
+        self.config['accent_color'] = pal['primary']
+        self.save_config()
+        self._apply_theme()
+        if pal.get('accent_adjusted'):
+            self.accent_hint_var.set(
+                "低对比度已自动调深为 %s（对比度 %.2f:1）" % (
+                    pal['primary'], pal.get('accent_ratio', 0)))
+        else:
+            self.accent_hint_var.set("已应用强调色 %s（对比度 %.2f:1）" % (
+                pal['primary'], pal.get('accent_ratio', 0)))
+
+    def on_accent_reset(self):
+        self.config['accent_color'] = ''
+        self.accent_var.set('')
+        self.accent_hint_var.set("已恢复当前主题的强调色")
+        self.save_config()
+        self._apply_theme()
+
     def _poll_system_theme(self):
         """system 模式下每 5s 检测系统深浅色变化并应用（TH-03）"""
         try:
@@ -1734,6 +1837,13 @@ class AutoClicker:
                 except ValueError:
                     pass
                 sched['weekdays'] = self._label_to_weekdays(self.schedule_days_var.get())
+                period_text = getattr(self, 'schedule_periods_var', None)
+                if period_text is not None:
+                    try:
+                        sched['periods'] = _engine_periods_from_text(
+                            period_text.get(), sched['weekdays'])
+                    except ValueError:
+                        pass
                 self.config['schedule'] = sched
             self.save_config()
         except Exception as e:
@@ -1775,39 +1885,60 @@ class AutoClicker:
         """返回 <= now 的最近一次生效计划（含跨零点前一天）。"""
         return _engine_schedule_occurrence(now, start, days)
 
+    def _schedule_periods(self):
+        """T06157：多时段优先；无 periods 时把单时段字段视为唯一时段。"""
+        sched = self.config.get('schedule')
+        if not isinstance(sched, dict):
+            sched = {}
+        enabled, start, stop_min, days = self._schedule_settings()
+        fallback = {'start': start, 'stop_after_min': stop_min, 'weekdays': days}
+        raw_periods = sched.get('periods')
+        if raw_periods:
+            try:
+                return _engine_normalize_periods(raw_periods, fallback=fallback)
+            except ValueError:
+                pass
+        return _engine_normalize_periods([], fallback=fallback)
+
     def _schedule_next_text(self, now=None):
-        _, start, stop_min, days = self._schedule_settings()
-        return _engine_schedule_next_text(now or datetime.now(), start, days)
+        now = now or datetime.now()
+        return _engine_schedule_next_period_text(now, self._schedule_periods())
 
     def _schedule_check(self, now=None, running=None):
         """执行一次定时判断。返回 started/stopped/noop，供探针断言。"""
-        enabled, start, stop_min, days = self._schedule_settings()
+        enabled = self._schedule_settings()[0]
         if not enabled:
             self._schedule_active_occurrence = None
             return 'noop'
         now = now or datetime.now()
         running = self.is_running if running is None else running
-        occ = self._schedule_occurrence(now, start, days)
+        latest = _engine_schedule_latest_period(now, self._schedule_periods())
+        if latest is None:
+            return 'noop'
+        occ = latest['occurrence']
+        stop_min = latest['stop_after_min']
+        key = occ.isoformat(timespec='minutes')
+        grace_end = _engine_schedule_grace_end(occ, stop_min)
         result = 'noop'
-        if occ is not None:
-            key = occ.isoformat(timespec='minutes')
-            grace_end = _engine_schedule_grace_end(occ, stop_min)
-            if (not running and now <= grace_end and key != self._schedule_last_occurrence):
-                self._schedule_last_occurrence = key
-                self._schedule_active_occurrence = key
-                self.start_clicking(source='schedule')
-                if self.is_running:
-                    self.log_message("定时计划触发：%s 启动" % occ.strftime('%m-%d %H:%M'))
-                    result = 'started'
-                else:
-                    self._schedule_active_occurrence = None
-                    self.log_message("定时计划触发失败：启动参数校验未通过")
-            if running and stop_min > 0 and self._schedule_active_occurrence == key:
-                stop_at = occ + timedelta(minutes=stop_min)
-                if now >= stop_at:
-                    self._schedule_active_occurrence = None
-                    self.stop_clicking(reason="定时计划运行 %d 分钟结束" % stop_min)
-                    result = 'stopped'
+        if not running and now <= grace_end and key != self._schedule_last_occurrence:
+            self._schedule_last_occurrence = key
+            self._schedule_active_occurrence = key
+            self._schedule_active_end = (occ + timedelta(minutes=stop_min)) if stop_min > 0 else None
+            self.start_clicking(source='schedule')
+            if self.is_running:
+                self.log_message("定时计划触发：%s 启动" % occ.strftime('%m-%d %H:%M'))
+                result = 'started'
+            else:
+                self._schedule_active_occurrence = None
+                self._schedule_active_end = None
+                self.log_message("定时计划触发失败：启动参数校验未通过")
+        if running and self._schedule_active_occurrence == key:
+            active_end = getattr(self, '_schedule_active_end', None)
+            if active_end is not None and now >= active_end:
+                self._schedule_active_occurrence = None
+                self._schedule_active_end = None
+                self.stop_clicking(reason="定时计划运行 %d 分钟结束" % stop_min)
+                result = 'stopped'
         return result
 
     def _schedule_tick(self):
@@ -1829,30 +1960,62 @@ class AutoClicker:
                 pass
 
     def on_schedule_apply(self):
+        entries = [entry for entry in (
+            getattr(self, 'schedule_start_entry', None),
+            getattr(self, 'schedule_stop_entry', None),
+            getattr(self, 'schedule_periods_entry', None)) if entry is not None]
+        for entry in entries:
+            try:
+                entry.configure(style='TEntry')
+            except Exception:
+                pass
+        self.clear_field_error()
         try:
             start = self._parse_schedule_start(self.schedule_start_var.get())
             stop_min = int(self.schedule_stop_var.get() or 0)
             if stop_min < 0 or stop_min > 1440:
                 raise ValueError('运行时长需为 0–1440 分钟')
             days = self._label_to_weekdays(self.schedule_days_var.get())
+            period_text = ''
+            if getattr(self, 'schedule_periods_var', None) is not None:
+                period_text = self.schedule_periods_var.get().strip()
+            periods = _engine_periods_from_text(period_text, days) if period_text else []
+            if len(periods) > 1:
+                start = periods[0]['start']
+                stop_min = periods[0]['stop_after_min']
             sched = {'enabled': bool(self.schedule_enabled_var.get()),
                      'start_at': '%02d:%02d' % start,
-                     'stop_after_min': stop_min, 'weekdays': days}
+                     'stop_after_min': stop_min, 'weekdays': days,
+                     'periods': periods}
             self.config['schedule'] = sched
             self._schedule_last_occurrence = None
             self._schedule_active_occurrence = None
             self.save_config()
             if sched['enabled']:
-                text = "定时计划已启用：%s 启动，运行 %s 分钟，%s；下次 %s" % (
-                    sched['start_at'], stop_min if stop_min else '不限',
-                    self.schedule_days_var.get(), self._schedule_next_text())
+                if periods:
+                    plan_text = '；'.join('%02d:%02d-%s' % (
+                        item['start'][0], item['start'][1],
+                        item['stop_after_min'] if item['stop_after_min'] else '不限')
+                        for item in periods)
+                    text = "定时计划已启用：多时段 %s，%s；下次 %s" % (
+                        plan_text, self.schedule_days_var.get(), self._schedule_next_text())
+                else:
+                    text = "定时计划已启用：%s 启动，运行 %s 分钟，%s；下次 %s" % (
+                        sched['start_at'], stop_min if stop_min else '不限',
+                        self.schedule_days_var.get(), self._schedule_next_text())
                 self.schedule_hint_label.config(text=text)
                 self.log_message(text)
             else:
                 self.schedule_hint_label.config(text="定时计划已关闭")
                 self.log_message("定时计划已关闭")
         except Exception as e:
-            messagebox.showerror("定时计划", "参数无效: " + str(e))
+            for entry in entries:
+                try:
+                    entry.configure(style='Error.TEntry')
+                except Exception:
+                    pass
+            self.show_field_error("定时计划参数无效：" + str(e))
+            self.schedule_hint_label.config(text="定时计划未应用，请修正标红字段")
     
     def on_prevent_sleep_changed(self):
         """防止系统锁屏选项改变时的回调（即时启停后台保活）"""
@@ -3415,6 +3578,8 @@ class AutoClicker:
             self.schedule_start_var.set(str(sched.get('start_at', '09:00')))
             self.schedule_stop_var.set(str(sched.get('stop_after_min', 0)))
             self.schedule_days_var.set(self._weekdays_to_label(sched.get('weekdays', [1, 2, 3, 4, 5])))
+            if getattr(self, 'schedule_periods_var', None) is not None:
+                self.schedule_periods_var.set(_engine_periods_to_text(sched.get('periods') or []))
             self._refresh_multi_point_listbox()
         except Exception as e:
             print("回填 UI 失败: " + str(e))
@@ -4061,17 +4226,30 @@ class AutoClicker:
         ttk.Checkbutton(sched_row, text="定时计划", variable=self.schedule_enabled_var).pack(side=tk.LEFT)
         ttk.Label(sched_row, text="启动 HH:MM").pack(side=tk.LEFT, padx=(6, 2))
         self.schedule_start_var = tk.StringVar(value=str(sched_cfg.get('start_at', '09:00')))
-        ttk.Entry(sched_row, textvariable=self.schedule_start_var, width=7,
-                  justify='center').pack(side=tk.LEFT)
+        self.schedule_start_entry = ttk.Entry(sched_row, textvariable=self.schedule_start_var, width=7,
+                  justify='center')
+        self.schedule_start_entry.pack(side=tk.LEFT)
         ttk.Label(sched_row, text="运行(分)").pack(side=tk.LEFT, padx=(8, 2))
         self.schedule_stop_var = tk.StringVar(value=str(sched_cfg.get('stop_after_min', 0)))
-        ttk.Entry(sched_row, textvariable=self.schedule_stop_var, width=5,
-                  justify='center').pack(side=tk.LEFT)
+        self.schedule_stop_entry = ttk.Entry(sched_row, textvariable=self.schedule_stop_var, width=5,
+                  justify='center')
+        self.schedule_stop_entry.pack(side=tk.LEFT)
         self.schedule_days_var = tk.StringVar(
             value=self._weekdays_to_label(sched_cfg.get('weekdays', [1, 2, 3, 4, 5])))
         ttk.Combobox(sched_row, textvariable=self.schedule_days_var, width=7,
                      values=['每天', '工作日', '周末'], state='readonly').pack(side=tk.LEFT, padx=(8, 2))
         ttk.Button(sched_row, text="应用计划", command=self.on_schedule_apply).pack(side=tk.LEFT)
+        # T06157：周计划多时段（分号分隔，格式 HH:MM-运行分钟；留空则用上面的单时段）
+        periods_row = ttk.Frame(p1b_card)
+        periods_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(periods_row, text="多时段").pack(side=tk.LEFT)
+        self.schedule_periods_var = tk.StringVar(
+            value=_engine_periods_to_text(sched_cfg.get('periods') or []))
+        self.schedule_periods_entry = ttk.Entry(
+            periods_row, textvariable=self.schedule_periods_var, width=34)
+        self.schedule_periods_entry.pack(side=tk.LEFT, padx=(6, 4))
+        ttk.Label(periods_row, text="例 09:00-30;13:00-30;18:00-0",
+                  foreground=self._color('muted')).pack(side=tk.LEFT)
         self.schedule_hint_label = ttk.Label(p1b_card, text="", font=('微软雅黑', 9))
         self.schedule_hint_label.pack(anchor=tk.W)
 
@@ -4295,6 +4473,19 @@ class AutoClicker:
         self.theme_combo.bind('<<ComboboxSelected>>', self.on_theme_change_ui)
         ttk.Button(theme_row, text="导入主题", command=self.import_user_theme,
                    width=9).pack(side=tk.LEFT)
+        accent_row = ttk.Frame(theme_card)
+        accent_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(accent_row, text="强调色").pack(side=tk.LEFT)
+        self.accent_var = tk.StringVar(value=str(self.config.get('accent_color', '')))
+        ttk.Entry(accent_row, textvariable=self.accent_var, width=10).pack(
+            side=tk.LEFT, padx=(8, 4))
+        ttk.Button(accent_row, text="应用", width=6,
+                   command=self.on_accent_apply).pack(side=tk.LEFT)
+        ttk.Button(accent_row, text="恢复主题色", width=10,
+                   command=self.on_accent_reset).pack(side=tk.LEFT, padx=(4, 0))
+        self.accent_hint_var = tk.StringVar(value="")
+        ttk.Label(theme_card, textvariable=self.accent_hint_var,
+                  foreground=self._color('muted')).pack(anchor=tk.W, pady=(4, 0))
         ttk.Label(theme_card, text="主题包仅包含 JSON 颜色令牌，不执行脚本。",
                   font=('微软雅黑', 8), foreground=self._color('muted')).pack(
                       anchor=tk.W, pady=(6, 0))
