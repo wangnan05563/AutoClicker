@@ -321,6 +321,8 @@ class AutoClicker:
         screen_h = self.root.winfo_screenheight()
         win_w = min(int(1000 * dpi_ratio), int(screen_w * 0.9))
         win_h = min(int(720 * dpi_ratio), int(screen_h * 0.9))
+        self._window_w = win_w
+        self._window_h = win_h
         self.root.geometry("%dx%d" % (win_w, win_h))
         self._min_w = min(int(900 * dpi_ratio), win_w)
         self._min_h = min(int(620 * dpi_ratio), win_h)
@@ -769,6 +771,14 @@ class AutoClicker:
 
     def _color(self, key):
         return self._current_palette.get(key, '#000000')
+
+    @staticmethod
+    def _compact_path(value, limit=44):
+        """1024×768 紧凑布局下压缩长路径，保留头尾便于识别。"""
+        text = str(value)
+        if len(text) <= limit:
+            return text
+        return text[:18] + '...' + text[-22:]
 
     def _on_color(self, key):
         """语义色背景上的文字色：浅色主题白字、深色主题深字，保证 ≥4.5:1。"""
@@ -3615,6 +3625,9 @@ class AutoClicker:
     def setup_ui(self):
         """信息架构：顶部状态条 + 左侧 4 导航 + 底部固定操作条（FR-24）。"""
         self._icons_ready = False
+        # AC-05：1000×720 默认窗口在 1024×768 屏幕上内容视口约 509px。
+        # 记录页固定左右分栏、设置页固定 2×2；日志正文在紧凑窗口默认折叠。
+        self._compact_layout = getattr(self, '_window_h', 720) <= 760
         self.root.minsize(getattr(self, '_min_w', 900), getattr(self, '_min_h', 620))
 
         main_container = ttk.Frame(self.root)
@@ -4291,9 +4304,18 @@ class AutoClicker:
         ttk.Button(sys_row, text="导出运行统计", command=self.export_run_stats).pack(side=tk.LEFT, padx=(10, 0))
 
         # ==================== 记录：最近运行历史（T06155） ====================
+        self.records_top = ttk.Frame(self.records_page)
+        self.records_top.pack(fill=tk.X)
+        self.records_top.grid_columnconfigure(0, weight=0, minsize=330)
+        self.records_top.grid_columnconfigure(1, weight=1)
+        self.records_top.grid_rowconfigure(0, weight=1)
+        history_holder = ttk.Frame(self.records_top)
+        history_holder.grid(row=0, column=0, sticky='nsew', padx=(0, 10))
+        macro_holder = ttk.Frame(self.records_top)
+        macro_holder.grid(row=0, column=1, sticky='nsew')
         self.history_card = ttk.LabelFrame(
-            self.records_page, text="运行历史（最近 30 次）", padding="10")
-        self.history_card.pack(fill=tk.X, pady=(0, 10))
+            history_holder, text="运行历史（最近 30 次）", padding="10")
+        self.history_card.pack(fill=tk.BOTH, expand=True)
         history_head = ttk.Frame(self.history_card)
         history_head.pack(fill=tk.X)
         self.history_summary_var = tk.StringVar(value=_history.summary_text(self.run_history))
@@ -4315,14 +4337,14 @@ class AutoClicker:
 
         # ==================== 记录：录制与回放（FR-13） ====================
         self.macro_card = ttk.LabelFrame(
-            self.records_page, text="录制与回放（FR-13）", padding="10")
-        self.macro_card.pack(fill=tk.X, pady=(0, 10))
+            macro_holder, text="录制与回放（FR-13）", padding="10")
+        self.macro_card.pack(fill=tk.BOTH, expand=True)
         ttk.Label(
             self.macro_card,
             text="只记录点击、按键与延时，不记录鼠标连续轨迹；录制/回放期间请先停止自动点击。"
                  "Esc / F8 可随时急停，录制结束自动保存为可读 JSON。",
             font=('微软雅黑', 8), foreground=self._color('muted'),
-            wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, fill=tk.X)
+            wraplength=560, justify=tk.LEFT).pack(anchor=tk.W, fill=tk.X)
 
         macro_record_row = ttk.Frame(self.macro_card)
         macro_record_row.pack(fill=tk.X, pady=(8, 3))
@@ -4334,22 +4356,22 @@ class AutoClicker:
             macro_record_row, textvariable=self.macro_name_var, width=20)
         self.macro_name_entry.pack(side=tk.LEFT, padx=(4, 8))
         self.macro_record_btn = ttk.Button(
-            macro_record_row, text="开始录制（3 秒）", width=13,
+            macro_record_row, text="开始录制", width=8,
             command=self.start_macro_recording)
         self.macro_record_btn.pack(side=tk.LEFT, padx=(0, 4))
         self.macro_record_pause_btn = ttk.Button(
-            macro_record_row, text="暂停", width=6,
+            macro_record_row, text="暂停", width=5,
             command=self.toggle_macro_recording_pause, state=tk.DISABLED)
         self.macro_record_pause_btn.pack(side=tk.LEFT, padx=(0, 4))
         self.macro_record_stop_btn = ttk.Button(
-            macro_record_row, text="停止并保存", width=11,
+            macro_record_row, text="停止", width=5,
             command=lambda: self.stop_macro_recording(
                 save=True, reason='手动停止录制'),
             state=tk.DISABLED)
         self.macro_record_stop_btn.pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(macro_record_row, text="打开宏目录", width=11,
+        ttk.Button(macro_record_row, text="宏目录", width=7,
                    command=self.open_macro_dir).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(macro_record_row, text="诊断", width=6,
+        ttk.Button(macro_record_row, text="诊断", width=5,
                    command=self.show_diagnostics_window).pack(side=tk.LEFT)
 
         macro_play_row = ttk.Frame(self.macro_card)
@@ -4367,11 +4389,11 @@ class AutoClicker:
             command=self.start_macro_playback)
         self.macro_play_btn.pack(side=tk.LEFT, padx=(0, 4))
         self.macro_play_pause_btn = ttk.Button(
-            macro_play_row, text="暂停回放", width=9,
+            macro_play_row, text="暂停回放", width=8,
             command=self.toggle_macro_playback_pause, state=tk.DISABLED)
         self.macro_play_pause_btn.pack(side=tk.LEFT, padx=(0, 4))
         self.macro_play_stop_btn = ttk.Button(
-            macro_play_row, text="停止回放", width=9,
+            macro_play_row, text="停止回放", width=8,
             command=lambda: self.stop_macro_playback(
                 reason='手动停止回放'), state=tk.DISABLED)
         self.macro_play_stop_btn.pack(side=tk.LEFT)
@@ -4392,7 +4414,7 @@ class AutoClicker:
             width=4, textvariable=self.macro_loop_var)
         self.macro_loop_spin.pack(side=tk.LEFT, padx=(4, 2))
         ttk.Label(macro_option_row, text="次").pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Label(macro_option_row, text="宏文件目录：" + self.macro_dir,
+        ttk.Label(macro_option_row, text="宏目录：" + self.macro_dir,
                   font=('微软雅黑', 8), foreground=self._color('muted')).pack(
                       side=tk.LEFT)
 
@@ -4431,7 +4453,7 @@ class AutoClicker:
         self.macro_detail_label = ttk.Label(
             self.macro_card, textvariable=self.macro_detail_var,
             font=('微软雅黑', 8), foreground=self._color('muted'),
-            wraplength=760, justify=tk.LEFT)
+            wraplength=560, justify=tk.LEFT)
         self.macro_detail_label.pack(anchor=tk.W, fill=tk.X, pady=(0, 4))
 
         self.macro_preview = tk.Text(
@@ -4442,7 +4464,7 @@ class AutoClicker:
 
         # ==================== 日志区域 ====================
         self.log_card = ttk.LabelFrame(self.records_page, text="运行日志", padding="10")
-        self.log_card.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        self.log_card.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
         log_card = self.log_card
 
         # 日志工具栏（UI-04：过滤 / 复制 / 清空；UI-01：可折叠）
@@ -4475,9 +4497,14 @@ class AutoClicker:
         self.log_text.tag_config('lvl_err', foreground=self._color('danger'))
         self.log_text.tag_config('lvl_warn', foreground=self._color('warning'))
         
-        # ==================== 设置：外观 ====================
-        theme_card = ttk.LabelFrame(self.settings_page, text="外观", padding="15")
-        theme_card.pack(fill=tk.X, pady=(0, 14))
+        # ==================== 设置：2×2 网格（1024×768 免滚动） ====================
+        self.settings_grid = ttk.Frame(self.settings_page)
+        self.settings_grid.pack(fill=tk.X)
+        self.settings_grid.grid_columnconfigure(0, weight=1, uniform='settings')
+        self.settings_grid.grid_columnconfigure(1, weight=1, uniform='settings')
+
+        theme_card = ttk.LabelFrame(self.settings_grid, text="外观", padding="8")
+        theme_card.grid(row=0, column=0, sticky='nsew', padx=(0, 4), pady=(0, 4))
         ttk.Label(theme_card, text="主题", font=('微软雅黑', 10, 'bold')).pack(anchor=tk.W)
         theme_row = ttk.Frame(theme_card)
         theme_row.pack(fill=tk.X, pady=(6, 0))
@@ -4507,8 +4534,8 @@ class AutoClicker:
                       anchor=tk.W, pady=(6, 0))
 
         # ==================== 设置：启动安全（FR-02） ====================
-        safety_card = ttk.LabelFrame(self.settings_page, text="启动安全", padding="15")
-        safety_card.pack(fill=tk.X, pady=(0, 14))
+        safety_card = ttk.LabelFrame(self.settings_grid, text="启动安全", padding="8")
+        safety_card.grid(row=0, column=1, sticky='nsew', pady=(0, 4))
         self.confirm_start_var = tk.BooleanVar(
             value=bool(self.config.get('start_confirm_enabled', True)))
         ttk.Checkbutton(safety_card, text="启动前显示参数确认摘要",
@@ -4521,8 +4548,8 @@ class AutoClicker:
                       anchor=tk.W, pady=(6, 0))
 
         # ==================== 设置：诊断中心（FR-03） ====================
-        diag_card = ttk.LabelFrame(self.settings_page, text="诊断中心", padding="15")
-        diag_card.pack(fill=tk.X, pady=(0, 14))
+        diag_card = ttk.LabelFrame(self.settings_grid, text="诊断中心", padding="8")
+        diag_card.grid(row=1, column=0, sticky='nsew', padx=(0, 4))
         self.diag_card = diag_card
         self.diag_status_var = tk.StringVar(value="尚未检查")
         self.diag_status_label = ttk.Label(
@@ -4533,7 +4560,7 @@ class AutoClicker:
             value="检查输入后端、热键、自启、权限、打包资源、崩溃记录、会话与 DPI。")
         self.diag_issue_label = ttk.Label(
             diag_card, textvariable=self.diag_issue_var,
-            font=('微软雅黑', 9), wraplength=620, justify=tk.LEFT)
+            font=('微软雅黑', 9), wraplength=430, justify=tk.LEFT)
         self.diag_issue_label.pack(anchor=tk.W, fill=tk.X, pady=(6, 8))
         diag_btns = ttk.Frame(diag_card)
         diag_btns.pack(fill=tk.X)
@@ -4553,16 +4580,17 @@ class AutoClicker:
                 anchor=tk.W, pady=(8, 0))
 
         # ==================== 设置：关于（FR-04） ====================
-        about_card = ttk.LabelFrame(self.settings_page, text="关于", padding="15")
-        about_card.pack(fill=tk.X, pady=(0, 14))
+        about_card = ttk.LabelFrame(self.settings_grid, text="关于", padding="8")
+        about_card.grid(row=1, column=1, sticky='nsew')
         about_grid = ttk.Frame(about_card)
         about_grid.pack(fill=tk.X)
         rows = (
             ("产品版本", "v%s" % APP_VERSION),
             ("构建号", BUILD_ID),
             ("Python", "%d.%d.%d" % sys.version_info[:3]),
-            ("配置文件", self.config_file),
-            ("日志目录", getattr(self, 'log_dir', os.path.expanduser('~/.auto_clicker_logs'))),
+            ("配置文件", self._compact_path(self.config_file)),
+            ("日志目录", self._compact_path(
+                getattr(self, 'log_dir', os.path.expanduser('~/.auto_clicker_logs')))),
             ("许可证", "MIT License"),
         )
         for idx, (name, value) in enumerate(rows):
@@ -4572,29 +4600,29 @@ class AutoClicker:
                 row=idx, column=1, sticky='w', pady=2)
         about_btns = ttk.Frame(about_card)
         about_btns.pack(fill=tk.X, pady=(10, 0))
-        ttk.Button(about_btns, text="打开配置目录", command=self.open_config_dir).pack(
+        ttk.Button(about_btns, text="配置目录", command=self.open_config_dir).pack(
             side=tk.LEFT, padx=(0, 6))
-        ttk.Button(about_btns, text="打开日志目录", command=self.open_log_dir).pack(
+        ttk.Button(about_btns, text="日志目录", command=self.open_log_dir).pack(
             side=tk.LEFT, padx=(0, 6))
-        ttk.Button(about_btns, text="复制版本信息", command=self.copy_version_info).pack(
+        ttk.Button(about_btns, text="复制版本", command=self.copy_version_info).pack(
             side=tk.LEFT, padx=(0, 6))
-        ttk.Button(about_btns, text="重跑首启向导",
+        ttk.Button(about_btns, text="首启向导",
                    command=lambda: self.show_onboarding_wizard(force=True)).pack(
                        side=tk.LEFT, padx=(0, 6))
         ttk.Button(about_btns, text="项目主页", command=self.open_project_home).pack(
             side=tk.LEFT)
-
-        # ==================== 底部提示区域 ====================
-        footer_frame = ttk.Frame(self.settings_page)
-        footer_frame.pack(fill=tk.X)
-        ttk.Label(footer_frame, text="快捷键: F6 启动/停止 · F8/Esc 紧急停止",
-                  font=('微软雅黑', 9), foreground=self._color('muted')).pack(anchor=tk.CENTER)
-        ttk.Label(footer_frame, text="v%s (Build %s)" % (APP_VERSION, BUILD_ID),
-                  font=('微软雅黑', 8), foreground=self._color('muted')).pack(anchor=tk.CENTER)
+        ttk.Label(about_card, text="快捷键: F6 启动/停止 · F8/Esc 紧急停止",
+                  font=('微软雅黑', 8), foreground=self._color('muted')).pack(
+                      anchor=tk.W, pady=(8, 0))
+        ttk.Label(about_card, text="v%s (Build %s)" % (APP_VERSION, BUILD_ID),
+                  font=('微软雅黑', 7), foreground=self._color('muted')).pack(anchor=tk.W)
 
         # 更新状态标签引用
         self.status_label = self.status_text_label
         self._macro_update_controls()
+        # AC-05：紧凑窗口默认折叠日志正文，仅保留工具栏，避免记录页纵向滚动。
+        if getattr(self, '_compact_layout', False) and not getattr(self, '_log_collapsed', False):
+            self.toggle_log_collapse()
         self.refresh_macro_list()
         self._apply_ui_mode()
         self._show_page('run')
