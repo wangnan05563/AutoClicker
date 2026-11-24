@@ -735,6 +735,10 @@ class AutoClicker:
             requested = 'light'
         self.theme_mode = requested
         self._ttkb_style = None
+        # AC-10：Tk 的 ttk theme_use 在窗口可见后会重建原生元素，实测耗时 13-16s。
+        # 因此在窗口映射前一次性固定 clam 作为唯一基底主题，运行时只改颜色，不再切主题。
+        self._ttk_base_theme = None
+        self._pin_ttk_base_theme()
         # TH-01：可选接入 ttkbootstrap（缺失则降级为纯 ttk + 手动语义配色）
         try:
             import ttkbootstrap as ttkb  # noqa
@@ -742,6 +746,26 @@ class AutoClicker:
         except Exception:
             self._ttkb_style = None
         self._current_palette = self._resolve_palette()
+
+    def _pin_ttk_base_theme(self):
+        """AC-10：只允许在窗口映射前固定一次 ttk 基底主题。
+
+        运行中调用 `ttk.Style.theme_use` 会重建原生 ttk 元素，可见窗口下实测
+        13.6-15.9s，无法满足 1s 切换。clam 支持完整的颜色配置，固定后由
+        `_apply_ttk_theme_styles` 逐主题覆盖颜色即可。
+        """
+        if getattr(self, '_ttk_base_theme', None):
+            return
+        try:
+            style = ttk.Style(self.root)
+            available = set(style.theme_names())
+            if 'clam' in available:
+                style.theme_use('clam')
+                self._ttk_base_theme = 'clam'
+            elif available:
+                self._ttk_base_theme = style.theme_use()
+        except Exception:
+            self._ttk_base_theme = None
 
     def _color(self, key):
         return self._current_palette.get(key, '#000000')
@@ -909,21 +933,13 @@ class AutoClicker:
     def _apply_ttk_theme_styles(self, pal):
         """TH-01/TH-02：把语义调色板落到 ttk 全局样式，深色主题不能只改变量。
 
-        纯 ttk（无 ttkbootstrap）时，vista 主题忽略多数颜色选项；深色模式改用
-        内置 clam 主题承载颜色，浅色模式回到 vista（非 Windows 用 clam）。
+        基底固定为 clam（窗口映射前一次性设置），因为它支持 ttk 颜色选项；
+        Windows vista 主题会忽略多数颜色，且运行时切 theme_use 会造成秒级卡顿。
         """
         try:
             style = ttk.Style(self.root)
-            dark = bool(pal.get('is_dark'))
-            available = set(style.theme_names())
-            if dark:
-                if 'clam' in available:
-                    style.theme_use('clam')
-            elif IS_WINDOWS and 'vista' in available:
-                style.theme_use('vista')
-            elif 'clam' in available:
-                style.theme_use('clam')
-
+            # AC-10：基底主题只在窗口映射前固定一次；运行时不再切 theme_use。
+            self._pin_ttk_base_theme()
             common = {
                 'TFrame': {'background': pal['bg']},
                 'TLabelframe': {'background': pal['bg'], 'foreground': pal['fg'],
