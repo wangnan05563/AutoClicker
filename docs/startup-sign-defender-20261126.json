@@ -1,0 +1,407 @@
+{
+  "schema_version": 1,
+  "task": "T06328",
+  "measured_at": "2026-11-26T01:10:00+08:00",
+  "environment": {
+    "os": "Windows 10 10.0.19045",
+    "python": "3.14.3",
+    "pyinstaller": "6.20.0",
+    "defender_version": "1.463.463.0",
+    "defender_realtime_protection": true,
+    "defender_tamper_protection": true,
+    "existing_exclusions": 11,
+    "source_dir_excluded": "D:\\code\\otherProjects",
+    "test_root_excluded_during_baseline": false,
+    "note": "MsMpEng showed continuous background CPU load (86-202% of one core) throughout the test window; absolute numbers are noisy."
+  },
+  "artifact": {
+    "kind": "PyInstaller onedir",
+    "files": 1029,
+    "size_mb": 44.56,
+    "pe_files": 84,
+    "unsigned_sha256": "B5ABB878C37C203EBD50DD5A7116AB300A7D6788EFCFE7499235CFDC11129D9B",
+    "signed_sha256": "A00D681B8BA7CF813FF02C03144FFADA00BA2051524852C0664C545FE0BEF84A",
+    "signing_certificate": "CN=AutoClicker Test Signing 20261126",
+    "signing_certificate_thumbprint": "613B98851AE2EBDFD90DE786A15E004B200F2743",
+    "signed_main_status_during_test": "Valid",
+    "signed_pe_count": 84,
+    "certificate_removed_after_test": true,
+    "signed_status_after_cert_removal": "UnknownError",
+    "note": "Temporary self-signed code-signing certificate, trusted only in CurrentUser stores for the test; not a production/publicly trusted signature."
+  },
+  "method": {
+    "metric": "process start to first visible top-level window with non-empty title",
+    "runs_per_case": 3,
+    "timeout_s": 60,
+    "profiles": "fresh temporary USERPROFILE per run except *_persistent_profile cases; process-isolation cases reused a temp profile",
+    "isolation": {
+      "unsigned_excluded": "temporary Defender folder exclusion for D:\\tmp_ac_sign\\unsigned",
+      "unsigned_root_excluded": "temporary Defender folder exclusion for D:\\tmp_ac_sign",
+      "unsigned_process_excluded": "temporary Defender process exclusion for D:\\tmp_ac_sign\\unsigned\\AutoClicker.exe",
+      "signed_process_excluded": "temporary Defender process exclusion for D:\\tmp_ac_sign\\signed\\AutoClicker.exe"
+    }
+  },
+  "runs": {
+    "unsigned": {
+      "label": "unsigned",
+      "exe": "D:\\tmp_ac_sign\\unsigned\\AutoClicker.exe",
+      "runs": [
+        {
+          "run": 1,
+          "visible_s": 60.103,
+          "title": null,
+          "rc": null
+        },
+        {
+          "run": 2,
+          "visible_s": 34.608,
+          "title": "AutoClicker Sign Probe 2",
+          "rc": null
+        },
+        {
+          "run": 3,
+          "visible_s": 11.318,
+          "title": "AutoClicker Sign Probe 3",
+          "rc": null
+        }
+      ],
+      "samples": [
+        60.103,
+        34.608,
+        11.318
+      ],
+      "first_s": 60.103,
+      "median_s": 34.608,
+      "min_s": 11.318,
+      "max_s": 60.103
+    },
+    "unsigned_warm": {
+      "label": "unsigned_warm",
+      "exe": "D:\\tmp_ac_sign\\unsigned\\AutoClicker.exe",
+      "runs": [
+        {
+          "run": 1,
+          "visible_s": 19.763,
+          "title": "AutoClicker Sign Probe 1",
+          "rc": null
+        },
+        {
+          "run": 2,
+          "visible_s": 23.692,
+          "title": "AutoClicker Sign Probe 2",
+          "rc": null
+        },
+        {
+          "run": 3,
+          "visible_s": 14.934,
+          "title": "AutoClicker Sign Probe 3",
+          "rc": null
+        }
+      ],
+      "samples": [
+        19.763,
+        23.692,
+        14.934
+      ],
+      "first_s": 19.763,
+      "median_s": 19.763,
+      "min_s": 14.934,
+      "max_s": 23.692
+    },
+    "signed": {
+      "label": "signed",
+      "exe": "D:\\tmp_ac_sign\\signed\\AutoClicker.exe",
+      "runs": [
+        {
+          "run": 1,
+          "visible_s": 25.433,
+          "title": "AutoClicker Sign Probe 1",
+          "rc": null
+        },
+        {
+          "run": 2,
+          "visible_s": 21.018,
+          "title": "AutoClicker Sign Probe 2",
+          "rc": null
+        },
+        {
+          "run": 3,
+          "visible_s": 27.325,
+          "title": "AutoClicker Sign Probe 3",
+          "rc": null
+        }
+      ],
+      "samples": [
+        25.433,
+        21.018,
+        27.325
+      ],
+      "first_s": 25.433,
+      "median_s": 25.433,
+      "min_s": 21.018,
+      "max_s": 27.325
+    },
+    "unsigned_persistent_profile": {
+      "label": "unsigned_persistent_profile",
+      "exe": "D:\\tmp_ac_sign\\unsigned\\AutoClicker.exe",
+      "runs": [
+        {
+          "run": 1,
+          "visible_s": 17.015,
+          "title": "AutoClicker Sign Probe 1",
+          "rc": null
+        },
+        {
+          "run": 2,
+          "visible_s": 6.788,
+          "title": "AutoClicker Sign Probe 2",
+          "rc": null
+        },
+        {
+          "run": 3,
+          "visible_s": 11.394,
+          "title": "AutoClicker Sign Probe 3",
+          "rc": null
+        }
+      ],
+      "samples": [
+        17.015,
+        6.788,
+        11.394
+      ],
+      "first_s": 17.015,
+      "median_s": 11.394,
+      "min_s": 6.788,
+      "max_s": 17.015
+    },
+    "unsigned_excluded": {
+      "label": "unsigned_excluded",
+      "exe": "D:\\tmp_ac_sign\\unsigned\\AutoClicker.exe",
+      "runs": [
+        {
+          "run": 1,
+          "visible_s": 21.727,
+          "title": "AutoClicker Sign Probe 1",
+          "rc": null
+        },
+        {
+          "run": 2,
+          "visible_s": 19.671,
+          "title": "AutoClicker Sign Probe 2",
+          "rc": null
+        },
+        {
+          "run": 3,
+          "visible_s": 28.959,
+          "title": "AutoClicker Sign Probe 3",
+          "rc": null
+        }
+      ],
+      "samples": [
+        21.727,
+        19.671,
+        28.959
+      ],
+      "first_s": 21.727,
+      "median_s": 21.727,
+      "min_s": 19.671,
+      "max_s": 28.959
+    },
+    "unsigned_root_excluded": {
+      "label": "unsigned_root_excluded",
+      "exe": "D:\\tmp_ac_sign\\unsigned\\AutoClicker.exe",
+      "runs": [
+        {
+          "run": 1,
+          "visible_s": 10.047,
+          "title": "AutoClicker Sign Probe 1",
+          "rc": null
+        },
+        {
+          "run": 2,
+          "visible_s": 6.159,
+          "title": "AutoClicker Sign Probe 2",
+          "rc": null
+        },
+        {
+          "run": 3,
+          "visible_s": 5.301,
+          "title": "AutoClicker Sign Probe 3",
+          "rc": null
+        }
+      ],
+      "samples": [
+        10.047,
+        6.159,
+        5.301
+      ],
+      "first_s": 10.047,
+      "median_s": 6.159,
+      "min_s": 5.301,
+      "max_s": 10.047
+    },
+    "unsigned_process_excluded": {
+      "label": "unsigned_process_excluded",
+      "exe": "D:\\tmp_ac_sign\\unsigned\\AutoClicker.exe",
+      "runs": [
+        {
+          "run": 1,
+          "visible_s": 4.971,
+          "title": "AutoClicker Sign Probe 1",
+          "rc": null
+        },
+        {
+          "run": 2,
+          "visible_s": 3.982,
+          "title": "AutoClicker Sign Probe 2",
+          "rc": null
+        },
+        {
+          "run": 3,
+          "visible_s": 5.532,
+          "title": "AutoClicker Sign Probe 3",
+          "rc": null
+        }
+      ],
+      "samples": [
+        4.971,
+        3.982,
+        5.532
+      ],
+      "first_s": 4.971,
+      "median_s": 4.971,
+      "min_s": 3.982,
+      "max_s": 5.532
+    },
+    "signed_process_excluded": {
+      "label": "signed_process_excluded",
+      "exe": "D:\\tmp_ac_sign\\signed\\AutoClicker.exe",
+      "runs": [
+        {
+          "run": 1,
+          "visible_s": 8.98,
+          "title": "AutoClicker Sign Probe 1",
+          "rc": null
+        },
+        {
+          "run": 2,
+          "visible_s": 5.457,
+          "title": "AutoClicker Sign Probe 2",
+          "rc": null
+        },
+        {
+          "run": 3,
+          "visible_s": 7.137,
+          "title": "AutoClicker Sign Probe 3",
+          "rc": null
+        }
+      ],
+      "samples": [
+        8.98,
+        5.457,
+        7.137
+      ],
+      "first_s": 8.98,
+      "median_s": 7.137,
+      "min_s": 5.457,
+      "max_s": 8.98
+    },
+    "notepad": {
+      "label": "notepad",
+      "exe": "C:\\Windows\\System32\\notepad.exe",
+      "runs": [
+        {
+          "run": 1,
+          "visible_s": 4.422,
+          "title": "无标题 - 记事本",
+          "rc": null
+        },
+        {
+          "run": 2,
+          "visible_s": 1.804,
+          "title": "无标题 - 记事本",
+          "rc": null
+        },
+        {
+          "run": 3,
+          "visible_s": 1.364,
+          "title": "无标题 - 记事本",
+          "rc": null
+        }
+      ],
+      "samples": [
+        4.422,
+        1.804,
+        1.364
+      ],
+      "first_s": 4.422,
+      "median_s": 1.804,
+      "min_s": 1.364,
+      "max_s": 4.422
+    }
+  },
+  "idle_msmpeng_cpu": [
+    {
+      "wall_s": 30.1,
+      "cpu_s": 60.703,
+      "pct_of_one_core": 201.6,
+      "state": "idle after first batch"
+    },
+    {
+      "wall_s": 20.0,
+      "cpu_s": 22.469,
+      "pct_of_one_core": 111.9,
+      "state": "idle after exclusion tests"
+    },
+    {
+      "wall_s": 20.0,
+      "cpu_s": 17.203,
+      "pct_of_one_core": 85.8,
+      "state": "idle after 120s wait"
+    }
+  ],
+  "comparisons": {
+    "defender_process_exclusion_unsigned": {
+      "baseline_median_s": 19.763,
+      "isolated_median_s": 4.971,
+      "delta_s": 14.792,
+      "delta_pct": 74.8
+    },
+    "signing_without_exclusion": {
+      "unsigned_warm_median_s": 19.763,
+      "signed_median_s": 25.433,
+      "delta_s": 5.67,
+      "result": "self-signed artifact was slower, not faster; not representative of a publicly trusted signature"
+    },
+    "signed_with_process_exclusion": {
+      "unsigned_median_s": 4.971,
+      "signed_median_s": 7.137,
+      "delta_s": 2.166,
+      "result": "signature verification/self-signed chain added overhead after Defender scan was bypassed"
+    },
+    "best_observed": {
+      "label": "unsigned_process_excluded",
+      "min_s": 3.982,
+      "median_s": 4.971,
+      "target_s": 3.0,
+      "still_above_target": true
+    }
+  },
+  "conclusion": {
+    "defender_realtime_scan_is_main_contributor": true,
+    "defender_realtime_scan_is_sole_cause": false,
+    "evidence": [
+      "Process-level exclusion cut unsigned median from 19.763s to 4.971s (-14.792s, -74.8%).",
+      "Even with process-level exclusion, median 4.971s and min 3.982s remain above the 3s target.",
+      "Temporary self-signed signature did not reduce startup and was slower than unsigned under normal Defender settings.",
+      "MsMpEng idle CPU remained 86-202% of one core, so this host is not a clean performance baseline.",
+      "The public/trusted code-signing certificate needed to validate signing as a product fix is not available on this host."
+    ],
+    "next": [
+      "Test with a real OV/EV or Microsoft Trusted Signing certificate on a clean Windows VM with Defender real-time protection on.",
+      "If trusted signing still leaves startup above 3s, optimize PyInstaller runtime/loader or use a native bootstrap rather than Tcl data trimming.",
+      "Do not use this self-signed artifact as a production deliverable."
+    ]
+  }
+}
+
