@@ -1,0 +1,75 @@
+{
+  "task": "T06328",
+  "measured_at": "2026-11-25T23:05:00+08:00",
+  "environment": {
+    "os": "Microsoft Windows 10 企业版 10.0.19045",
+    "python": "3.14.3",
+    "pyinstaller": "6.20.0",
+    "disk": "NVMe SSD (SK hynix PC711)"
+  },
+  "source_reference": {
+    "source": "T06166 result / release/startup-stage-source-20261124.log",
+    "root_ready_s": 0.84,
+    "init_s": 2.55,
+    "total_s": 2.73,
+    "setup_ui_s": 0.67
+  },
+  "installed_004": {
+    "path": "F:\\Program Files\\AutoClicker\\AutoClicker.exe",
+    "note": "安装目录为 20261123-004 产物，不是 T06166 测量的 005 产物",
+    "samples_s": [57.91, 7.826, 5.199, 3.43, 8.913],
+    "median_s": 7.826,
+    "min_s": 3.43,
+    "max_s": 57.91,
+    "first_run_note": "首次启动 57.91s，后续 3.43–8.91s；首次差异与 Defender 对新 exe 的扫描一致"
+  },
+  "fresh_onedir": {
+    "path": "D:\\tmp_ac_perf\\dist\\AutoClickerPerf\\AutoClickerPerf.exe",
+    "file_count": 1029,
+    "size_mb": 44.6,
+    "samples_s": [13.163, 6.215, 10.498, 5.441, 8.105],
+    "median_s": 8.105,
+    "min_s": 5.441,
+    "max_s": 13.163
+  },
+  "trimmed_onedir": {
+    "path": "D:\\tmp_ac_perf\\dist\\AutoClickerTrim\\AutoClickerPerf.exe",
+    "file_count": 275,
+    "size_mb": 43.2,
+    "removed": ["_internal/_tcl_data/tzdata", "_internal/_tcl_data/msgs", "_internal/_tk_data/msgs"],
+    "samples_s": [17.878, 6.534, 6.478, 10.426, 6.194],
+    "median_s": 6.534,
+    "min_s": 6.194,
+    "max_s": 17.878,
+    "improvement_vs_fresh_pct": 19.4
+  },
+  "onefile": {
+    "path": "D:\\tmp_ac_perf\\one\\dist\\AutoClickerOne.exe",
+    "size_mb": 21.6,
+    "valid": false,
+    "samples_s": [6.192, 60.041, 0.427, 0.289, 0.255],
+    "note": "多个样本只出现标题为 Error 的窗口或超过 60s 无主窗口，不能作为可用产物"
+  },
+  "release_evidence": {
+    "release_dir_exists": false,
+    "note": "D:\\code\\otherProjects\\AutoClicker\\release 整体缺失，005 的 startup-bench-20261124-001.json、build-005.log 与 dist 无法复核"
+  },
+  "acceptance": {
+    "ac": "AC-16",
+    "threshold_s": 3.0,
+    "best_valid_median_s": 6.534,
+    "pass": false
+  },
+  "bottleneck": [
+    "源码首屏 2.73s，打包后同机稳定态 6.2–8.1s，增量主要在 PyInstaller onedir 运行时加载与 Windows Defender 对 275–1029 个文件的扫描，不在 Tk 页面构建",
+    "裁剪 Tcl tzdata/msgs 后文件数从 1029 降到 275，稳定态中位数从 8.105s 降到 6.534s，但仍高于 3s",
+    "onefile 产物在该机启动不稳定，出现 Error 窗口或 60s 无主窗口，不能作为达标路径",
+    "首次运行新 exe 受 Defender 扫描影响可达 13–58s，未签名产物无法稳定满足冷启动门槛"
+  ],
+  "hard_constraints": [
+    "不改变点击引擎行为",
+    "不伪造测量口径；以主窗口可见为计时终点",
+    "未签名/未加入信任链的 PyInstaller onedir 在本机无法消除首次扫描成本",
+    "005 原始产物缺失，无法对 23.95s 的原始中位数做同文件复核"
+  ]
+}
