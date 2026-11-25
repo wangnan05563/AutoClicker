@@ -6,6 +6,7 @@
 """
 import ctypes
 import os
+import random
 import sys
 
 MOD_ALT = 0x0001
@@ -25,7 +26,7 @@ _VK_NAMES = {
     'pageup': 0x21, 'pgup': 0x21, 'pagedown': 0x22, 'pgdn': 0x22,
     'up': 0x26, 'down': 0x28, 'left': 0x25, 'right': 0x27,
     'comma': 0xBC, ',': 0xBC, 'period': 0xBE, '.': 0xBE, 'semicolon': 0xBA,
-    'colon': 0xBA, 'slash': 0xBF, '/': 0xBF, 'backslash': 0x5C, '\\': 0x5C,
+    'colon': 0xBA, ':': 0xBA, 'slash': 0xBF, '/': 0xBF, 'backslash': 0x5C, '\\': 0x5C,
     'minus': 0xBD, '-': 0xBD, 'plus': 0xBB, '+': 0xBB,
 }
 
@@ -39,6 +40,11 @@ def parse_hotkey(text):
     normalized = normalize_hotkey(text)
     if not normalized:
         return 0, 0, normalized, '热键不能为空'
+    # L2：Ctrl++ 的尾缀加号会被 split 过滤掉，先归一成 plus
+    if normalized.endswith('++'):
+        normalized = normalized[:-2] + '+plus'
+    elif normalized in ('+', ':'):
+        normalized = 'plus' if normalized == '+' else 'colon'
     parts = [p for p in normalized.replace('-', '+').split('+') if p]
     if not parts:
         return 0, 0, normalized, '热键格式无效'
@@ -56,6 +62,9 @@ def parse_hotkey(text):
     vk = _vk_for(base)
     if vk is None:
         return 0, 0, normalized, '不支持的按键：%s' % base
+    # L2：plus/colon 在美式键盘上是 Shift 组合，缺少 MOD_SHIFT 会注册成 =/;
+    if base in ('plus', '+', 'colon', ':'):
+        modifiers |= MOD_SHIFT
     return modifiers, vk, normalized, ''
 
 
@@ -84,11 +93,14 @@ def probe_windows_hotkey(text):
     mods, vk, _, error = parse_hotkey(text)
     if error:
         return False, error
-    probe_id = 0x4F41
+    probe_id = random.randint(0x4000, 0x7FFF)
     user32 = ctypes.windll.user32
     try:
         if user32.RegisterHotKey(0, probe_id, mods, vk):
-            user32.UnregisterHotKey(0, probe_id)
+            try:
+                user32.UnregisterHotKey(0, probe_id)
+            except Exception:
+                pass
             return False, ''
         code = ctypes.windll.kernel32.GetLastError()
         if code == 1409:

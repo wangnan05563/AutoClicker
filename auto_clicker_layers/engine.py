@@ -12,6 +12,7 @@ MAX_INTERVAL = 3600
 MAX_INTERVAL_BY_UNIT = {'ms': 86_400_000, 's': 86_400, 'min': 1_440, 'h': 24}
 INTERVAL_UNITS = ('ms', 's', 'min', 'h')
 MAX_CPS = 200
+MAX_HOLD_MS = 5000
 WEEKDAY_LABELS = {'每天': [1, 2, 3, 4, 5, 6, 7], '工作日': [1, 2, 3, 4, 5], '周末': [6, 7]}
 
 
@@ -236,6 +237,8 @@ def validate_hold_ms(raw):
         return None, '按住时长必须为整数'
     if value < 0:
         return None, '按住时长不能为负数'
+    if value > MAX_HOLD_MS:
+        return None, '按住时长不能超过 %d ms' % MAX_HOLD_MS
     return value, None
 
 
@@ -371,18 +374,69 @@ def normalize_schedule_periods(periods, fallback=None):
             days = [1, 2, 3, 4, 5]
         normalized.append({'start': start, 'stop_after_min': stop_min, 'weekdays': days})
     if not normalized and isinstance(fallback, dict):
-        start = fallback.get('start', (9, 0))
-        if not (isinstance(start, (list, tuple)) and len(start) == 2):
-            start = parse_schedule_start(start)
-        legacy_days = fallback.get('weekdays', [1, 2, 3, 4, 5])
+        raw_start = fallback.get('start', (9, 0))
+        if isinstance(raw_start, (list, tuple)) and len(raw_start) == 2:
+            start = (int(raw_start[0]), int(raw_start[1]))
+            if not (0 <= start[0] <= 23 and 0 <= start[1] <= 59):
+                raise ValueError('时间需在 00:00–23:59')
+        else:
+            try:
+                start = parse_schedule_start(raw_start)
+            except (TypeError, ValueError) as exc:
+                raise ValueError('单时段开始时间无效：%s' % exc)
+        try:
+            stop_min = max(0, int(fallback.get('stop_after_min', 0) or 0))
+        except (TypeError, ValueError):
+            raise ValueError('单时段运行分钟需为整数')
+        try:
+            legacy_days = sorted(set(
+                int(d) for d in fallback.get('weekdays', [1, 2, 3, 4, 5])
+                if 1 <= int(d) <= 7))
+        except (TypeError, ValueError):
+            legacy_days = [1, 2, 3, 4, 5]
         normalized = [{
-            'start': (int(start[0]), int(start[1])),
-            'stop_after_min': max(0, int(fallback.get('stop_after_min', 0) or 0)),
-            'weekdays': sorted(set(int(d) for d in legacy_days if 1 <= int(d) <= 7)) or [1, 2, 3, 4, 5],
+            'start': start,
+            'stop_after_min': stop_min,
+            'weekdays': legacy_days or [1, 2, 3, 4, 5],
         }]
     if len(normalized) > MAX_SCHEDULE_PERIODS:
         raise ValueError('多时段最多 %d 段' % MAX_SCHEDULE_PERIODS)
     return sorted(normalized, key=lambda p: p['start'])
+
+
+def validate_schedule_no_overlap(periods):
+    """M9：拒绝同一天重复开始或执行区间重叠的时段。
+
+    时段按周循环展开为分钟区间；跨零点通过相邻周平移比较。
+    stop_after_min=0 视为瞬时开始，只参与重复开始校验。
+    """
+    normalized = normalize_schedule_periods(periods)
+    def _hm(start):
+        return '%02d:%02d' % start
+
+    for i, first in enumerate(normalized):
+        for second in normalized[i + 1:]:
+            common = set(first['weekdays']) & set(second['weekdays'])
+            if not common:
+                continue
+            if first['start'] == second['start']:
+                raise ValueError('时段开始时间重复：%s' % _hm(first['start']))
+            dur1 = max(0, int(first['stop_after_min']))
+            dur2 = max(0, int(second['stop_after_min']))
+            if dur1 <= 0 and dur2 <= 0:
+                continue
+            for day1 in first['weekdays']:
+                for day2 in second['weekdays']:
+                    start1 = (day1 - 1) * 1440 + first['start'][0] * 60 + first['start'][1]
+                    start2 = (day2 - 1) * 1440 + second['start'][0] * 60 + second['start'][1]
+                    for shift in (-10080, 0, 10080):
+                        s2 = start2 + shift
+                        if start1 < s2 + dur2 and s2 < start1 + dur1:
+                            raise ValueError(
+                                '时段重叠：%s-%d 与 %s-%d' % (
+                                    _hm(first['start']), dur1,
+                                    _hm(second['start']), dur2))
+    return normalized
 
 
 def schedule_latest_period(now, periods):

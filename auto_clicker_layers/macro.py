@@ -121,7 +121,8 @@ def validate_macro(data):
     for index, raw in enumerate(steps_raw, 1):
         steps.append(_normalize_step(raw, index))
     screen = _normalize_screen(data.get('screen'))
-    created_at = str(data.get('created_at') or datetime.now().isoformat(timespec='seconds'))
+    created_at = str(
+        data.get('created_at') or datetime.now().isoformat(timespec='seconds'))[:64]
     return {
         'schema': SCHEMA,
         'name': name,
@@ -147,12 +148,20 @@ def save_macro(path, data):
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(prefix='.macro-', suffix='.json', dir=directory)
+    handle = None
     try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+        handle = os.fdopen(fd, 'w', encoding='utf-8')
+        fd = None
+        with handle:
             json.dump(macro, handle, ensure_ascii=False, indent=2)
             handle.write('\n')
         os.replace(tmp_path, path)
     finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -359,6 +368,7 @@ class MacroRecorder:
         self._lock = threading.Lock()
         self._started_at = None
         self._stopped = False
+        self._truncated_gap_ms = 0
 
     def start(self, now=None):
         with self._lock:
@@ -367,6 +377,7 @@ class MacroRecorder:
             self._last_time = None
             self._paused = False
             self._stopped = False
+            self._truncated_gap_ms = 0
 
     def pause(self):
         with self._lock:
@@ -399,7 +410,16 @@ class MacroRecorder:
         if gap < self.min_gap_ms:
             return []
         self._last_time = now
-        return [{'type': 'wait', 'ms': min(gap, MAX_WAIT_MS)}]
+        if gap > MAX_WAIT_MS:
+            # L5：记录原始间隔，UI 提示“已按 60 秒上限截断”
+            self._truncated_gap_ms = gap
+            return [{'type': 'wait', 'ms': MAX_WAIT_MS}]
+        return [{'type': 'wait', 'ms': gap}]
+
+    @property
+    def truncated_gap_ms(self):
+        with self._lock:
+            return self._truncated_gap_ms
 
     def _append_locked(self, step, now):
         gap = self._gap_steps(now)
@@ -423,6 +443,18 @@ class MacroRecorder:
                 'button': button, 'hold_ms': min(MAX_HOLD_MS, max(0, int(hold_ms))),
             }
             return self._append_locked(step, now)
+
+    def update_last_click_hold(self, x, y, button='left', hold_ms=0):
+        """H5：录制到鼠标 release 后，回填最近一步同坐标点击的按住时长。"""
+        with self._lock:
+            for step in reversed(self.steps):
+                if (step.get('type') == 'click'
+                        and step.get('button') == button
+                        and int(step.get('x', -1)) == int(x)
+                        and int(step.get('y', -1)) == int(y)):
+                    step['hold_ms'] = min(MAX_HOLD_MS, max(0, int(hold_ms)))
+                    return True
+            return False
 
     def add_key(self, key, action='press', now=None):
         with self._lock:

@@ -57,12 +57,33 @@ def derive_states(accent, background):
     normalized = normalize_hex(accent)
     background = normalize_hex(background)
     toward = '#FFFFFF' if relative_luminance(background) < 0.5 else '#000000'
+    hover = _mix(normalized, toward, 0.10)
+    pressed = _mix(normalized, toward, 0.20)
+    # L7：同一个 on_primary 要同时覆盖基色/hover/pressed，取三者最小对比度最大者。
+    candidates = ('#FFFFFF', '#111111')
+    on_primary = max(
+        candidates,
+        key=lambda c: min(contrast_ratio(c, color) for color in (normalized, hover, pressed)))
+    min_ratio = min(contrast_ratio(on_primary, color) for color in (normalized, hover, pressed))
+    # 极端中间亮度仍不足 4.5:1 时，把 hover/pressed 拉回基色，优先保证可读性。
+    for key in ('hover', 'pressed'):
+        color = hover if key == 'hover' else pressed
+        if contrast_ratio(on_primary, color) >= 4.5:
+            continue
+        for step in range(1, 21):
+            trial = _mix(color, normalized, step / 20.0)
+            if contrast_ratio(on_primary, trial) >= 4.5:
+                if key == 'hover':
+                    hover = trial
+                else:
+                    pressed = trial
+                break
     return {
         'primary': normalized,
-        'primary_hover': _mix(normalized, toward, 0.10),
-        'primary_pressed': _mix(normalized, toward, 0.20),
+        'primary_hover': hover,
+        'primary_pressed': pressed,
         'soft': _mix(normalized, background, 0.12),
-        'on_primary': readability_on(normalized),
+        'on_primary': on_primary,
     }
 
 
@@ -96,6 +117,7 @@ def apply_to_palette(palette, candidate, min_ratio=4.5):
         'primary': states['primary'],
         'primary_hover': states['primary_hover'],
         'primary_pressed': states['primary_pressed'],
+        'soft': states['soft'],
         'on_primary': states['on_primary'],
         'accent_adjusted': adjusted,
         'accent_ratio': ratio,

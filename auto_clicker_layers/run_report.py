@@ -46,10 +46,19 @@ def _area(value):
         return None
 
 
+_UNIT_LABELS = {'ms': '毫秒', 's': '秒', 'min': '分钟', 'h': '小时'}
+
+
 def interval_label(config):
-    value = _int((config or {}).get('interval_seconds', 10), 10)
-    unit = (config or {}).get('interval_unit', 's')
-    return '%d 毫秒' % value if unit == 'ms' else '%d 秒' % value
+    config = config or {}
+    if 'interval_value' not in config and 'interval_unit' not in config:
+        return '%g 秒' % _float(config.get('interval_seconds', 0))
+    unit = str(config.get('interval_unit') or 's')
+    if 'interval_value' in config:
+        value = _int(config.get('interval_value'), 0)
+    else:
+        value = _int(config.get('interval_seconds', 10), 10)
+    return '%d %s' % (value, _UNIT_LABELS.get(unit, '秒'))
 
 
 def target_label(config):
@@ -70,7 +79,9 @@ def target_label(config):
             _MODE_LABELS.get(mode, mode), area['width'], area['height'],
             area['x'], area['y'])
     if config.get('mouse_move_only'):
-        target += '，只移动不点击'
+        target += '，只移动不点击（不会产生真实点击）'
+    else:
+        target += '，将真实点击'
     keyword = str(config.get('target_window_keyword') or '').strip()
     if keyword:
         target += '；前台窗口含“%s”' % keyword
@@ -153,8 +164,8 @@ def build_end_lines(stats):
         '点击：%d 次    成功：%d 次    失败：%d 次    异常：%d 次' % (
             clicks, success, failed, abnormal),
         '运行时长：%s' % runtime_label(stats.get('runtime_seconds', 0)),
-        '间隔：%g 秒 · 模式：%s · 按键：%s' % (
-            _float(stats.get('interval_seconds', 0)), mode, button),
+        '间隔：%s · 模式：%s · 按键：%s' % (
+            interval_label(stats), mode, button),
         '结束时间：%s' % (str(stats.get('timestamp') or '--').replace('T', ' ')),
     ]
 
@@ -182,6 +193,8 @@ def normalized_stats(stats):
         'exception_count': max(0, _int(stats.get('exception_count', 0))),
         'runtime_seconds': round(max(0.0, _float(stats.get('runtime_seconds', 0))), 1),
         'interval_seconds': max(0.0, _float(stats.get('interval_seconds', 0))),
+        'interval_value': max(0, _int(stats.get('interval_value', 0))),
+        'interval_unit': str(stats.get('interval_unit') or 's'),
         'mode': str(stats.get('mode') or ''),
         'button': str(stats.get('button') or ''),
         'stop_reason': str(stats.get('stop_reason') or '').strip() or '手动停止',
@@ -197,7 +210,7 @@ def summary_rows(stats):
         ('失败次数', data['fail_count']),
         ('异常次数', data['exception_count']),
         ('运行时长（秒）', data['runtime_seconds']),
-        ('间隔（秒）', data['interval_seconds']),
+        ('间隔', interval_label(data)),
         ('模式', _MODE_LABELS.get(data['mode'], data['mode'])),
         ('按键', _BUTTON_LABELS.get(data['button'], data['button'])),
         ('停止原因', data['stop_reason']),

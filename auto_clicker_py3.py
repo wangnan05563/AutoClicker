@@ -44,6 +44,7 @@ from auto_clicker_layers.engine import (
     schedule_grace_end as _engine_schedule_grace_end,
     schedule_next_text as _engine_schedule_next_text,
     normalize_schedule_periods as _engine_normalize_periods,
+    validate_schedule_no_overlap as _engine_validate_schedule_no_overlap,
     periods_from_text as _engine_periods_from_text,
     periods_to_text as _engine_periods_to_text,
     schedule_latest_period as _engine_schedule_latest_period,
@@ -95,6 +96,7 @@ from auto_clicker_layers.platform_io import (
     get_foreground_window_info,
     restore_system_settings,
     install_setting_restore_guards,
+    release_mouse_buttons,
     detect_input_backend,
     _is_wayland_session,
     _ydotool_run,
@@ -330,6 +332,10 @@ class AutoClicker:
         
         self.is_running = False
         self.click_thread = None
+        # H3：每次运行一个递增令牌；旧线程即使把 is_running 再读成 True 也不能继续点击。
+        self._run_id = 0
+        self._click_run_local = threading.local()
+        self._click_cancel_event = None
         self._region_selector = None
         self._region_starting = False
         self.config_file = os.path.expanduser("~/.auto_clicker_config_py3.json")
@@ -444,7 +450,9 @@ class AutoClicker:
         self._macro_play_loop = 1
         self._macro_record_tray_active = False
         self._macro_key_lock = threading.Lock()
-        self._macro_pressed_keys = set()
+        # M7：按键归属按回放 token 分组，旧 worker 只释放自己的键
+        self._macro_pressed_keys = {}
+        self._macro_play_local = threading.local()
         self._macro_last_macro = None
         self._macro_last_path = ''
         self._macro_record_name = ''
@@ -725,7 +733,12 @@ class AutoClicker:
 
     # ==================== P2 主题系统（TH-01 / TH-02 / TH-03） ====================
     def _init_theme(self):
-        """初始化主题：5 套内置主题 + 用户 JSON 主题包 + 可选 ttkbootstrap。"""
+        """初始化主题：5 套内置主题 + 用户 JSON 主题包。
+
+        AC-10：不再接入 ttkbootstrap。ttkbootstrap 构造 Style 会改变当前
+        ttk 主题，且每次 theme_use 都会在可见窗口重建原生元素；本应用已
+        使用手工语义色，保留 ttkbootstrap 只会破坏 clam 固定策略。
+        """
         self.user_theme_dir = os.path.expanduser('~/.auto_clicker/themes')
         self._user_themes, self._theme_load_errors = _theme_load_user_themes(self.user_theme_dir)
         # TH-02：语义化变量集中在 theme 层，避免散落十六进制
@@ -736,17 +749,12 @@ class AutoClicker:
         if requested != 'system' and requested not in self.THEMES:
             requested = 'light'
         self.theme_mode = requested
+        # 保留属性名供旧代码/诊断读取，但永不实例化 ttkbootstrap。
         self._ttkb_style = None
         # AC-10：Tk 的 ttk theme_use 在窗口可见后会重建原生元素，实测耗时 13-16s。
         # 因此在窗口映射前一次性固定 clam 作为唯一基底主题，运行时只改颜色，不再切主题。
         self._ttk_base_theme = None
         self._pin_ttk_base_theme()
-        # TH-01：可选接入 ttkbootstrap（缺失则降级为纯 ttk + 手动语义配色）
-        try:
-            import ttkbootstrap as ttkb  # noqa
-            self._ttkb_style = ttkb.Style(theme='cosmo')
-        except Exception:
-            self._ttkb_style = None
         self._current_palette = self._resolve_palette()
 
     def _pin_ttk_base_theme(self):
@@ -756,18 +764,20 @@ class AutoClicker:
         13.6-15.9s，无法满足 1s 切换。clam 支持完整的颜色配置，固定后由
         `_apply_ttk_theme_styles` 逐主题覆盖颜色即可。
         """
-        if getattr(self, '_ttk_base_theme', None):
-            return
         try:
             style = ttk.Style(self.root)
+            if self._ttk_base_theme and style.theme_use() == self._ttk_base_theme:
+                return
             available = set(style.theme_names())
-            if 'clam' in available:
-                style.theme_use('clam')
-                self._ttk_base_theme = 'clam'
-            elif available:
-                self._ttk_base_theme = style.theme_use()
-        except Exception:
+            if 'clam' not in available:
+                raise RuntimeError('clam 主题不可用')
+            style.theme_use('clam')
+            self._ttk_base_theme = 'clam'
+        except Exception as e:
+            # 初始化阶段无法获得 clam 时保持 None，由诊断显示；运行时绝不
+            # 再尝试 theme_use，避免错误路径把主题切换拖成秒级。
             self._ttk_base_theme = None
+            print("固定 ttk 基底主题失败: %s" % e)
 
     def _color(self, key):
         return self._current_palette.get(key, '#000000')
@@ -778,7 +788,10 @@ class AutoClicker:
         text = str(value)
         if len(text) <= limit:
             return text
-        return text[:18] + '...' + text[-22:]
+        limit = max(5, int(limit))
+        head = (limit - 3) // 2
+        tail = limit - 3 - head
+        return text[:head] + '...' + text[-tail:]
 
     def _on_color(self, key):
         """语义色背景上的文字色：浅色主题白字、深色主题深字，保证 ≥4.5:1。"""
@@ -843,9 +856,18 @@ class AutoClicker:
                 return
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            pal, errors = _theme_validate_pack(data, existing_ids=set(_THEME_PALETTES))
+            pal, errors = _theme_validate_pack(
+                data, existing_ids=set(_THEME_PALETTES) | set(self._user_themes))
             if errors or not pal:
                 messagebox.showerror("主题包无效", "\n".join(errors or ['未知错误']))
+                return
+            # L6：显示名也必须唯一，否则下拉框会覆盖已有主题
+            used_names = {str(item.get('name') or tid)
+                          for tid, item in {**_THEME_PALETTES, **self._user_themes}.items()}
+            if str(pal.get('name') or pal['id']) in used_names:
+                messagebox.showerror(
+                    "主题包无效", "主题显示名与已有主题冲突：%s" % (
+                        pal.get('name') or pal['id']))
                 return
             os.makedirs(self.user_theme_dir, exist_ok=True)
             dest = os.path.join(self.user_theme_dir, pal['id'] + '.json')
@@ -856,17 +878,6 @@ class AutoClicker:
             messagebox.showinfo("主题已导入", "已导入主题：%s" % (pal.get('name') or pal['id']))
         except Exception as e:
             messagebox.showerror("导入失败", str(e))
-
-    def _apply_ttkbootstrap_theme(self, pal=None):
-        """切换 ttkbootstrap 主题（TH-01）；未安装或切换失败时静默降级。"""
-        if self._ttkb_style is None:
-            return
-        try:
-            pal = pal or self._resolve_palette()
-            tb_name = 'darkly' if pal.get('is_dark') else 'cosmo'
-            self._ttkb_style.theme_use(tb_name)
-        except Exception:
-            pass
 
     def _recolor_action_buttons(self, pal):
         """按语义色重着色操作按钮（TH-02）。"""
@@ -963,7 +974,8 @@ class AutoClicker:
                 'TCombobox': {'fieldbackground': pal['surface'], 'foreground': pal['fg'],
                               'background': pal['surface'], 'arrowcolor': pal['fg'],
                               'bordercolor': pal['border'],
-                              'selectbackground': pal['primary'], 'selectforeground': 'white'},
+                              'selectbackground': pal['primary'],
+                              'selectforeground': pal['on_primary']},
                 'TCheckbutton': {'background': pal['bg'], 'foreground': pal['fg'],
                                  'indicatorbackground': pal['surface'],
                                  'indicatorforeground': pal['fg'],
@@ -1209,6 +1221,66 @@ class AutoClicker:
             self._refresh_nav_styles()
         except Exception as e:
             print("应用界面模式失败: %s" % e)
+
+    def _on_records_resize(self, event=None):
+        """T06164：记录页宽度变化后防抖重排，避免 Configure 风暴。"""
+        after_id = getattr(self, '_records_layout_after_id', None)
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        try:
+            self._records_layout_after_id = self.root.after(
+                50, self._layout_records_page)
+        except Exception:
+            self._records_layout_after_id = None
+
+    def _layout_records_page(self):
+        """记录页响应式布局：内容宽足够才两栏，否则上下堆叠。
+
+        两栏的实际请求宽由历史卡与宏卡共同决定。默认 1000/921 窗口下
+        历史摘要和宏按钮曾把请求宽撑到 1217px，导致宏控件被裁掉；这里
+        以实测请求宽 + 安全余量作为断点，而不是用固定窗口宽猜测。
+        """
+        self._records_layout_after_id = None
+        if not all(hasattr(self, name) for name in (
+                'records_top', 'history_holder', 'macro_holder',
+                'history_card', 'macro_card')):
+            return
+        try:
+            width = int(self.records_top.winfo_width())
+        except Exception:
+            return
+        if width <= 1:
+            return
+        required = (self.history_card.winfo_reqwidth()
+                    + self.macro_card.winfo_reqwidth() + 18)
+        # 330（历史卡最小宽）+ 约 680（宏卡请求宽）+ 间距的保守下限；
+        # 请求宽更大时自动抬高断点，避免宽屏边界上再次挤压宏卡。
+        two_col_min = max(1040, required)
+        mode = 'two_col' if width >= two_col_min else 'stack'
+        if mode == self._records_layout_mode:
+            return
+        if mode == 'two_col':
+            self.records_top.grid_columnconfigure(0, weight=0, minsize=330)
+            self.records_top.grid_columnconfigure(1, weight=1)
+            self.records_top.grid_rowconfigure(0, weight=1)
+            self.records_top.grid_rowconfigure(1, weight=0)
+            self.history_holder.grid(
+                row=0, column=0, sticky='nsew', padx=(0, 10), pady=0)
+            self.macro_holder.grid(
+                row=0, column=1, sticky='nsew', padx=0, pady=0)
+        else:
+            self.records_top.grid_columnconfigure(0, weight=1, minsize=0)
+            self.records_top.grid_columnconfigure(1, weight=0)
+            self.records_top.grid_rowconfigure(0, weight=0)
+            self.records_top.grid_rowconfigure(1, weight=0)
+            self.history_holder.grid(
+                row=0, column=0, sticky='ew', padx=0, pady=0)
+            self.macro_holder.grid(
+                row=1, column=0, sticky='ew', padx=0, pady=(10, 0))
+        self._records_layout_mode = mode
 
     def _run_summary_text(self):
         """运行台配置摘要（只读，避免与规则页控件状态不同步）。"""
@@ -1546,7 +1618,8 @@ class AutoClicker:
             self.daily_stats = _dashboard.record_run(
                 self.daily_stats, run or self.last_run_stats)
             self.daily_stats = _dashboard.save(self.daily_stats_file, self.daily_stats)
-            self._refresh_run_metrics()
+            # M6：后台点击线程只落盘，Tk 刷新统一回到主线程队列
+            self._ui(self._refresh_run_metrics)
         except Exception as e:
             try:
                 self.log_message("保存今日统计失败: " + str(e))
@@ -1556,7 +1629,7 @@ class AutoClicker:
             self.run_history = _history.append_run(
                 self.run_history, run or self.last_run_stats)
             self.run_history = _history.save(self.run_history_file, self.run_history)
-            self.refresh_run_history()
+            self._ui(self.refresh_run_history)
         except Exception as e:
             try:
                 self.log_message("保存运行历史失败: " + str(e))
@@ -1583,14 +1656,66 @@ class AutoClicker:
             except Exception:
                 pass
 
+    def _on_history_canvas_resize(self, event=None):
+        """M10：窗口缩放后防抖重绘趋势图。"""
+        if event is not None and getattr(event, 'width', 1) <= 1:
+            return
+        after_id = getattr(self, '_history_draw_after_id', None)
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        try:
+            self._history_draw_after_id = self.root.after(
+                80, self._redraw_history_trend)
+        except Exception:
+            self._history_draw_after_id = None
+
+    def _redraw_history_trend(self):
+        self._history_draw_after_id = None
+        try:
+            self._draw_history_trend(_history.trend_points(self.run_history))
+        except Exception:
+            pass
+
+    def _on_mp_canvas_resize(self, event=None):
+        """M10：多点路径画布缩放后防抖重绘。"""
+        if event is not None and getattr(event, 'width', 1) <= 1:
+            return
+        after_id = getattr(self, '_mp_draw_after_id', None)
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        try:
+            self._mp_draw_after_id = self.root.after(
+                80, self._redraw_mp_preview)
+        except Exception:
+            self._mp_draw_after_id = None
+
+    def _redraw_mp_preview(self):
+        self._mp_draw_after_id = None
+        try:
+            self._draw_multi_point_preview()
+        except Exception:
+            pass
+
     def _draw_history_trend(self, points):
         canvas = getattr(self, 'history_canvas', None)
         if canvas is None:
             return
         try:
             canvas.delete('all')
-            width = max(240, int(canvas.winfo_width() or 720))
-            height = max(60, int(canvas.winfo_height() or 96))
+            width = int(canvas.winfo_width())
+            height = int(canvas.winfo_height())
+            if width <= 1:
+                width = 720
+            if height <= 1:
+                height = 96
+            width = max(240, width)
+            height = max(60, height)
             pad_l, pad_r, pad_t, pad_b = 34, 12, 10, 18
             graph_w = max(1, width - pad_l - pad_r)
             graph_h = max(1, height - pad_t - pad_b)
@@ -1675,7 +1800,6 @@ class AutoClicker:
         try:
             pal = self._resolve_palette()
             self._current_palette = pal
-            self._apply_ttkbootstrap_theme(pal)
             self._apply_ttk_theme_styles(pal)
             # theme_use 会重置 ttk 样式字体，切换后需按统一基准重新覆盖
             self._apply_ttk_fonts()
@@ -1685,6 +1809,7 @@ class AutoClicker:
             self._refresh_nav_styles()
             # 托盘图标跟随浅/深主题刷新（T05257）
             self._refresh_tray_icon()
+            self._restyle_tray_menu()
             if getattr(self, 'log_text', None):
                 try:
                     self.log_text.configure(bg=pal['surface'], fg=pal['fg'])
@@ -1742,8 +1867,12 @@ class AutoClicker:
                 self.root.configure(bg=pal['bg'])
             except Exception:
                 pass
-        except Exception:
-            pass
+        except Exception as exc:
+            # L11：主题失败要可见，不能让窗口停在半套配色
+            try:
+                self.log_message("应用主题失败: %s: %s" % (type(exc).__name__, exc))
+            except Exception:
+                pass
 
     def on_theme_change(self, mode):
         """切换主题并持久化（FR-33/34/35）。"""
@@ -1764,8 +1893,15 @@ class AutoClicker:
             # 跟随系统模式：启动轮询，随系统深浅色变化
             if mode == 'system':
                 self._poll_system_theme()
-        except Exception:
-            pass
+        except Exception as exc:
+            try:
+                self.log_message("切换主题失败: %s: %s" % (type(exc).__name__, exc))
+            except Exception:
+                pass
+            try:
+                self.show_operation_message("切换主题失败：%s" % exc, level='error')
+            except Exception:
+                pass
 
     def on_theme_change_ui(self, event=None):
         mode = getattr(self, '_theme_name_map', {}).get(self.theme_var.get(), 'light')
@@ -1947,17 +2083,28 @@ class AutoClicker:
         grace_end = _engine_schedule_grace_end(occ, stop_min)
         result = 'noop'
         if not running and now <= grace_end and key != self._schedule_last_occurrence:
-            self._schedule_last_occurrence = key
-            self._schedule_active_occurrence = key
-            self._schedule_active_end = (occ + timedelta(minutes=stop_min)) if stop_min > 0 else None
+            # M5：失败后 30 秒内不再重试，避免每秒弹错误框；成功才提交 last_occurrence。
+            retry_key = getattr(self, '_schedule_retry_key', None)
+            retry_after = getattr(self, '_schedule_retry_after', None)
+            if retry_key == key and retry_after is not None and now < retry_after:
+                return result
             self.start_clicking(source='schedule')
             if self.is_running:
+                self._schedule_last_occurrence = key
+                self._schedule_active_occurrence = key
+                self._schedule_active_end = (
+                    (occ + timedelta(minutes=stop_min)) if stop_min > 0 else None)
+                self._schedule_retry_key = None
+                self._schedule_retry_after = None
                 self.log_message("定时计划触发：%s 启动" % occ.strftime('%m-%d %H:%M'))
                 result = 'started'
             else:
                 self._schedule_active_occurrence = None
                 self._schedule_active_end = None
-                self.log_message("定时计划触发失败：启动参数校验未通过")
+                self._schedule_retry_key = key
+                self._schedule_retry_after = now + timedelta(seconds=30)
+                self.log_message("定时计划触发失败：启动参数校验未通过，30 秒后重试")
+                self._schedule_noop_reason = 'schedule_start_failed'
         if running and self._schedule_active_occurrence == key:
             active_end = getattr(self, '_schedule_active_end', None)
             if active_end is not None and now >= active_end:
@@ -2006,7 +2153,10 @@ class AutoClicker:
             if getattr(self, 'schedule_periods_var', None) is not None:
                 period_text = self.schedule_periods_var.get().strip()
             periods = _engine_periods_from_text(period_text, days) if period_text else []
-            if len(periods) > 1:
+            if periods:
+                periods = _engine_validate_schedule_no_overlap(periods)
+            if len(periods) >= 1:
+                # M9：单时段也要同步 legacy 字段，避免 UI 与实际调度不一致
                 start = periods[0]['start']
                 stop_min = periods[0]['stop_after_min']
             sched = {'enabled': bool(self.schedule_enabled_var.get()),
@@ -2126,8 +2276,14 @@ class AutoClicker:
             points = _multi_point.normalize_points(
                 self.config.get('multi_points', []) if points is None else points)
             canvas.delete('all')
-            width = max(240, int(canvas.winfo_width() or 720))
-            height = max(60, int(canvas.winfo_height() or 84))
+            width = int(canvas.winfo_width())
+            height = int(canvas.winfo_height())
+            if width <= 1:
+                width = 720
+            if height <= 1:
+                height = 84
+            width = max(240, width)
+            height = max(60, height)
             pal = self._current_palette
             canvas.configure(bg=pal['surface'])
             canvas.create_rectangle(8, 8, width - 8, height - 8,
@@ -2372,10 +2528,23 @@ class AutoClicker:
 
     @staticmethod
     def _autostart_executable():
-        """返回开机自启应指向的可执行路径（打包后为 exe，源码运行为脚本）。"""
+        """返回开机自启应指向的可执行路径（打包后为 exe，源码运行为 python）。"""
         if getattr(sys, 'frozen', False):
             return os.path.abspath(sys.argv[0])
-        return os.path.abspath(__file__)
+        return os.path.abspath(sys.executable)
+
+    @classmethod
+    def _autostart_command(cls):
+        """L8：源码运行时必须带上脚本路径，不能只注册 python.exe。"""
+        if getattr(sys, 'frozen', False):
+            return '"%s"' % cls._autostart_executable()
+        executable = os.path.abspath(sys.executable)
+        # Windows 源码模式优先 pythonw.exe，避免开机时弹控制台窗口
+        if IS_WINDOWS:
+            pythonw = os.path.join(os.path.dirname(executable), 'pythonw.exe')
+            if os.path.exists(pythonw):
+                executable = pythonw
+        return '"%s" "%s"' % (executable, os.path.abspath(__file__))
 
     def _set_autostart_windows(self, enable):
         """写入/删除 Windows 注册表 Run 项。"""
@@ -2386,7 +2555,7 @@ class AutoClicker:
         try:
             if enable:
                 winreg.SetValueEx(key, "AutoClicker", 0, winreg.REG_SZ,
-                                  '"' + self._autostart_executable() + '"')
+                                  self._autostart_command())
             else:
                 try:
                     winreg.DeleteValue(key, "AutoClicker")
@@ -2403,8 +2572,8 @@ class AutoClicker:
         if enable:
             with open(desk, 'w', encoding='utf-8') as f:
                 f.write("[Desktop Entry]\nType=Application\nName=AutoClicker\n"
-                        "Exec=\"%s\"\nHidden=false\nX-GNOME-Autostart-enabled=true\n"
-                        % self._autostart_executable())
+                        "Exec=%s\nHidden=false\nX-GNOME-Autostart-enabled=true\n"
+                        % self._autostart_command())
         elif os.path.exists(desk):
             os.remove(desk)
 
@@ -2425,7 +2594,11 @@ class AutoClicker:
                     raw, registered = '', False
                 finally:
                     winreg.CloseKey(key)
-                path = str(raw or '').strip().strip('"')
+                raw_cmd = str(raw or '').strip()
+                if raw_cmd.startswith('"'):
+                    path = raw_cmd[1:].split('"', 1)[0]
+                else:
+                    path = raw_cmd.split(' ', 1)[0].strip('"')
                 return {
                     'supported': True, 'enabled': enabled,
                     'registered': registered, 'path': path,
@@ -2447,7 +2620,11 @@ class AutoClicker:
                     with open(desk, 'r', encoding='utf-8', errors='replace') as fh:
                         for line in fh:
                             if line.startswith('Exec='):
-                                path = line.split('=', 1)[1].strip().strip('"')
+                                cmd = line.split('=', 1)[1].strip()
+                                if cmd.startswith('"'):
+                                    path = cmd[1:].split('"', 1)[0]
+                                else:
+                                    path = cmd.split(' ', 1)[0]
                                 break
                 except OSError:
                     pass
@@ -2463,6 +2640,8 @@ class AutoClicker:
         }
 
     def set_autostart(self, enable):
+        """L8：失败时回滚配置与复选框，避免 UI 显示已开启但注册表未写入。"""
+        previous = bool(self.config.get('autostart', False))
         try:
             if IS_WINDOWS:
                 self._set_autostart_windows(enable)
@@ -2470,15 +2649,24 @@ class AutoClicker:
                 self._set_autostart_linux(enable)
             else:
                 messagebox.showinfo("提示", "当前平台不支持开机自启")
-                return
+                return False
             self.config['autostart'] = enable
             self.save_config()
             self.log_message("开机自启已" + ("开启" if enable else "关闭"))
             self.refresh_diagnostics()
+            return True
         except Exception as e:
+            self.config['autostart'] = previous
+            var = getattr(self, 'autostart_var', None)
+            if var is not None:
+                try:
+                    var.set(previous)
+                except Exception:
+                    pass
             self.log_message("设置开机自启失败: " + str(e))
             messagebox.showerror("错误", "设置开机自启失败: " + str(e))
             self.refresh_diagnostics()
+            return False
 
     def open_config_dir(self):
         """FR-04：打开配置文件所在目录。"""
@@ -2914,6 +3102,7 @@ class AutoClicker:
                         'x': int(region['x']), 'y': int(region['y']),
                         'width': int(region['width']), 'height': int(region['height']),
                     }
+                self._wizard_area_selected = True
         except Exception:
             pass
         self._restore_wizard_window()
@@ -2930,11 +3119,12 @@ class AutoClicker:
 
     def _wizard_use_cursor(self):
         self._wizard_click_area = self._onboarding_point_area()
+        self._wizard_area_selected = True
         self._wizard_refresh_preview()
 
     def _wizard_save_safe_profile(self, cfg):
         try:
-            self.config.setdefault('profiles', {})['推荐安全'] = {
+            self.config.setdefault('profiles', {})[_onboarding.SAFE_TEMPLATE['name']] = {
                 k: cfg.get(k) for k in (
                     'interval_seconds', 'click_mode', 'prevent_sleep',
                     'mouse_follow_enabled', 'mouse_move_speed', 'mouse_move_only',
@@ -2955,7 +3145,12 @@ class AutoClicker:
         try:
             start = self._wizard_hotkey_start_var.get().strip().lower()
             emergency = self._wizard_hotkey_emergency_var.get().strip().lower()
-            area = getattr(self, '_wizard_click_area', None) or self._onboarding_point_area()
+            explicit_area = getattr(self, '_wizard_click_area', None)
+            if (not skipped
+                    and _onboarding.template_requires_explicit_target(template_id)
+                    and not getattr(self, '_wizard_area_selected', False)):
+                raise ValueError('该模板会真实点击，请先在“目标区域”步骤选择目标')
+            area = explicit_area or self._onboarding_point_area()
             if skipped:
                 safe_cfg = _onboarding.safe_config(
                     self.config, click_area=area,
@@ -2978,7 +3173,7 @@ class AutoClicker:
             self._show_page('run')
             self._close_wizard()
             self.log_message("首启向导：%s，目标 %s" % (
-                '已跳过并使用推荐安全' if skipped else
+                '已跳过并使用安全试运行（只移动不点击）' if skipped else
                 ('模板 ' + str(_onboarding.get_template(template_id)['name'])),
                 self._wizard_target_text()))
         except Exception as e:
@@ -3021,6 +3216,7 @@ class AutoClicker:
         self._wizard_force = bool(force)
         self._wizard_step = 1
         self._wizard_click_area = dict(self.config.get('click_area') or {})
+        self._wizard_area_selected = False
         self._wizard_template_var = tk.StringVar(value='keep_online')
         self._wizard_target_var = tk.StringVar(value=self._wizard_target_text())
         self._wizard_preview_var = tk.StringVar()
@@ -4161,7 +4357,7 @@ class AutoClicker:
         self.click_button_var = tk.StringVar(value=self.config.get('click_button', 'left'))
         ttk.Combobox(row1, textvariable=self.click_button_var, width=10,
                      values=['left', 'right', 'middle', 'double'], state='readonly').pack(side=tk.LEFT, padx=(5, 15))
-        ttk.Label(row1, text="按住时长(ms)", font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
+        ttk.Label(row1, text="按住时长(ms, ≤5000)", font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
         self.hold_ms_var = tk.StringVar(value=str(self.config.get('hold_ms', 10)))
         ttk.Entry(row1, textvariable=self.hold_ms_var, width=8, justify='center').pack(side=tk.LEFT, padx=(5, 0))
 
@@ -4210,6 +4406,7 @@ class AutoClicker:
             p1_card, height=84, bg=self._color('surface'),
             highlightthickness=0, relief=tk.FLAT)
         self.mp_preview_canvas.pack(fill=tk.X, pady=(0, 4))
+        self.mp_preview_canvas.bind('<Configure>', self._on_mp_canvas_resize)
         self.root.after(50, self._draw_multi_point_preview)
         mp_btn = ttk.Frame(p1_card)
         mp_btn.pack(fill=tk.X)
@@ -4306,38 +4503,46 @@ class AutoClicker:
         # ==================== 记录：最近运行历史（T06155） ====================
         self.records_top = ttk.Frame(self.records_page)
         self.records_top.pack(fill=tk.X)
-        self.records_top.grid_columnconfigure(0, weight=0, minsize=330)
-        self.records_top.grid_columnconfigure(1, weight=1)
-        self.records_top.grid_rowconfigure(0, weight=1)
-        history_holder = ttk.Frame(self.records_top)
-        history_holder.grid(row=0, column=0, sticky='nsew', padx=(0, 10))
-        macro_holder = ttk.Frame(self.records_top)
-        macro_holder.grid(row=0, column=1, sticky='nsew')
+        # 窄屏默认上下堆叠：两栏所需请求宽约 1050px，默认 1000/921 窗口放不下。
+        self._records_layout_mode = 'stack'
+        self.records_top.grid_columnconfigure(0, weight=1)
+        self.records_top.grid_rowconfigure(0, weight=0)
+        self.records_top.grid_rowconfigure(1, weight=0)
+        self.history_holder = ttk.Frame(self.records_top)
+        self.history_holder.grid(row=0, column=0, sticky='ew')
+        self.macro_holder = ttk.Frame(self.records_top)
+        self.macro_holder.grid(row=1, column=0, sticky='ew', pady=(10, 0))
         self.history_card = ttk.LabelFrame(
-            history_holder, text="运行历史（最近 30 次）", padding="10")
+            self.history_holder, text="运行历史（最近 30 次）", padding="10")
         self.history_card.pack(fill=tk.BOTH, expand=True)
         history_head = ttk.Frame(self.history_card)
         history_head.pack(fill=tk.X)
         self.history_summary_var = tk.StringVar(value=_history.summary_text(self.run_history))
-        ttk.Label(history_head, textvariable=self.history_summary_var,
-                  font=('微软雅黑', 9, 'bold')).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(history_head, text="导出 CSV", command=self.export_run_history,
-                   width=9).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Button(history_head, text="刷新", command=self.refresh_run_history,
+        self.history_summary_label = ttk.Label(
+            history_head, textvariable=self.history_summary_var,
+            font=('微软雅黑', 9, 'bold'), wraplength=280, justify=tk.LEFT)
+        self.history_summary_label.pack(anchor=tk.W, fill=tk.X)
+        history_actions = ttk.Frame(self.history_card)
+        history_actions.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(history_actions, text="导出 CSV", command=self.export_run_history,
+                   width=9).pack(side=tk.LEFT)
+        ttk.Button(history_actions, text="刷新", command=self.refresh_run_history,
                    width=6).pack(side=tk.LEFT, padx=(4, 0))
         self.history_canvas = tk.Canvas(
             self.history_card, height=96, bg=self._color('surface'),
             highlightthickness=0, relief=tk.FLAT)
         self.history_canvas.pack(fill=tk.X, pady=(6, 0))
+        self.history_canvas.bind('<Configure>', self._on_history_canvas_resize)
         self.history_empty_label = ttk.Label(
             self.history_card, text="完成一次运行后，这里显示成功率与时长趋势。",
-            font=('微软雅黑', 8), foreground=self._color('muted'))
+            font=('微软雅黑', 8), foreground=self._color('muted'),
+            wraplength=280, justify=tk.LEFT)
         self.history_empty_label.pack(anchor=tk.W)
         self.root.after(50, self.refresh_run_history)
 
         # ==================== 记录：录制与回放（FR-13） ====================
         self.macro_card = ttk.LabelFrame(
-            macro_holder, text="录制与回放（FR-13）", padding="10")
+            self.macro_holder, text="录制与回放（FR-13）", padding="10")
         self.macro_card.pack(fill=tk.BOTH, expand=True)
         ttk.Label(
             self.macro_card,
@@ -4369,10 +4574,6 @@ class AutoClicker:
                 save=True, reason='手动停止录制'),
             state=tk.DISABLED)
         self.macro_record_stop_btn.pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(macro_record_row, text="宏目录", width=7,
-                   command=self.open_macro_dir).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(macro_record_row, text="诊断", width=5,
-                   command=self.show_diagnostics_window).pack(side=tk.LEFT)
 
         macro_play_row = ttk.Frame(self.macro_card)
         macro_play_row.pack(fill=tk.X, pady=(3, 3))
@@ -4437,7 +4638,11 @@ class AutoClicker:
         ttk.Button(macro_lib_row, text="绑定", width=6,
                    command=self.apply_macro_hotkey).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(macro_lib_row, text="解除", width=6,
-                   command=self.clear_macro_hotkey).pack(side=tk.LEFT)
+                   command=self.clear_macro_hotkey).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(macro_lib_row, text="宏目录", width=7,
+                   command=self.open_macro_dir).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(macro_lib_row, text="诊断", width=5,
+                   command=self.show_diagnostics_window).pack(side=tk.LEFT)
         self.macro_recent_var = tk.StringVar(
             value=_macro.recent_label(self._macro_recent, self.macro_dir))
         ttk.Label(self.macro_card, textvariable=self.macro_recent_var,
@@ -4461,6 +4666,10 @@ class AutoClicker:
             font=('Consolas', 8), bg=self._color('surface'), fg=self._color('fg'),
             relief=tk.FLAT, padx=5, pady=3, highlightthickness=0)
         self.macro_preview.pack(fill=tk.X)
+
+        # T06164：记录页按实际内容宽响应式布局；窗口缩放后防抖重排。
+        self.records_top.bind('<Configure>', self._on_records_resize)
+        self.root.after(0, self._layout_records_page)
 
         # ==================== 日志区域 ====================
         self.log_card = ttk.LabelFrame(self.records_page, text="运行日志", padding="10")
@@ -4671,15 +4880,22 @@ class AutoClicker:
         self._hk_keys = []
         macro_keys = []
         macro_errors = []
+        # M11：宏热键配置损坏时只跳过宏，不能拖垮 Esc/F6/F8 的注册。
+        raw_macro_hotkeys = self.config.get('macro_hotkeys')
+        if not isinstance(raw_macro_hotkeys, dict):
+            macro_errors.append('macro_hotkeys 配置损坏（应为对象）')
+            raw_macro_hotkeys = {}
         try:
             kb.add_hotkey(start_k, lambda: self._hotkey_queue.put('toggle'))
             self._hk_keys.append(start_k)
             kb.add_hotkey(emer_k, lambda: self._hotkey_queue.put('emergency'))
             self._hk_keys.append(emer_k)
-            kb.add_hotkey('esc', lambda: self._hotkey_queue.put('emergency'))
-            self._hk_keys.append('esc')
+            # M12：emer_k 本身就是 esc 时不再重复注册固定 Esc
+            if emer_k.lower() != 'esc':
+                kb.add_hotkey('esc', lambda: self._hotkey_queue.put('emergency'))
+                self._hk_keys.append('esc')
             reserved = {start_k.lower(), emer_k.lower(), 'esc'}
-            for path, key in (self.config.get('macro_hotkeys') or {}).items():
+            for path, key in raw_macro_hotkeys.items():
                 try:
                     normalized = str(key or '').strip().lower()
                     if not normalized:
@@ -4699,12 +4915,14 @@ class AutoClicker:
                     macro_errors.append("%s：%s" % (str(key), exc))
             self._hotkey_state = {
                 'available': True, 'registered': True,
-                'keys': [start_k, emer_k, 'esc'] + macro_keys,
+                'keys': [start_k, emer_k] + (
+                    ['esc'] if emer_k.lower() != 'esc' else []) + macro_keys,
                 'start': start_k, 'emergency': emer_k, 'error': '',
                 'macro_keys': macro_keys, 'macro_errors': macro_errors,
             }
             print("快捷键已注册：启动=" + start_k + "，紧急停止=" + emer_k +
-                  "，Esc，宏热键=" + str(len(macro_keys)))
+                  "，Esc" + ("" if emer_k.lower() == 'esc' else "（固定）") +
+                  "，宏热键=" + str(len(macro_keys)))
             if macro_errors:
                 print("部分宏热键未注册：" + "；".join(macro_errors))
         except Exception as e:
@@ -5104,8 +5322,14 @@ class AutoClicker:
     def _set_next(self, text):
         self._ui(self.next_click_label.config, text=text)
 
-    def run_clicking(self):
+    def run_clicking(self, run_id=None, cancel_event=None):
         """点击主流程（后台线程）：先启动倒计时，再进入点击循环（CX-04）"""
+        if run_id is None:
+            run_id = self._run_id
+        self._click_run_local.run_id = run_id
+        # H4：每个运行实例独立取消事件，旧线程不会误用新运行的取消状态。
+        if cancel_event is not None:
+            self._click_run_local.cancel_event = cancel_event
         self.start_time = time.time()
         self.success_count = 0
         self.fail_count = 0
@@ -5115,7 +5339,7 @@ class AutoClicker:
         if countdown > 0:
             deadline = time.monotonic() + countdown
             last_second = None
-            while self.is_running:
+            while self._run_active():
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
@@ -5127,14 +5351,14 @@ class AutoClicker:
                     self._set_next("启动倒计时 %.1fs" % remaining)
                     last_second = second
                 time.sleep(min(0.1, max(0.01, remaining)))
-            if not self.is_running:
+            if not self._run_active():
                 return
             self._ui(self._set_run_countdown, 0.0, countdown)
         self._ui(self.countdown_bar.config, value=100)
         self._set_status("运行中", 'green')
         self._set_next("--")
         self._ui(self._start_runtime_tick)
-        self.click_loop()
+        self.click_loop(run_id)
         self._ui(self._stop_runtime_tick)
         self._ui(self.countdown_bar.config, value=0)
 
@@ -5182,15 +5406,25 @@ class AutoClicker:
         """返回叠加 jitter 后的等待秒数。"""
         return _engine_jittered_wait(base_seconds, self.jitter_pct, _RANDOM)
 
+    def _run_active(self):
+        """H3：当前线程是否仍属于最新一次运行（旧线程停止后不得复活）。"""
+        local = getattr(self, '_click_run_local', None)
+        run_id = getattr(self, '_run_id', None)
+        local_id = getattr(local, 'run_id', None)
+        # 测试或旧调用路径没有令牌时退回 is_running，不改变原有直接调用语义。
+        if run_id is None or local_id is None:
+            return bool(self.is_running)
+        return bool(self.is_running) and local_id == run_id
+
     def _wait_interval(self, base_seconds):
         """按 jitter 随机化后分段等待，期间可响应停止、failsafe 与参数热更新"""
         wait = self._jittered_wait(base_seconds)
         if wait <= 0:
-            return self.is_running
+            return self._run_active()
         show_countdown = base_seconds >= 1.0 and self.interval_unit == 's'
         step = 0.05
         remaining = wait
-        while remaining > 0 and self.is_running:
+        while remaining > 0 and self._run_active():
             if self._interval_change_event.is_set():
                 self._interval_change_event.clear()
                 base_seconds = self._effective_interval_seconds()
@@ -5203,9 +5437,9 @@ class AutoClicker:
             chunk = min(step, remaining)
             time.sleep(chunk)
             remaining -= chunk
-        if not show_countdown and self.is_running:
+        if not show_countdown and self._run_active():
             self._set_next("ms 模式")
-        return self.is_running
+        return self._run_active()
 
     def _failsafe_triggered(self, base_pos):
         """鼠标相对基线位移超过 20px 时视为触发 failsafe。"""
@@ -5244,9 +5478,13 @@ class AutoClicker:
         # FN-01/FN-02：支持按键类型与按住时长；FR-15 支持可配双击间隔
         effective_hold = self.hold_ms if hold_ms is None else max(0, int(hold_ms))
         gap = int(getattr(self, 'double_gap_cache', 30))
+        cancel_event = getattr(getattr(self, '_click_run_local', None), 'cancel_event', None)
         ok = click_mouse(x, y, button=self.click_button, hold_ms=effective_hold,
-                         double_gap_ms=gap)
+                         double_gap_ms=gap, cancel_event=cancel_event)
         final_ok = bool(ok)
+        if not ok and cancel_event is not None and cancel_event.is_set():
+            self.log_message("点击已被停止取消，跳过 pyautogui 兜底")
+            return
         if ok:
             self.log_message(f"在位置 ({x}, {y}) 执行点击[按键={self.click_button}]")
         else:
@@ -5287,14 +5525,30 @@ class AutoClicker:
     def _target_window_ok(self):
         if not getattr(self, 'target_window_cache', ''):
             return True
-        title, proc, klass = get_foreground_window_info()
+        try:
+            info = get_foreground_window_info()
+        except Exception:
+            return True
+        # L10：兼容旧版/第三方返回 2 元组或单值的实现，不让窗口过滤中断点击。
+        if isinstance(info, (tuple, list)):
+            if len(info) >= 3:
+                title, proc, klass = info[:3]
+            elif len(info) == 2:
+                title, proc = info
+                klass = ''
+            elif len(info) == 1:
+                title, proc, klass = info[0], '', ''
+            else:
+                title, proc, klass = '', '', ''
+        else:
+            title, proc, klass = str(info or ''), '', ''
         return target_window_matches(self.target_window_cache, title, proc, klass)
 
     def _pause_for_target_window(self):
         """FR-E03：前台窗口不匹配时暂停点击，切回目标窗口后自动恢复。"""
         if not getattr(self, 'target_window_cache', ''):
-            return self.is_running
-        while self.is_running:
+            return self._run_active()
+        while self._run_active():
             if self._target_window_ok():
                 if getattr(self, '_window_mismatch_active', False):
                     self._window_mismatch_active = False
@@ -5311,17 +5565,17 @@ class AutoClicker:
     def _wait_exact(self, seconds):
         """高精度等待：≤50ms 纯自旋，避免 Windows 定时器粒度把 20ms 拖成 60ms+。"""
         if seconds <= 0:
-            return self.is_running
+            return self._run_active()
         deadline = time.perf_counter() + seconds
         if seconds <= 0.05:
-            while self.is_running:
+            while self._run_active():
                 if self._interval_change_event.is_set():
                     self._interval_change_event.clear()
                     return True
                 if time.perf_counter() >= deadline:
                     break
-            return self.is_running
-        while self.is_running:
+            return self._run_active()
+        while self._run_active():
             if self._interval_change_event.is_set():
                 self._interval_change_event.clear()
                 return True
@@ -5332,20 +5586,22 @@ class AutoClicker:
                 time.sleep(min(max(0.0005, remain - 0.003), 0.05))
             else:
                 time.sleep(0.0002)
-        return self.is_running
+        return self._run_active()
 
-    def click_loop(self):
+    def click_loop(self, run_id=None):
+        if run_id is not None:
+            self._click_run_local.run_id = run_id
         # 多点位序列模式（FN-03）
         points = self.multi_points if self.use_multi_points else None
         point_idx = 0
         last_click_at = time.perf_counter()
         lead_est = 0.001  # 等待结束到点击动作之间的预估开销，按实测自适应
-        while self.is_running:
+        while self._run_active():
             try:
                 # T06150：暂停闸门；继续后从下一周期重新计时，不补点
                 gate = getattr(self, '_pause_gate', None)
                 if gate is not None and gate.paused():
-                    if not gate.wait_until_resumed(lambda: self.is_running):
+                    if not gate.wait_until_resumed(lambda: self._run_active()):
                         break
                     last_click_at = time.perf_counter()
                 base = self._effective_interval_seconds()
@@ -5379,7 +5635,7 @@ class AutoClicker:
                     continue
 
                 # 安全：运行中若开启 failsafe 且鼠标被移动 >20px，立即急停（CX-01）
-                if self.failsafe_enabled and self.is_running and self._failsafe_armed and self._failsafe_triggered(failsafe_base):
+                if self.failsafe_enabled and self._run_active() and self._failsafe_armed and self._failsafe_triggered(failsafe_base):
                     self.stop_clicking(reason="鼠标位移触发安全停止 (failsafe)")
                     return
 
@@ -5532,6 +5788,12 @@ class AutoClicker:
         if not self.input_ok:
             messagebox.showerror("启动已禁用", self.input_reason)
             return
+        # H3：旧线程尚未退出时拒绝启动，避免 is_running 被新运行重新置 True 后旧线程复活。
+        if self.click_thread is not None and self.click_thread.is_alive():
+            self.show_operation_message(
+                "上一次点击仍在收尾，请稍候再启动。", level='operation')
+            self.log_message("启动被拒绝：上一次点击线程尚未退出")
+            return
         # FR-13：录制/回放占用真实输入时，不允许自动点击同时启动。
         if self._macro_ui_busy():
             self.show_operation_message(
@@ -5557,6 +5819,15 @@ class AutoClicker:
             if hold_ms is None:
                 return
             use_cps = bool(self.use_cps_var.get())
+            if not use_cps:
+                # H4：按住时长不得超过一个点击间隔，否则实际周期被 hold 拉长。
+                interval_seconds = _engine_effective_interval_seconds(
+                    interval, self.interval_unit_var.get())
+                if interval_seconds > 0 and hold_ms > interval_seconds * 1000.0:
+                    self.show_field_error(
+                        "按住时长不能超过点击间隔（当前约 %d ms）"
+                        % int(interval_seconds * 1000))
+                    return
             cps_range = self._read_cps_range() if use_cps else (None, None)
             if use_cps and cps_range is None:
                 return
@@ -5577,6 +5848,10 @@ class AutoClicker:
                 self.log_message("启动已取消：用户在启动确认框选择取消")
                 return
 
+            self._run_id += 1
+            run_id = self._run_id
+            cancel_event = threading.Event()
+            self._click_cancel_event = cancel_event
             self.is_running = True
             self.click_count = 0
             self.success_count = 0
@@ -5650,7 +5925,8 @@ class AutoClicker:
             if self.mouse_move_only_var.get():
                 self.log_message("只移动不点击模式: 启用")
 
-            self.click_thread = threading.Thread(target=self.run_clicking, daemon=True)
+            self.click_thread = threading.Thread(
+                target=self.run_clicking, args=(run_id, cancel_event), daemon=True)
             self.click_thread.start()
 
             # 更新状态指示器（含底部状态条与窗口标题联动）
@@ -5743,6 +6019,12 @@ class AutoClicker:
 
     def stop_clicking(self, reason=""):
         was_running = bool(getattr(self, 'is_running', False))
+        # H3：先让旧线程的令牌失效，再置 is_running=False；否则旧线程可能在新一轮启动后复活。
+        self._run_id = getattr(self, '_run_id', 0) + 1
+        # H4：唤醒仍在按住等待的点击线程，并在 join 后兜底释放鼠标键。
+        cancel_event = getattr(self, '_click_cancel_event', None)
+        if cancel_event is not None:
+            cancel_event.set()
         self.is_running = False
         self.is_paused = False
         self.countdown_cancelled = False
@@ -5760,6 +6042,8 @@ class AutoClicker:
             except RuntimeError:
                 pass
 
+        release_mouse_buttons()
+
         # REQ-004 / FR-02：等点击线程收尾后再记录快照，确保成功/失败计数完整
         try:
             runtime = max(0.0, time.time() - getattr(self, 'start_time', time.time()))
@@ -5771,6 +6055,8 @@ class AutoClicker:
                 'exception_count': getattr(self, 'exception_count', 0),
                 'runtime_seconds': round(runtime, 1),
                 'interval_seconds': self._effective_interval_seconds(),
+                'interval_value': self.config.get('interval_seconds', 0),
+                'interval_unit': self.config.get('interval_unit', 's'),
                 'mode': self.config.get('click_mode', ''),
                 'button': getattr(self, 'click_button', ''),
                 'stop_reason': str(reason or '').strip() or '手动停止',
@@ -6351,13 +6637,19 @@ class AutoClicker:
         self._register_hotkeys()
         state = getattr(self, '_hotkey_state', {}) or {}
         macro_errors = state.get('macro_errors') or []
-        if macro_errors:
+        registered = bool(state.get('registered'))
+        macro_keys = state.get('macro_keys') or []
+        state_error = str(state.get('error') or '').strip()
+        # M4：宏错误为空不代表注册成功（keyboard 不可用/启动键失败时可能整批未注册）
+        if macro_errors or state_error or not registered or normalized not in macro_keys:
             self._macro_hotkey_bindings = old
             self.config['macro_hotkeys'] = old
             self.save_config()
             self._register_hotkeys()
-            self._macro_set_status(
-                "绑定失败：%s" % '; '.join(macro_errors), 'danger')
+            reason = '; '.join(macro_errors) or state_error or '热键注册未生效'
+            self._macro_set_status("绑定失败：%s" % reason, 'danger')
+            self.log_message("宏热键绑定失败：%s → %s（%s）" % (
+                normalized, entry['path'], reason))
             return
         self._macro_set_status("已绑定宏热键：%s = %s" % (
             entry.get('name') or os.path.basename(entry['path']), normalized), 'success')
@@ -6562,10 +6854,19 @@ class AutoClicker:
                 detail += " 键盘监听不可用。"
             if getattr(self._macro_capture, 'mouse_error', ''):
                 detail += " " + self._macro_capture.mouse_error + "。"
+            truncated_gap = getattr(recorder, 'truncated_gap_ms', 0)
+            if truncated_gap:
+                detail += " 最长空闲 %s 已按 60 秒上限记录。" % (
+                    _macro.format_duration(int(truncated_gap)))
             self._macro_set_detail(detail)
             self._macro_record_tick_id = self.root.after(500, self._macro_record_tick)
-        except Exception:
-            pass
+        except Exception as exc:
+            try:
+                self.log_message("宏录制状态刷新失败: %s: %s" % (type(exc).__name__, exc))
+            except Exception:
+                pass
+            # 继续排下一拍，避免一次 UI 异常导致录制状态永久停更
+            self._macro_record_tick_id = self.root.after(500, self._macro_record_tick)
 
     def toggle_macro_recording_pause(self):
         recorder = self._macro_recorder
@@ -6666,6 +6967,10 @@ class AutoClicker:
                 ok = recorder.add_click(
                     event.get('x', 0), event.get('y', 0),
                     event.get('button', 'left'), event.get('hold_ms', 0))
+            elif event.get('type') == 'click_hold':
+                ok = recorder.update_last_click_hold(
+                    event.get('x', 0), event.get('y', 0),
+                    event.get('button', 'left'), event.get('hold_ms', 0))
             elif event.get('type') == 'key':
                 ok = recorder.add_key(
                     event.get('key', ''), event.get('action', 'press'))
@@ -6709,6 +7014,7 @@ class AutoClicker:
                                 hicon, "AutoClicker - 录制中")
                             win32gui.Shell_NotifyIcon(win32gui.NIM_MODIFY, new_nid)
                             self.tray_nid = new_nid
+                            self._swap_tray_hicon(hicon)
                 else:
                     self._refresh_tray_icon()
                     self._update_tray_status(bool(getattr(self, 'is_running', False)))
@@ -6721,8 +7027,12 @@ class AutoClicker:
                     self.tray_icon.title = "AutoClicker - 录制中"
                 else:
                     self.tray_icon.title = "AutoClicker - 已停止"
-        except Exception:
-            pass
+        except Exception as exc:
+            try:
+                self.log_message("切换托盘录制图标失败: %s: %s" % (
+                    type(exc).__name__, exc))
+            except Exception:
+                pass
 
     def start_macro_playback(self):
         if self._macro_ui_busy():
@@ -6878,17 +7188,20 @@ class AutoClicker:
             kb = _get_keyboard()
             if kb is None:
                 raise _macro.MacroError("键盘模块不可用，无法回放按键")
+            token = getattr(
+                getattr(self, '_macro_play_local', None), 'token',
+                self._macro_play_token)
             key = str(step.get('key', ''))
             action = step.get('action', 'press')
             try:
                 if action == 'down':
                     kb.press(key)
                     with self._macro_key_lock:
-                        self._macro_pressed_keys.add(key)
+                        self._macro_pressed_keys.setdefault(token, set()).add(key)
                 elif action == 'up':
                     kb.release(key)
                     with self._macro_key_lock:
-                        self._macro_pressed_keys.discard(key)
+                        self._macro_pressed_keys.get(token, set()).discard(key)
                 else:
                     kb.press_and_release(key)
             except Exception as exc:
@@ -6903,10 +7216,16 @@ class AutoClicker:
         except Exception:
             return True
 
-    def _release_macro_keys(self):
+    def _release_macro_keys(self, token=None):
+        """M7：token 指定时只释放该次回放的键；token=None 释放全部（退出兜底）。"""
         with self._macro_key_lock:
-            keys = list(self._macro_pressed_keys)
-            self._macro_pressed_keys.clear()
+            if token is None:
+                keys = []
+                for owned in self._macro_pressed_keys.values():
+                    keys.extend(owned)
+                self._macro_pressed_keys.clear()
+            else:
+                keys = list(self._macro_pressed_keys.pop(token, set()))
         if not keys:
             return
         kb = _get_keyboard()
@@ -6919,6 +7238,7 @@ class AutoClicker:
                 pass
 
     def _macro_playback_worker(self, player, token):
+        self._macro_play_local.token = token
         status = 'stopped'
         error = ''
         try:
@@ -6928,11 +7248,15 @@ class AutoClicker:
         except Exception as exc:
             error = "回放异常：%s" % exc
         finally:
-            self._release_macro_keys()
+            self._release_macro_keys(token)
         self._ui(self._macro_playback_done, token, status, error)
 
     def _macro_playback_done(self, token, status, error):
         if token != self._macro_play_token:
+            # 旧 worker 已退出，清掉可能残留的线程引用，供下一次回放使用。
+            thread = getattr(self, '_macro_play_thread', None)
+            if thread is not None and not thread.is_alive():
+                self._macro_play_thread = None
             return
         self._macro_playing = False
         self._macro_player = None
@@ -6965,6 +7289,7 @@ class AutoClicker:
     def stop_macro_playback(self, reason=''):
         countdown = self._macro_play_countdown_active
         playing = self._macro_playing
+        old_token = self._macro_play_token
         self._macro_play_countdown_active = False
         self._macro_play_token += 1
         if self._macro_play_after_id is not None:
@@ -6989,8 +7314,10 @@ class AutoClicker:
                 thread.join(timeout=1.5)
             except Exception:
                 pass
-        self._macro_play_thread = None
-        self._release_macro_keys()
+        if thread is None or not thread.is_alive():
+            self._macro_play_thread = None
+        # 只释放本次回放拥有的键，旧 worker 收尾时再用自己的 token 兜底。
+        self._release_macro_keys(old_token)
         self._do_set_status("已停止", self._color('muted'))
         if countdown:
             self._macro_set_status("回放倒计时已取消", 'muted')
@@ -7071,8 +7398,12 @@ class AutoClicker:
         try:
             # 创建原生托盘菜单（使用tkinter Menu）
             self._tray_dynamic_count = 0
-            self.tray_menu = tk.Menu(self.root, tearoff=0,
-                                     bg=self._color('surface'), fg=self._color('fg'))
+            self.tray_menu = tk.Menu(
+                self.root, tearoff=0,
+                bg=self._color('surface'), fg=self._color('fg'),
+                activebackground=self._color('primary'),
+                activeforeground=self._color('on_primary'),
+                selectcolor=self._color('surface_alt'), borderwidth=0)
             self.tray_menu.add_command(label="显示窗口", command=self.show_from_tray)
             self.tray_menu.add_separator()
             self.tray_menu.add_command(label="退出程序", command=self.exit_from_tray)
@@ -7210,10 +7541,15 @@ class AutoClicker:
                 win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, nid)
                 self.tray_nid = nid
                 self.tray_icon_created = True
+                self._tray_hicon = hicon
                 print("系统托盘图标创建成功")
             except Exception as e:
                 print(f"系统托盘图标创建失败: {e}")
                 self.tray_icon_created = False
+                try:
+                    win32gui.DestroyIcon(hicon)
+                except Exception:
+                    pass
                 
         except Exception as e:
             print(f"创建Windows托盘图标失败: {e}")
@@ -7242,6 +7578,30 @@ class AutoClicker:
             pass
         return None
 
+    def _restyle_tray_menu(self):
+        """L9：主题切换后同步托盘菜单前景/选中色。"""
+        menu = getattr(self, 'tray_menu', None)
+        if menu is None:
+            return
+        try:
+            menu.configure(
+                bg=self._color('surface'), fg=self._color('fg'),
+                activebackground=self._color('primary'),
+                activeforeground=self._color('on_primary'),
+                selectcolor=self._color('surface_alt'))
+        except Exception:
+            pass
+
+    def _swap_tray_hicon(self, hicon):
+        """L9：托盘图标替换成功后销毁旧 HICON，避免主题切换反复泄漏 GDI 句柄。"""
+        old = getattr(self, '_tray_hicon', None)
+        self._tray_hicon = hicon
+        if old and old != hicon:
+            try:
+                win32gui.DestroyIcon(old)
+            except Exception:
+                pass
+
     def _refresh_tray_icon(self):
         """主题切换后刷新托盘图标，避免深色任务栏仍显示浅色图标（T05257）。"""
         if not (IS_WINDOWS and HAS_WIN32GUI and getattr(self, 'tray_icon_created', False)):
@@ -7258,8 +7618,12 @@ class AutoClicker:
             new_nid = self.tray_nid[:4] + (hicon, self.tray_nid[5])
             win32gui.Shell_NotifyIcon(win32gui.NIM_MODIFY, new_nid)
             self.tray_nid = new_nid
+            self._swap_tray_hicon(hicon)
         except Exception as e:
-            print(f"刷新托盘图标失败: {e}")
+            try:
+                self.log_message("刷新托盘图标失败: %s: %s" % (type(e).__name__, e))
+            except Exception:
+                pass
     
     def _tray_window_proc(self, hwnd, msg, wparam, lparam):
         """托盘消息窗口处理函数"""
@@ -7282,11 +7646,22 @@ class AutoClicker:
                 if hasattr(self, 'tray_nid'):
                     win32gui.Shell_NotifyIcon(win32gui.NIM_DELETE, self.tray_nid)
                     self.tray_icon_created = False
+            old_hicon = getattr(self, '_tray_hicon', None)
+            self._tray_hicon = None
+            if old_hicon:
+                try:
+                    win32gui.DestroyIcon(old_hicon)
+                except Exception:
+                    pass
             
             # 隐藏托盘菜单（如果正在显示）
             self.hide_tray_menu()
-        except Exception:
-            pass
+        except Exception as exc:
+            try:
+                self.log_message("移除托盘图标失败: %s: %s" % (
+                    type(exc).__name__, exc))
+            except Exception:
+                pass
     
     def minimize_to_tray(self):
         """最小化到系统托盘"""
@@ -7369,6 +7744,11 @@ class AutoClicker:
     
     def _shutdown_runtime(self):
         """停止托盘、点击线程、保活与全局热键；任何一步失败都不得阻断退出。"""
+        # H3/H4：退出同样让点击线程令牌失效并取消按住等待
+        self._run_id = getattr(self, '_run_id', 0) + 1
+        cancel_event = getattr(self, '_click_cancel_event', None)
+        if cancel_event is not None:
+            cancel_event.set()
         self.is_running = False
         # FR-13：退出时先收尾录制/回放，避免全局 hook 或按下的按键遗留。
         try:
@@ -7376,6 +7756,11 @@ class AutoClicker:
                 self.stop_macro_recording(save=True, reason='程序退出')
             if self._macro_play_countdown_active or self._macro_playing:
                 self.stop_macro_playback(reason='程序退出')
+        except Exception:
+            pass
+        try:
+            # 退出兜底：无论 worker 是否仍在，都释放所有回放按键。
+            self._release_macro_keys()
         except Exception:
             pass
         try:
@@ -7393,6 +7778,7 @@ class AutoClicker:
                 self.click_thread.join(timeout=1.5)
             except Exception:
                 pass
+        release_mouse_buttons()
         try:
             self._remove_tray_icon()
         except Exception:

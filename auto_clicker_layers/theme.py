@@ -166,6 +166,10 @@ def validate_theme_pack(data, existing_ids=None):
         errors.append('id 必须为 3-32 位小写字母/数字/下划线/短横线，且以字母开头')
     elif theme_id in existing_ids:
         errors.append('id 与内置主题冲突: ' + theme_id)
+    raw_name = data.get('name')
+    if raw_name is not None:
+        if not isinstance(raw_name, str) or not (1 <= len(raw_name.strip()) <= 80):
+            errors.append('name 必须是 1-80 字符字符串')
     mode = data.get('mode', 'light')
     if mode not in ('light', 'dark', 'high_contrast'):
         errors.append('mode 必须为 light/dark/high_contrast')
@@ -184,6 +188,23 @@ def validate_theme_pack(data, existing_ids=None):
     if not isinstance(typography, dict):
         errors.append('typography 必须是对象')
         typography = {}
+    else:
+        allowed_typography = {'font_family', 'mono_family', 'scale'}
+        unknown_typography = set(typography) - allowed_typography
+        if unknown_typography:
+            errors.append('未知排版字段: ' + ', '.join(sorted(unknown_typography)))
+        for key in ('font_family', 'mono_family'):
+            if key in typography:
+                value = typography[key]
+                if not isinstance(value, str) or not (1 <= len(value.strip()) <= 80):
+                    errors.append('%s 必须是 1-80 字符字符串' % key)
+        if 'scale' in typography:
+            try:
+                scale = float(typography['scale'])
+            except (TypeError, ValueError):
+                scale = None
+            if scale is None or not (0.8 <= scale <= 2.0):
+                errors.append('typography.scale 必须在 0.8-2.0')
     meta = data.get('meta') or {}
     if not isinstance(meta, dict):
         errors.append('meta 必须是对象')
@@ -213,6 +234,7 @@ def load_theme_pack(path):
 def load_user_themes(directory):
     """扫描用户主题目录；返回 (themes, errors)。"""
     themes, errors = {}, []
+    used_names = {str(pal.get('name') or key) for key, pal in THEMES.items()}
     try:
         if not os.path.isdir(directory):
             return themes, errors
@@ -222,6 +244,11 @@ def load_user_themes(directory):
             path = os.path.join(directory, name)
             pal, errs = load_theme_pack(path)
             if pal:
+                display = str(pal.get('name') or pal['id'])
+                if display in used_names:
+                    errors.append((name, '主题显示名与已有主题冲突：%s' % display))
+                    continue
+                used_names.add(display)
                 themes[pal['id']] = pal
             else:
                 errors.append((name, '; '.join(errs)))

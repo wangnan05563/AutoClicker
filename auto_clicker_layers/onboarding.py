@@ -86,16 +86,16 @@ TEMPLATES = (
 SAFE_ID = 'safe'
 SAFE_TEMPLATE = {
     'id': SAFE_ID,
-    'name': '推荐安全',
+    'name': '安全试运行（只移动）',
     'icon': 'shield',
-    'description': '10 秒一次、3 秒倒计时、鼠标位移急停、防锁屏，适合第一次试用。',
+    'description': '每 10 秒轻微移动鼠标，不点击；3 秒倒计时 + 位移急停 + 防锁屏，适合第一次试用。',
     'patch': {
         'interval_seconds': 10,
         'interval_unit': 's',
         'click_mode': 'center',
         'prevent_sleep': True,
         'mouse_follow_enabled': True,
-        'mouse_move_only': False,
+        'mouse_move_only': True,
         'click_limit': 0,
         'duration_limit': 0,
         'failsafe_enabled': True,
@@ -107,6 +107,12 @@ _TEMPLATE_MAP = {t['id']: t for t in TEMPLATES}
 _TEMPLATE_MAP[SAFE_ID] = SAFE_TEMPLATE
 
 _HOTKEY_WHITELIST = ('f6', 'f7', 'f8', 'f9', 'f10', 'f11', 'f12', 'esc')
+# H6：这些模板会产生真实点击，向导里必须由用户显式选择目标区域。
+REAL_CLICK_TEMPLATE_IDS = ('checkin', 'button_repeat')
+
+
+def template_requires_explicit_target(template_id):
+    return template_id in REAL_CLICK_TEMPLATE_IDS
 
 
 def template_ids():
@@ -152,6 +158,8 @@ def normalize_hotkeys(start, emergency):
     emergency = str(emergency or 'f8').strip().lower()
     if start not in _HOTKEY_WHITELIST:
         raise ValueError('启动热键不在允许列表: %s' % start)
+    if start == 'esc':
+        raise ValueError('Esc 固定为急停，不能作为启动热键')
     if emergency not in _HOTKEY_WHITELIST:
         raise ValueError('急停热键不在允许列表: %s' % emergency)
     if start == emergency:
@@ -166,29 +174,33 @@ def apply_template(config, template_id, click_area=None, hotkey_start='f6',
     if template is None:
         raise ValueError('未知首启模板: %s' % template_id)
     result = copy.deepcopy(config) if isinstance(config, dict) else {}
-    result.update(copy.deepcopy(template['patch']))
+    is_custom = template_id == 'custom'
+    # M8：自定义模板的描述是“保留当前参数”，不得套用 patch 重置。
+    if not is_custom:
+        result.update(copy.deepcopy(template['patch']))
     result['ui_mode'] = 'simple'
-    result['click_button'] = 'left'
-    result['hold_ms'] = 10
-    result['jitter_pct'] = 0
-    result['use_multi_points'] = False
-    result['multi_points'] = []
-    result['target_window_keyword'] = ''
-    result['close_to_tray'] = True
-    result['autostart'] = False
-    result['startup_countdown'] = int(template['patch'].get('startup_countdown', 3))
+    if not is_custom:
+        result['click_button'] = 'left'
+        result['hold_ms'] = 10
+        result['jitter_pct'] = 0
+        result['use_multi_points'] = False
+        result['multi_points'] = []
+        result['target_window_keyword'] = ''
+        result['startup_countdown'] = int(
+            template['patch'].get('startup_countdown', 3))
     start, emergency = normalize_hotkeys(hotkey_start, hotkey_emergency)
     result['hotkey_start'] = start
     result['hotkey_emergency'] = emergency
-    if template_id == 'custom' and click_area is None:
+    if is_custom and click_area is None:
         area = _normalize_area(result.get('click_area'))
     else:
         area = _normalize_area(click_area) or area_center(result)
     if area:
         result['click_area'] = area
-    schedule = dict(result.get('schedule') or {})
-    schedule['enabled'] = False
-    result['schedule'] = schedule
+    if not is_custom:
+        schedule = dict(result.get('schedule') or {})
+        schedule['enabled'] = False
+        result['schedule'] = schedule
     if mark_done:
         result['onboarding_done'] = True
         result['onboarding_template'] = template_id

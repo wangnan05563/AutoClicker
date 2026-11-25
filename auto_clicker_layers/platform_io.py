@@ -4,9 +4,11 @@
 不依赖 tkinter；UI 层只消费这里导出的函数和常量。
 """
 import atexit
+import ctypes
 import os
 import signal
 import sys
+import threading
 import time
 
 PLATFORM = sys.platform
@@ -58,6 +60,25 @@ MOUSEEVENTF_RIGHTDOWN = 0x0008
 MOUSEEVENTF_RIGHTUP = 0x0010
 MOUSEEVENTF_MIDDLEDOWN = 0x0020
 MOUSEEVENTF_MIDDLEUP = 0x0040
+
+# H4：只记录本进程实际按下、尚未确认释放的鼠标键。
+_MOUSE_FLAGS = {
+    'left': (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+    'right': (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+    'middle': (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+}
+_MOUSE_DOWN_LOCK = threading.Lock()
+_MOUSE_DOWN_BUTTONS = set()
+
+
+def _mark_mouse_down(button):
+    with _MOUSE_DOWN_LOCK:
+        _MOUSE_DOWN_BUTTONS.add(button)
+
+
+def _mark_mouse_up(button):
+    with _MOUSE_DOWN_LOCK:
+        _MOUSE_DOWN_BUTTONS.discard(button)
 
 
 def get_foreground_window_info():
@@ -143,8 +164,11 @@ def install_setting_restore_guards():
         return
     _SETTING_GUARDS_INSTALLED = True
     atexit.register(restore_system_settings)
+    # H4：正常/异常退出都释放可能仍按下的鼠标键
+    atexit.register(release_mouse_buttons)
 
     def _signal_handler(signum, _frame):
+        release_mouse_buttons()
         restore_system_settings()
         raise SystemExit(0)
 
@@ -265,36 +289,80 @@ def windows_move_mouse(x, y):
         return False
 
 
-def _windows_click_button(x, y, button, hold_ms):
-    flags = {
-        'left': (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
-        'right': (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
-        'middle': (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
-    }.get(button, (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP))
+def _windows_click_button(x, y, button, hold_ms, cancel_event=None):
+    normalized = button if button in _MOUSE_FLAGS else 'left'
+    flags = _MOUSE_FLAGS[normalized]
+    if cancel_event is not None and cancel_event.is_set():
+        return False
+    down_sent = False
     try:
         ctypes.windll.user32.SetCursorPos(int(x), int(y))
         time.sleep(0.005)
         ctypes.windll.user32.mouse_event(flags[0], 0, 0, 0, 0)
+        down_sent = True
+        _mark_mouse_down(normalized)
         if hold_ms > 0:
-            time.sleep(hold_ms / 1000.0)
+            # H4：按住期间分片等待，停止/退出时 cancel_event 可立即打断。
+            deadline = time.monotonic() + hold_ms / 1000.0
+            while time.monotonic() < deadline:
+                if cancel_event is not None and cancel_event.is_set():
+                    return False
+                time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
         time.sleep(0.005)
-        ctypes.windll.user32.mouse_event(flags[1], 0, 0, 0, 0)
         return True
     except Exception as e:
         print(f"点击失败：{e}")
         return False
+    finally:
+        # H4：无论正常返回、取消还是异常，只要按下过就必须发送 UP。
+        if down_sent:
+            try:
+                ctypes.windll.user32.mouse_event(flags[1], 0, 0, 0, 0)
+                _mark_mouse_up(normalized)
+            except Exception:
+                pass
 
 
-def windows_click(x, y, button='left', hold_ms=0, double_gap_ms=30):
+def release_mouse_buttons(force_all=False):
+    """H4：最后一道保险，释放本进程按下的鼠标键，避免异常退出后按键卡住。
+
+    默认只释放本进程实际按下且尚未确认释放的键；`force_all=True` 时无条件
+    补发左/右/中三键 UP，用于显式兜底，不会在正常停止时误释放用户物理按住的鼠标。
+    """
+    # 仅用 ctypes 发送 mouse_event，不依赖 pywin32；缺少 pywin32 时也必须能兜底。
+    if not IS_WINDOWS:
+        return
+    if force_all:
+        buttons = ('left', 'right', 'middle')
+    else:
+        with _MOUSE_DOWN_LOCK:
+            buttons = tuple(_MOUSE_DOWN_BUTTONS)
+    for button in buttons:
+        try:
+            ctypes.windll.user32.mouse_event(
+                _MOUSE_FLAGS[button][1], 0, 0, 0, 0)
+            _mark_mouse_up(button)
+        except Exception:
+            pass
+
+
+def windows_click(x, y, button='left', hold_ms=0, double_gap_ms=30, cancel_event=None):
     if not HAS_WIN32API:
         return False
     try:
         if button == 'double':
-            _windows_click_button(x, y, 'left', hold_ms)
-            time.sleep(max(0.001, double_gap_ms / 1000.0))
-            _windows_click_button(x, y, 'left', hold_ms)
-            return True
-        return _windows_click_button(x, y, button, hold_ms)
+            ok1 = _windows_click_button(x, y, 'left', hold_ms, cancel_event)
+            if not ok1:
+                return False
+            gap_seconds = max(0.001, double_gap_ms / 1000.0)
+            if cancel_event is not None:
+                if cancel_event.wait(gap_seconds):
+                    return False
+            else:
+                time.sleep(gap_seconds)
+            ok2 = _windows_click_button(x, y, 'left', hold_ms, cancel_event)
+            return ok1 and ok2
+        return _windows_click_button(x, y, button, hold_ms, cancel_event)
     except Exception as e:
         print(f"点击失败：{e}")
         return False
@@ -426,9 +494,9 @@ def move_mouse(x, y):
     return True
 
 
-def click_mouse(x, y, button='left', hold_ms=0, double_gap_ms=30):
+def click_mouse(x, y, button='left', hold_ms=0, double_gap_ms=30, cancel_event=None):
     if IS_WINDOWS:
-        return windows_click(x, y, button, hold_ms, double_gap_ms)
+        return windows_click(x, y, button, hold_ms, double_gap_ms, cancel_event)
     elif IS_LINUX:
         return linux_click(x, y, button, hold_ms, double_gap_ms)
     return _pyautogui_click(x, y, button, double_gap_ms if button == 'double' else None)

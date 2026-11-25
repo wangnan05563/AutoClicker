@@ -39,7 +39,8 @@ def normalize_run(run):
         return None
     clicks = _int(run.get('click_count'))
     success = min(_int(run.get('success_count')), clicks)
-    fail = min(_int(run.get('fail_count')), clicks)
+    # L4：成功 + 失败不得超过总点击数
+    fail = min(_int(run.get('fail_count')), clicks - success)
     return {
         'timestamp': str(run.get('timestamp') or '')[:32],
         'click_count': clicks,
@@ -152,6 +153,14 @@ def trend_points(history):
     return points
 
 
+def _csv_safe(value):
+    """L4：防止 Excel 公式注入；CSV 内字符串以公式字符开头时加单引号。"""
+    text = str(value)
+    if text.startswith(('=', '+', '-', '@')):
+        return "'" + text
+    return text
+
+
 def write_csv(path, history):
     """导出最近记录为 UTF-8 BOM CSV，Excel 直接打开不乱码。"""
     runs = normalize(history)['runs']
@@ -166,9 +175,10 @@ def write_csv(path, history):
             clicks = run['click_count']
             rate = (min(1.0, run['success_count'] / clicks) * 100.0) if clicks else 0.0
             writer.writerow([
-                run['timestamp'], clicks, run['success_count'], run['fail_count'],
+                _csv_safe(run['timestamp']), clicks, run['success_count'], run['fail_count'],
                 run['exception_count'], run['runtime_seconds'], '%.1f' % rate,
-                run['interval_seconds'], run['mode'], run['button'], run['stop_reason'],
+                run['interval_seconds'], _csv_safe(run['mode']), _csv_safe(run['button']),
+                _csv_safe(run['stop_reason']),
             ])
         if not runs:
             writer.writerow(['', 0, 0, 0, 0, 0.0, '', '', '', '', ''])

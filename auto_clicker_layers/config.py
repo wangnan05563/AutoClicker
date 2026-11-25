@@ -4,6 +4,7 @@ import datetime
 import json
 import os
 import shutil
+import tempfile
 
 DEFAULT_CONFIG = {
     'interval_seconds': 10,
@@ -97,6 +98,16 @@ def normalize_config(config):
     sched.setdefault('stop_after_min', 0)
     sched.setdefault('weekdays', [1, 2, 3, 4, 5])
     config['schedule'] = sched
+    # M11：损坏的宏/多点结构不得在热键注册或列表构建时抛出异常
+    if not isinstance(config.get('macro_hotkeys'), dict):
+        config['macro_hotkeys'] = {}
+    if not isinstance(config.get('macro_recent'), list):
+        config['macro_recent'] = []
+    if not isinstance(config.get('multi_points'), list):
+        config['multi_points'] = []
+    # M12：Esc 固定为急停，不能再作为启动热键
+    if str(config.get('hotkey_start') or '').strip().lower() == 'esc':
+        config['hotkey_start'] = 'f6'
     return config
 
 
@@ -122,5 +133,28 @@ def backup_config(path):
 
 
 def write_config(path, config):
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
+    """M1：临时文件 + fsync + os.replace，保证写配置不会留下半个 JSON。"""
+    directory = os.path.dirname(os.path.abspath(path)) or '.'
+    fd = None
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            dir=directory, prefix='.config-', suffix='.tmp')
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            fd = None
+            json.dump(config, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_path is not None:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
