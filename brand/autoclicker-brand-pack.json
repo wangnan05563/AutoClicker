@@ -1,0 +1,125 @@
+{
+  "name": "autoclicker",
+  "label": "桌面自动点击工具",
+  "version": 1,
+  "raw": {
+    "color": {
+      "primary": "#0056b3",
+      "primary-hover": "#004a99",
+      "primary-pressed": "#003d80",
+      "primary-soft": "#e8f1fb",
+      "on-primary": "#ffffff",
+      "bg": "#ffffff",
+      "card": "#f8f9fa",
+      "ink": "#212529",
+      "ink-2": "#495057",
+      "muted": "#5c636a",
+      "line": "#ced4da",
+      "success": "#1e7e34",
+      "danger": "#b02a37",
+      "warning": "#8a4b00"
+    },
+    "font": {
+      "sans": "Microsoft YaHei UI, Microsoft YaHei, Segoe UI, Noto Sans CJK SC, sans-serif",
+      "mono": "Cascadia Mono, Consolas, monospace",
+      "caption": 12,
+      "body": 14,
+      "subtitle": 16,
+      "title": 20,
+      "display": 28
+    },
+    "space": {
+      "2": 8,
+      "3": 12,
+      "4": 16,
+      "6": 24,
+      "8": 32
+    },
+    "radius": {
+      "sm": 4,
+      "md": 8,
+      "lg": 12,
+      "full": 999
+    },
+    "shadow": {
+      "sm": "0 1px 2px rgba(16, 24, 40, 0.08)",
+      "md": "0 4px 12px rgba(16, 24, 40, 0.12)"
+    },
+    "motion": {
+      "fast": "120ms",
+      "base": "200ms",
+      "ease-standard": "cubic-bezier(0.2, 0.8, 0.2, 1)"
+    }
+  },
+  "semantic": {
+    "brand": "{raw.color.primary}",
+    "brand-hover": "{raw.color.primary-hover}",
+    "brand-pressed": "{raw.color.primary-pressed}",
+    "brand-ink": "{raw.color.primary-pressed}",
+    "brand-soft": "{raw.color.primary-soft}",
+    "on-primary": "{raw.color.on-primary}",
+    "bg": "{raw.color.bg}",
+    "card": "{raw.color.card}",
+    "ink": "{raw.color.ink}",
+    "ink-2": "{raw.color.ink-2}",
+    "muted": "{raw.color.muted}",
+    "line": "{raw.color.line}",
+    "success": "{raw.color.success}",
+    "danger": "{raw.color.danger}",
+    "warning": "{raw.color.warning}",
+    "ff": "{raw.font.sans}",
+    "ff-mono": "{raw.font.mono}",
+    "font-caption": "{raw.font.caption}",
+    "font-body": "{raw.font.body}",
+    "font-subtitle": "{raw.font.subtitle}",
+    "font-title": "{raw.font.title}",
+    "font-display": "{raw.font.display}",
+    "radius-sm": "{raw.radius.sm}",
+    "radius-md": "{raw.radius.md}",
+    "radius-lg": "{raw.radius.lg}",
+    "radius-full": "{raw.radius.full}",
+    "shadow-sm": "{raw.shadow.sm}",
+    "shadow-md": "{raw.shadow.md}",
+    "motion-fast": "{raw.motion.fast}",
+    "motion-base": "{raw.motion.base}",
+    "ease-standard": "{raw.motion.ease-standard}",
+    "space-2": "{raw.space.2}",
+    "space-3": "{raw.space.3}",
+    "space-4": "{raw.space.4}",
+    "space-6": "{raw.space.6}",
+    "space-8": "{raw.space.8}"
+  },
+  "component": {
+    "primaryButton": {
+      "bg": "{semantic.brand}",
+      "fg": "{semantic.on-primary}",
+      "bgHover": "{semantic.brand-hover}",
+      "bgPressed": "{semantic.brand-pressed}",
+      "font": "{semantic.ff}",
+      "fontSize": "{semantic.font-body}",
+      "paddingX": "{semantic.space-4}",
+      "paddingY": "{semantic.space-2}",
+      "radius": "{semantic.radius-md}",
+      "motion": "{semantic.motion-fast}"
+    },
+    "brandBadge": {
+      "bg": "{semantic.brand-soft}",
+      "fg": "{semantic.brand-ink}",
+      "font": "{semantic.ff}",
+      "fontSize": "{semantic.font-caption}",
+      "paddingX": "{semantic.space-3}",
+      "paddingY": "{semantic.space-2}",
+      "radius": "{semantic.radius-full}"
+    },
+    "card": {
+      "bg": "{semantic.card}",
+      "fg": "{semantic.ink}",
+      "border": "1px solid {semantic.line}",
+      "font": "{semantic.ff}",
+      "fontSize": "{semantic.font-body}",
+      "padding": "{semantic.space-6}",
+      "radius": "{semantic.radius-lg}",
+      "shadow": "{semantic.shadow-sm}"
+    }
+  }
+}
