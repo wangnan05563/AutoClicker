@@ -1,0 +1,99 @@
+{
+  "generated_at": "2026-11-26",
+  "environment": "Windows 10/11, Python venv, GUI source run with isolated USERPROFILE/HOME",
+  "samples": [
+    {
+      "ac01_pass": true,
+      "first_run_flag": true,
+      "config_exists_before": false,
+      "app_init_s": 3.477,
+      "tmp_home": "C:\\PYFIX_~4\\autoclicker_ac01_832ho088",
+      "wizard_appeared_s": 9.662,
+      "wizard_step": 1,
+      "wizard_template": "keep_online",
+      "wizard_done_s": 10.435,
+      "onboarding_done": true,
+      "onboarding_template": "keep_online",
+      "after_wizard_page": "run",
+      "start_clicked_s": 11.808,
+      "start_confirm": {
+        "seen": true,
+        "accepted": true
+      },
+      "start_confirm_required": true,
+      "running_s": 12.865,
+      "status": "● 2 秒后启动",
+      "is_running": true,
+      "log_has_start": true,
+      "log_has_move_only": true,
+      "wizard_to_running_s": 3.203,
+      "ac01_limit_s": 60,
+      "config_exists_after": true,
+      "config_cleanup": true
+    },
+    {
+      "ac01_pass": true,
+      "first_run_flag": true,
+      "config_exists_before": false,
+      "app_init_s": 2.778,
+      "tmp_home": "C:\\PYFIX_~4\\autoclicker_ac01_jvmerg3e",
+      "wizard_appeared_s": 7.293,
+      "wizard_step": 1,
+      "wizard_template": "keep_online",
+      "wizard_done_s": 7.578,
+      "onboarding_done": true,
+      "onboarding_template": "keep_online",
+      "after_wizard_page": "run",
+      "start_clicked_s": 7.743,
+      "start_confirm": {
+        "seen": true,
+        "accepted": true
+      },
+      "start_confirm_required": true,
+      "running_s": 7.844,
+      "status": "● 3 秒后启动",
+      "is_running": true,
+      "log_has_start": true,
+      "log_has_move_only": true,
+      "wizard_to_running_s": 0.551,
+      "ac01_limit_s": 60,
+      "config_exists_after": true,
+      "config_cleanup": true
+    },
+    {
+      "ac01_pass": true,
+      "first_run_flag": true,
+      "config_exists_before": false,
+      "app_init_s": 1.554,
+      "tmp_home": "C:\\PYFIX_~4\\autoclicker_ac01_n4mg48bd",
+      "wizard_appeared_s": 6.012,
+      "wizard_step": 1,
+      "wizard_template": "keep_online",
+      "wizard_done_s": 6.341,
+      "onboarding_done": true,
+      "onboarding_template": "keep_online",
+      "after_wizard_page": "run",
+      "start_clicked_s": 6.486,
+      "start_confirm": {
+        "seen": true,
+        "accepted": true
+      },
+      "start_confirm_required": true,
+      "running_s": 6.579,
+      "status": "● 3 秒后启动",
+      "is_running": true,
+      "log_has_start": true,
+      "log_has_move_only": true,
+      "wizard_to_running_s": 0.567,
+      "ac01_limit_s": 60,
+      "config_exists_after": true,
+      "config_cleanup": true
+    }
+  ],
+  "suite": {
+    "command": "python -m unittest discover -s tests -v",
+    "tests": 281,
+    "result": "OK",
+    "duration_s": 61.594
+  }
+}
