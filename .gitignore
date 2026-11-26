@@ -39,6 +39,9 @@ Thumbs.db
 # SonarQube 扫描临时目录
 .scannerwork/
 
+# 任务结果临时副本（Txxxxx_result.md 仅作本地归档，不入库）
+/T*_result.md
+
 # 代理/助手工作目录（含个人数据，绝不入库）
 .workbuddy-ai/
 .workbuddy/
