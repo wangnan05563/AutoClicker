@@ -37,6 +37,10 @@ class AccentTests(unittest.TestCase):
         self.assertEqual(merged['success'], '#1E7E34')
         self.assertEqual(merged['primary'], '#0056B3')
         self.assertFalse(merged['accent_adjusted'])
+        self.assertIn('soft', merged)
+        for key in ('primary', 'primary_hover', 'primary_pressed'):
+            self.assertGreaterEqual(accent.contrast_ratio(merged['on_primary'], merged[key]), 4.5,
+                                    key)
 
 
 if __name__ == '__main__':

@@ -53,6 +53,12 @@ class SchemaTests(unittest.TestCase):
         with self.assertRaises(macro.MacroError):
             macro.validate_macro({'schema': macro.SCHEMA, 'name': 'x', 'steps': []})
 
+    def test_created_at_is_length_limited(self):
+        data = macro.validate_macro({
+            'schema': macro.SCHEMA, 'name': 'x', 'created_at': 'x' * 200,
+            'steps': [{'type': 'move', 'x': 1, 'y': 2}]})
+        self.assertEqual(len(data['created_at']), 64)
+
     def test_invalid_step_fields(self):
         with self.assertRaises(macro.MacroError):
             macro.validate_macro({
@@ -101,6 +107,15 @@ class SchemaTests(unittest.TestCase):
         preview = macro.preview_lines(data, limit=3)
         self.assertIn('move', preview)
         self.assertIn('共 10 步', preview)
+
+    def test_recorder_updates_last_click_hold(self):
+        rec = macro.MacroRecorder('hold', clock=lambda: 0.0)
+        rec.start()
+        self.assertTrue(rec.add_click(10, 20, 'left', 0))
+        self.assertTrue(rec.update_last_click_hold(10, 20, 'left', 350))
+        click_steps = [s for s in rec.steps if s.get('type') == 'click']
+        self.assertEqual(click_steps[-1]['hold_ms'], 350)
+        self.assertFalse(rec.update_last_click_hold(99, 99, 'left', 10))
 
 
 class FileTests(unittest.TestCase):
@@ -182,6 +197,15 @@ class RecorderTests(unittest.TestCase):
         self.assertTrue(rec.add_wait(100, now=0))
         with self.assertRaises(macro.MacroError):
             rec.add_wait(0, now=0)
+
+    def test_long_gap_is_capped_and_flagged(self):
+        rec = macro.MacroRecorder('r')
+        rec.start(now=0)
+        rec.add_key('a', 'press', now=0)
+        rec.add_key('b', 'press', now=65.0)
+        waits = [s for s in rec.steps if s['type'] == 'wait']
+        self.assertEqual(waits, [{'type': 'wait', 'ms': macro.MAX_WAIT_MS}])
+        self.assertEqual(rec.truncated_gap_ms, 65000)
 
 
 class PlayerTests(unittest.TestCase):

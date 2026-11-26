@@ -22,6 +22,17 @@ class HotkeyTests(unittest.TestCase):
             _, _, _, error = hotkey.parse_hotkey(value)
             self.assertTrue(error, value)
 
+    def test_shifted_symbols_add_shift(self):
+        mods, vk, normalized, error = hotkey.parse_hotkey('Ctrl++')
+        self.assertEqual(error, '')
+        self.assertEqual(mods, hotkey.MOD_CTRL | hotkey.MOD_SHIFT)
+        self.assertEqual(vk, 0xBB)
+        self.assertEqual(normalized, 'ctrl+plus')
+        mods, vk, _, error = hotkey.parse_hotkey('Ctrl+colon')
+        self.assertEqual(error, '')
+        self.assertEqual(mods, hotkey.MOD_CTRL | hotkey.MOD_SHIFT)
+        self.assertEqual(vk, 0xBA)
+
     def test_probe_returns_tuple_and_does_not_claim(self):
         occupied, reason = hotkey.probe_windows_hotkey('ctrl+alt+k')
         self.assertIsInstance(occupied, bool)

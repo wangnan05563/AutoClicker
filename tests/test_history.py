@@ -54,6 +54,23 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         self.assertEqual(rows[1][6], '80.0')
 
+    def test_normalize_clamps_success_and_fail_to_total(self):
+        clean = history.normalize_run(
+            run(clicks=10, success=12, fail=8, ts='2026-11-23T12:00:00'))
+        self.assertEqual(clean['success_count'], 10)
+        self.assertEqual(clean['fail_count'], 0)
+
+    def test_csv_escapes_formula_injection(self):
+        hist = history.append_run(
+            history.empty_history(),
+            run(ts='2026-11-23T12:00:00', success=9, fail=1))
+        hist['runs'][0]['stop_reason'] = '=HYPERLINK("http://x")'
+        path = os.path.join(tempfile.mkdtemp(prefix='ac-history-'), 'history.csv')
+        history.write_csv(path, hist)
+        with open(path, 'r', encoding='utf-8-sig', newline='') as handle:
+            rows = list(csv.reader(handle))
+        self.assertTrue(rows[1][-1].startswith("'="), rows[1][-1])
+
     def test_corrupt_file_returns_empty_and_save_roundtrip(self):
         tmp = tempfile.mkdtemp(prefix='ac-history-')
         bad = os.path.join(tmp, 'bad.json')

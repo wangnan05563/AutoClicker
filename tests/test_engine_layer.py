@@ -123,6 +123,9 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine.validate_jitter('101'), (None, '随机抖动必须在 0-100 之间'))
         self.assertEqual(engine.validate_jitter('x'), (None, '随机抖动必须为整数'))
         self.assertEqual(engine.validate_hold_ms('10'), (10, None))
+        self.assertEqual(engine.validate_hold_ms('5000'), (5000, None))
+        self.assertEqual(engine.validate_hold_ms('5001'),
+                         (None, '按住时长不能超过 5000 ms'))
         self.assertEqual(engine.validate_hold_ms('-1'), (None, '按住时长不能为负数'))
         self.assertEqual(engine.validate_hold_ms('x'), (None, '按住时长必须为整数'))
 
@@ -135,6 +138,24 @@ class EngineTests(unittest.TestCase):
             engine.parse_schedule_start('aa:bb')
         with self.assertRaises(ValueError):
             engine.parse_schedule_start('24:00')
+
+    def test_schedule_overlap_and_duplicate_rejected(self):
+        periods = [
+            {'start': (9, 0), 'stop_after_min': 30},
+            {'start': (9, 20), 'stop_after_min': 30},
+        ]
+        with self.assertRaises(ValueError):
+            engine.validate_schedule_no_overlap(periods)
+        with self.assertRaises(ValueError):
+            engine.validate_schedule_no_overlap([
+                {'start': (9, 0), 'stop_after_min': 30},
+                {'start': (9, 0), 'stop_after_min': 10},
+            ])
+        self.assertEqual(
+            len(engine.validate_schedule_no_overlap([
+                {'start': (9, 0), 'stop_after_min': 30},
+                {'start': (10, 0), 'stop_after_min': 30},
+            ])), 2)
 
     def test_weekday_labels(self):
         self.assertEqual(engine.weekdays_to_label([1, 2, 3, 4, 5, 6, 7]), '每天')

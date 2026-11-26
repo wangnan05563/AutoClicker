@@ -37,6 +37,15 @@ class StartSummaryTests(unittest.TestCase):
         config['interval_unit'] = 'ms'
         self.assertEqual(run_report.interval_label(config), '250 毫秒')
 
+    def test_minute_and_hour_interval(self):
+        config = self.base_config()
+        config['interval_seconds'] = 10
+        config['interval_unit'] = 'min'
+        self.assertEqual(run_report.interval_label(config), '10 分钟')
+        config['interval_seconds'] = 2
+        config['interval_unit'] = 'h'
+        self.assertEqual(run_report.interval_label(config), '2 小时')
+
     def test_target_region_and_window(self):
         config = self.base_config()
         config['click_mode'] = 'random'
@@ -44,14 +53,21 @@ class StartSummaryTests(unittest.TestCase):
         config['target_window_keyword'] = 'Excel'
         self.assertEqual(
             run_report.target_label(config),
-            '随机位置 30x40 @ (10, 20)；前台窗口含“Excel”')
+            '随机位置 30x40 @ (10, 20)，将真实点击；前台窗口含“Excel”')
+
+    def test_target_move_only_is_explicit(self):
+        config = self.base_config()
+        config['mouse_move_only'] = True
+        self.assertEqual(
+            run_report.target_label(config),
+            '点 (100, 200)，只移动不点击（不会产生真实点击）')
 
     def test_target_multi_points(self):
         config = self.base_config()
         config['use_multi_points'] = True
         config['multi_points'] = [{'x': 1, 'y': 2}, {'x': 3, 'y': 4}]
         self.assertEqual(
-            run_report.target_label(config), '多点位 2 个（首个 (1, 2)）')
+            run_report.target_label(config), '多点位 2 个（首个 (1, 2)），将真实点击')
 
     def test_stop_conditions_combine(self):
         config = self.base_config()
@@ -76,7 +92,7 @@ class StartSummaryTests(unittest.TestCase):
         lines = run_report.build_start_lines(self.base_config())
         self.assertEqual(len(lines), 4)
         self.assertEqual(lines[0], '间隔：10 秒（左键，按住 10ms，抖动 0%）')
-        self.assertEqual(lines[1], '目标：点 (100, 200)')
+        self.assertEqual(lines[1], '目标：点 (100, 200)，将真实点击')
         self.assertEqual(
             lines[2], '停止条件：点击 1 次后停止；鼠标位移 >20px 急停；防锁屏：开')
         self.assertEqual(lines[3], '热键：F6 启动/停止；F8 / Esc 急停；启动倒计时 3 秒')

@@ -25,6 +25,12 @@ class TemplateCatalogTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             onboarding.normalize_hotkeys('ctrl+a', 'f8')
 
+    def test_real_click_templates_require_explicit_target(self):
+        for template_id in ('checkin', 'button_repeat'):
+            self.assertTrue(onboarding.template_requires_explicit_target(template_id))
+        for template_id in ('keep_online', 'custom', 'safe'):
+            self.assertFalse(onboarding.template_requires_explicit_target(template_id))
+
 
 class ApplyTemplateTests(unittest.TestCase):
     def test_keep_online_only_moves_and_prevents_sleep(self):
@@ -65,10 +71,29 @@ class ApplyTemplateTests(unittest.TestCase):
 
     def test_custom_keeps_existing_target(self):
         area = {'x': 5, 'y': 6, 'width': 20, 'height': 30}
-        out = onboarding.apply_template({'click_area': area}, 'custom')
+        cfg = {
+            'click_area': area, 'click_mode': 'center', 'interval_seconds': 7,
+            'hold_ms': 250, 'autostart': True, 'close_to_tray': False,
+            'use_multi_points': True,
+            'multi_points': [{'x': 1, 'y': 2}],
+            'schedule': {'enabled': True, 'start_at': '10:00'},
+        }
+        out = onboarding.apply_template(cfg, 'custom')
         self.assertEqual(out['click_area'], area)
-        self.assertEqual(out['click_mode'], 'random')
+        self.assertEqual(out['click_mode'], 'center')
+        self.assertEqual(out['interval_seconds'], 7)
+        self.assertEqual(out['hold_ms'], 250)
+        self.assertTrue(out['autostart'])
+        self.assertFalse(out['close_to_tray'])
+        self.assertTrue(out['use_multi_points'])
+        self.assertEqual(out['multi_points'], [{'x': 1, 'y': 2}])
+        self.assertTrue(out['schedule']['enabled'])
         self.assertEqual(out['onboarding_template'], 'custom')
+        self.assertEqual(out['ui_mode'], 'simple')
+
+    def test_start_hotkey_cannot_be_esc(self):
+        with self.assertRaises(ValueError):
+            onboarding.normalize_hotkeys('esc', 'f8')
 
     def test_safe_config_marks_done_and_centers_point(self):
         out = onboarding.safe_config(
@@ -76,8 +101,12 @@ class ApplyTemplateTests(unittest.TestCase):
         self.assertTrue(out['onboarding_done'])
         self.assertEqual(out['onboarding_template'], 'safe')
         self.assertEqual(out['startup_countdown'], 3)
+        self.assertTrue(out['mouse_move_only'])
         self.assertEqual(out['click_area'],
                          {'x': 50, 'y': 40, 'width': 1, 'height': 1})
+        self.assertTrue(onboarding.SAFE_TEMPLATE['patch']['mouse_move_only'])
+        summary = '\n'.join(onboarding.summary_lines('safe', out))
+        self.assertIn('只移动不点击', summary)
 
     def test_unknown_template_raises(self):
         with self.assertRaises(ValueError):

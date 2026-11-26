@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -45,6 +46,13 @@ class ConfigLayerTests(unittest.TestCase):
         self.assertEqual(out['schedule']['weekdays'], [1, 2, 3, 4, 5])
         self.assertEqual(cfg.normalize_config({'schedule': 'bad'})['schedule']['start_at'], '09:00')
 
+    def test_normalize_repairs_bad_collection_types(self):
+        out = cfg.normalize_config({
+            'macro_hotkeys': ['bad'], 'macro_recent': 'bad', 'multi_points': 'bad'})
+        self.assertEqual(out['macro_hotkeys'], {})
+        self.assertEqual(out['macro_recent'], [])
+        self.assertEqual(out['multi_points'], [])
+
     def test_config_version(self):
         self.assertEqual(cfg.config_version({'config_version': 2}), 2)
         self.assertEqual(cfg.config_version({'config_version': '3'}), 3)
@@ -79,6 +87,16 @@ class ConfigLayerTests(unittest.TestCase):
                 f.write('{bad json')
             with self.assertRaises(ValueError):
                 cfg.read_config(path)
+
+    def test_write_failure_keeps_old_file_and_no_temp(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, 'config.json')
+            cfg.write_config(path, {'a': 1})
+            with mock.patch.object(cfg.json, 'dump', side_effect=RuntimeError('disk full')):
+                with self.assertRaises(RuntimeError):
+                    cfg.write_config(path, {'a': 2})
+            self.assertEqual(cfg.read_config(path), {'a': 1})
+            self.assertFalse([n for n in os.listdir(d) if n.startswith('.config-')])
 
     def test_backup_config(self):
         with tempfile.TemporaryDirectory() as d:
@@ -177,6 +195,28 @@ class ThemePackTests(unittest.TestCase):
             self.assertIsNone(pal)
             self.assertTrue(errors, data)
 
+    def test_validate_theme_pack_rejects_bad_typography(self):
+        colors = {k: theme.THEMES['light'][k] for k in theme.REQUIRED_COLOR_KEYS}
+        base = {'schema': theme.THEME_SCHEMA, 'id': 'type_theme', 'mode': 'light',
+                'colors': colors}
+        for typo in ({'font_family': ''}, {'font_family': 3}, {'scale': 0.1},
+                     {'scale': 'big'}, {'unknown': 1}):
+            pal, errors = theme.validate_theme_pack(dict(base, typography=typo))
+            self.assertIsNone(pal)
+            self.assertTrue(errors, typo)
+
+    def test_load_user_themes_rejects_duplicate_display_name(self):
+        colors = {k: theme.THEMES['light'][k] for k in theme.REQUIRED_COLOR_KEYS}
+        builtin_name = theme.THEMES['light']['name']
+        dup = {'schema': theme.THEME_SCHEMA, 'id': 'dup_name',
+               'name': builtin_name, 'mode': 'light', 'colors': colors}
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, 'dup.json'), 'w', encoding='utf-8') as f:
+                json.dump(dup, f)
+            themes, errors = theme.load_user_themes(d)
+            self.assertNotIn('dup_name', themes)
+            self.assertTrue(any('显示名' in msg for _, msg in errors))
+
     def test_load_user_themes_skips_invalid_json(self):
         colors = {k: theme.THEMES['sand'][k] for k in theme.REQUIRED_COLOR_KEYS}
         valid = {'schema': theme.THEME_SCHEMA, 'id': 'user_sand', 'name': '用户暖沙',
@@ -245,6 +285,12 @@ class ThemePackTests(unittest.TestCase):
         finally:
             plat._ydotool_run = original_run
             plat._ydotool_move = original_move
+
+    def test_foreground_window_info_returns_three_values(self):
+        info = plat.get_foreground_window_info()
+        self.assertEqual(len(info), 3)
+        for item in info:
+            self.assertIsInstance(item, str)
 
     def test_get_cursor_pos_returns_pair(self):
         try:

@@ -306,6 +306,15 @@ class ConfigTests(unittest.TestCase):
     def test_autostart_executable_is_absolute(self):
         self.assertTrue(os.path.isabs(AutoClicker._autostart_executable()))
 
+    def test_autostart_command_includes_script_in_source_mode(self):
+        self.assertIn('auto_clicker_py3.py', AutoClicker._autostart_command())
+
+    def test_compact_path_respects_limit(self):
+        for limit in (5, 10, 44):
+            text = AutoClicker._compact_path('D:/' + 'a' * 200, limit)
+            self.assertLessEqual(len(text), limit)
+            self.assertIn('...', text)
+
 
 class StartConfirmationTests(unittest.TestCase):
     def test_confirmation_calls_dialog(self):
