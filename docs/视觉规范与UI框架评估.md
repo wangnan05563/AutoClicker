@@ -101,5 +101,5 @@
 
 ## 8. 参考
 
-- `docs/PRD-AutoClicker.md` §1.1、§14 风险表（ttk 主题能力上限）。
-- `docs/人工复验记录-20261116.md` 中 DPI/主题/托盘截图证据。
+- `docs/PRD-AutoClicker-v2.0.md` §1.1、§14 风险表（ttk 主题能力上限）。
+- DPI/主题实测见 `docs/兼容性测试报告-005-Windows部分.md`；托盘深色目视仍缺（见 `docs/安全合规审查报告-005.md` AC-30）。

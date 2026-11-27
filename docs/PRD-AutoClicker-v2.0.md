@@ -10,7 +10,7 @@
 | 平台 | Windows 10/11 x64；银河麒麟 V10 SP1 x86_64 / arm64 |
 | 编写日期 | 2026-11-21 |
 | 文档状态 | 已完成全面评审，待项目负责人确认 P0 范围后排期 |
-| 替代关系 | 替代 `docs/PRD-AutoClicker.md`（v1.0，2026-11-10）；旧版保留归档 |
+| 替代关系 | 替代 v1.0（2026-11-10）；旧版已清理，git 历史可查 |
 
 ### 修订记录
 
@@ -240,8 +240,8 @@ FR-11、FR-12、FR-18、FR-19、FR-20、FR-21、FR-22、FR-23、FR-32、FR-40。
 
 ### 4.6 旧 PRD 处置
 
-- `docs/PRD-AutoClicker.md`（v1.0）标记为历史归档，不再作为开发口径。
-- 本 PRD 替代旧版；旧版顶部增加指向本文件的说明。
+- v1.0（2026-11-10）已清理，不再作为开发口径；git 历史可查。
+- 本 PRD 替代旧版；旧版文件已清理，git 历史可查。
 - 旧版中已实现但仍有效的 FR，转入 §6.0「既有能力基线」，只做回归，不重复开发。
 - 旧版中未实现且仍有效的，重新编号并纳入 FR-01～FR-40。
 - 旧版中与当前实现冲突的，按本 PRD §11 修正。
@@ -824,9 +824,9 @@ FR-11、FR-12、FR-18、FR-19、FR-20、FR-21、FR-22、FR-23、FR-32、FR-40。
 ## 附录 D：参考资料
 
 - `docs/GitHub同款产品调研与优化需求-v3-20261121.md`（v3 需求基线）
-- `docs/PRD-AutoClicker.md`（v1.0，历史归档）
-- `docs/V2.1集成回归报告.md`、`docs/V2.2 P1集成回归报告.md`
-- `docs/启动性能验证报告.md`、`docs/视觉规范与UI框架评估.md`
+- v1.0 PRD（已清理，git 历史可查）
+- 旧版 V2.1/V2.2 回归报告（已清理，git 历史可查）
+- `docs/启动性能-AC16硬约束结论-20261126.md`、`docs/启动性能-签名与Defender实测-20261126.md`、`docs/视觉规范与UI框架评估.md`
 - `docs/需求变更评审机制.md`
 - `auto_clicker_py3.py`、`auto_clicker_layers/`、`scripts/config.build.json`
 - https://github.com/Blur009/Blur-AutoClicker
